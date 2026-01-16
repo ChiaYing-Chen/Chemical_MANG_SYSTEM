@@ -1001,7 +1001,7 @@ const DataEntryView: React.FC<{
                             </div>
                             <div>
                                 <label className="block text-sm font-medium text-slate-700 mb-1">2. 抄表日期</label>
-                                <input type="date" value={date} onChange={e => setDate(e.target.value)} className={inputClassName} required />
+                                <input type="date" value={date} onClick={(e) => e.currentTarget.showPicker()} onChange={e => setDate(e.target.value)} className={inputClassName} required />
                             </div>
                             <div className="p-3 bg-blue-50 rounded border border-blue-100 text-sm text-blue-900">
                                 <div className="flex justify-between">
@@ -2571,6 +2571,7 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                         <input
                             type="date"
                             value={tempDateRange.start}
+                            onClick={(e) => e.currentTarget.showPicker()}
                             onChange={e => setTempDateRange(prev => ({ ...prev, start: e.target.value }))}
                             className={inputClassName}
                         />
@@ -2578,6 +2579,7 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                         <input
                             type="date"
                             value={tempDateRange.end}
+                            onClick={(e) => e.currentTarget.showPicker()}
                             onChange={e => setTempDateRange(prev => ({ ...prev, end: e.target.value }))}
                             className={inputClassName}
                         />
@@ -3292,7 +3294,7 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
     return (
         <div className="space-y-8 animate-fade-in">
             <div className="flex justify-between items-center">
-                <h2 className="text-2xl font-bold text-slate-800">系統設定</h2>
+                <h2 className="text-2xl font-bold text-slate-800">儲槽設定</h2>
                 <div className="flex gap-2">
                     <div className="relative">
                         <input
@@ -3318,7 +3320,7 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
                         <Icons.Cooling className="w-6 h-6" />
                     </div>
                     <div>
-                        <h2 className="text-xl font-bold text-sky-900">冷卻水系統設定</h2>
+                        <h2 className="text-xl font-bold text-sky-900">冷卻水儲槽設定</h2>
                         <p className="text-xs text-sky-600">Cooling Water System (CWS)</p>
                     </div>
                 </div>
@@ -3376,7 +3378,7 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
                             <Icons.Boiler className="w-6 h-6" />
                         </div>
                         <div>
-                            <h2 className="text-xl font-bold text-orange-900">鍋爐水系統設定</h2>
+                            <h2 className="text-xl font-bold text-orange-900">鍋爐水儲槽設定</h2>
                             <p className="text-xs text-orange-600">Boiler Water System (BWS)</p>
                         </div>
                     </div>
@@ -3395,7 +3397,7 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
                             <Icons.DeNOx className="w-6 h-6" />
                         </div>
                         <div>
-                            <h2 className="text-xl font-bold text-emerald-900">脫銷系統設定</h2>
+                            <h2 className="text-xl font-bold text-emerald-900">脫銷儲槽設定</h2>
                             <p className="text-xs text-emerald-600">DeNOx (SCR)</p>
                         </div>
                     </div>
@@ -3413,7 +3415,7 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
                 <section className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                     <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex items-center gap-3">
                         <Icons.Factory className="w-5 h-5 text-slate-500" />
-                        <h2 className="text-lg font-bold text-slate-700">其他系統設定</h2>
+                        <h2 className="text-lg font-bold text-slate-700">其他儲槽設定</h2>
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
@@ -3499,7 +3501,7 @@ const App: React.FC = () => {
                     <NavItem view="entry" icon={Icons.Entry} label="數據輸入" />
                     <NavItem view="analysis" icon={Icons.Analysis} label="用量分析" />
                     <NavItem view="notes" icon={Icons.Notes} label="重要紀事" />
-                    <NavItem view="settings" icon={Icons.Settings} label="系統設定" />
+                    <NavItem view="settings" icon={Icons.Settings} label="儲槽設定" />
                 </nav>
             </aside>
 
@@ -3510,7 +3512,7 @@ const App: React.FC = () => {
                         {currentView === 'dashboard' && '總覽看板'}
                         {currentView === 'entry' && '數據輸入'}
                         {currentView === 'analysis' && '用量趨勢分析'}
-                        {currentView === 'settings' && '系統設定'}
+                        {currentView === 'settings' && '儲槽設定'}
                     </h1>
                     <div className="flex items-center gap-4">
                         <div className="text-sm text-slate-500">
