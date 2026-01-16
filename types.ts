@@ -21,6 +21,7 @@ export type CalculationMethod = 'NONE' | 'CWS_BLOWDOWN' | 'BWS_STEAM';
 
 // Table C: CWS Theoretical Params
 export interface CWSParameterRecord {
+  id?: string; // PK for history editing
   tankId: string; // Foreign Key
   circulationRate: number; // R (m3/hr)
   tempOutlet?: number; // T1
@@ -30,13 +31,16 @@ export interface CWSParameterRecord {
   makeupHardness?: number; // ppm
   concentrationCycles: number; // N
   targetPpm: number; // Dosage
+  date?: number; // Last Updated Timestamp
 }
 
 // Table D: BWS Theoretical Params
 export interface BWSParameterRecord {
+  id?: string; // PK for history editing
   tankId: string; // Foreign Key
-  steamProduction: number; // Tons/Month
+  steamProduction: number; // Tons/Week (Weekly Total)
   targetPpm: number; // Dosage
+  date?: number; // Last Updated Timestamp
 }
 
 // Table E: Tank Settings (Frontend Combined Object)
@@ -49,13 +53,15 @@ export interface Tank {
   description?: string;
   safeMinLevel: number; // %
   targetDailyUsage?: number;
-  
+
   // Configuration
   calculationMethod?: CalculationMethod;
-  
+
   // Joined Data (from Table C & D)
   cwsParams?: CWSParameterRecord;
   bwsParams?: BWSParameterRecord;
+
+  sortOrder?: number;
 }
 
 // Table A: Tank Levels
@@ -64,14 +70,14 @@ export interface Reading {
   tankId: string; // Foreign Key
   timestamp: number;
   levelCm: number;
-  
+
   // Snapshot data
   calculatedVolume: number; // Liters
   calculatedWeightKg: number; // KG
-  appliedSpecificGravity: number; 
+  appliedSpecificGravity: number;
   supplyId?: string; // Foreign Key to Table B
 
-  addedAmountLiters: number; 
+  addedAmountLiters: number;
   operatorName: string;
 }
 
@@ -94,4 +100,13 @@ export interface DailyUsage {
   date: string;
   usageLiters: number;
   readingsCount: number;
+}
+
+export interface ImportantNote {
+  id: string;
+  dateStr: string; // YYYY-MM-DD
+  area: string;
+  chemicalName: string;
+  note: string;
+  createdAt?: string;
 }

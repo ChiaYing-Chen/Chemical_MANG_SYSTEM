@@ -1,10 +1,10 @@
 import React from 'react';
-import { 
-  LayoutDashboard, 
-  FlaskConical, 
-  ClipboardPen, 
-  LineChart, 
-  NotebookText, 
+import {
+  LayoutDashboard,
+  FlaskConical,
+  ClipboardPen,
+  LineChart,
+  NotebookText,
   Settings,
   Plus,
   Trash2,
@@ -17,7 +17,13 @@ import {
   Snowflake,
   Flame,
   Wind,
-  Factory
+  Factory,
+  X,
+  FilePenLine,
+  GripVertical,
+  RefreshCw,
+  Calculator,
+  Import
 } from 'lucide-react';
 
 export const Icons = {
@@ -39,5 +45,12 @@ export const Icons = {
   Cooling: Snowflake,
   Boiler: Flame,
   DeNOx: Wind,
-  Factory: Factory
+  Factory: Factory,
+  X: X,
+  FilePenLine: FilePenLine,
+  Trash2: Trash2,
+  DragHandle: GripVertical,
+  Import: Import,
+  Recycle: RefreshCw,
+  Calculator: Calculator
 };

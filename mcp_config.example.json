@@ -1,0 +1,14 @@
+{
+    "mcpServers": {
+        "WTCA": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote",
+                "http://your-server-ip/WTCA/mcp-connect/wtca-secure-token-12345",
+                "--allow-http-transport",
+                "--allow-http-subpath"
+            ]
+        }
+    }
+}
