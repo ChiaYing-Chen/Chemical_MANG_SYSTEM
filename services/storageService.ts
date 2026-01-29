@@ -125,9 +125,16 @@ export class StorageService {
     }
 
     static async saveReadingsBatch(readings: Reading[]): Promise<void> {
+        const BATCH_SIZE = 100;
         try {
             const apiReadings = readings.map(r => StorageService.convertReadingToAPI(r));
-            await API.createReadingsBatch(apiReadings);
+
+            for (let i = 0; i < apiReadings.length; i += BATCH_SIZE) {
+                const chunk = apiReadings.slice(i, i + BATCH_SIZE);
+                await API.createReadingsBatch(chunk);
+                // Optional: add a small delay to avoid overwhelming the server if needed
+                // await new Promise(resolve => setTimeout(resolve, 50)); 
+            }
         } catch (err) {
             console.error('Failed to save readings batch:', err);
             throw err;
@@ -368,7 +375,11 @@ export class StorageService {
             calculationMethod: apiTank.calculation_method,
             cwsParams: apiTank.cws_params ? StorageService.convertCWSParamFromAPI(apiTank.cws_params) : undefined,
             bwsParams: apiTank.bws_params ? StorageService.convertBWSParamFromAPI(apiTank.bws_params) : undefined,
-            sortOrder: apiTank.sort_order ? parseInt(apiTank.sort_order) : undefined
+            sortOrder: apiTank.sort_order ? parseInt(apiTank.sort_order) : undefined,
+            shapeType: apiTank.shape_type,
+            dimensions: apiTank.dimensions,
+            inputUnit: apiTank.input_unit || 'CM',
+            validationThreshold: apiTank.validation_threshold ? parseFloat(apiTank.validation_threshold) : 30
         };
     }
 
@@ -383,7 +394,11 @@ export class StorageService {
             safe_min_level: tank.safeMinLevel,
             target_daily_usage: tank.targetDailyUsage,
             calculation_method: tank.calculationMethod,
-            sort_order: tank.sortOrder
+            sort_order: tank.sortOrder,
+            shape_type: tank.shapeType,
+            dimensions: tank.dimensions,
+            input_unit: tank.inputUnit,
+            validation_threshold: tank.validationThreshold ?? 30
         };
     }
 
@@ -426,7 +441,8 @@ export class StorageService {
             specificGravity: parseFloat(apiSupply.specific_gravity),
             price: apiSupply.price ? parseFloat(apiSupply.price) : undefined,
             startDate: parseInt(apiSupply.start_date),
-            notes: apiSupply.notes
+            notes: apiSupply.notes,
+            targetPpm: apiSupply.target_ppm ? parseFloat(apiSupply.target_ppm) : undefined
         };
     }
 
@@ -439,7 +455,8 @@ export class StorageService {
             specific_gravity: supply.specificGravity,
             price: supply.price,
             start_date: supply.startDate,
-            notes: supply.notes
+            notes: supply.notes,
+            target_ppm: supply.targetPpm
         };
     }
 
@@ -454,7 +471,6 @@ export class StorageService {
             cwsHardness: apiParam.cws_hardness ? parseFloat(apiParam.cws_hardness) : undefined,
             makeupHardness: apiParam.makeup_hardness ? parseFloat(apiParam.makeup_hardness) : undefined,
             concentrationCycles: parseFloat(apiParam.concentration_cycles || 1),
-            targetPpm: parseFloat(apiParam.target_ppm || 0),
             date: apiParam.date ? parseInt(apiParam.date) : undefined
         };
     }
@@ -470,7 +486,6 @@ export class StorageService {
             cws_hardness: param.cwsHardness,
             makeup_hardness: param.makeupHardness,
             concentration_cycles: param.concentrationCycles,
-            target_ppm: param.targetPpm,
             date: param.date
         };
     }
@@ -480,7 +495,6 @@ export class StorageService {
             id: apiParam.id,
             tankId: apiParam.tank_id,
             steamProduction: parseFloat(apiParam.steam_production || 0),
-            targetPpm: parseFloat(apiParam.target_ppm || 0),
             date: apiParam.date ? parseInt(apiParam.date) : undefined
         };
     }
@@ -490,7 +504,6 @@ export class StorageService {
             id: param.id,
             tank_id: param.tankId,
             steam_production: param.steamProduction,
-            target_ppm: param.targetPpm,
             date: param.date
         };
     }

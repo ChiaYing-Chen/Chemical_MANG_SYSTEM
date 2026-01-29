@@ -5,6 +5,20 @@ export enum SystemType {
   DENOX = '脫銷系統'
 }
 
+export type InputUnit = 'CM' | 'PERCENT';
+
+export type ShapeType = 'VERTICAL_CYLINDER' | 'HORIZONTAL_CYLINDER' | 'RECTANGULAR';
+export type HeadType = 'FLAT' | 'HEMISPHERICAL' | 'SEMI_ELLIPTICAL_2_1';
+
+export interface TankDimensions {
+  diameter: number; // cm (ID)
+  length?: number; // cm (Tangent to Tangent for Horizontal)
+  width?: number; // cm (Rectangular)
+  height?: number; // cm (Height reference)
+  sensorOffset?: number; // cm (Distance from bottom to sensor 0)
+  headType?: HeadType; // For Horizontal Cylinder
+}
+
 // Table B: Chemical Price/SG
 export interface ChemicalSupply {
   id: string;
@@ -15,6 +29,7 @@ export interface ChemicalSupply {
   price?: number; // 單價 (元/KG)
   startDate: number; // 生效日期
   notes?: string;
+  targetPpm?: number; // 目標藥劑濃度 (ppm)
 }
 
 export type CalculationMethod = 'NONE' | 'CWS_BLOWDOWN' | 'BWS_STEAM';
@@ -30,7 +45,6 @@ export interface CWSParameterRecord {
   cwsHardness?: number; // ppm
   makeupHardness?: number; // ppm
   concentrationCycles: number; // N
-  targetPpm: number; // Dosage
   date?: number; // Last Updated Timestamp
 }
 
@@ -39,7 +53,6 @@ export interface BWSParameterRecord {
   id?: string; // PK for history editing
   tankId: string; // Foreign Key
   steamProduction: number; // Tons/Week (Weekly Total)
-  targetPpm: number; // Dosage
   date?: number; // Last Updated Timestamp
 }
 
@@ -56,12 +69,22 @@ export interface Tank {
 
   // Configuration
   calculationMethod?: CalculationMethod;
+  shapeType?: ShapeType;
+  dimensions?: TankDimensions;
 
   // Joined Data (from Table C & D)
   cwsParams?: CWSParameterRecord;
   bwsParams?: BWSParameterRecord;
 
+  inputUnit?: InputUnit; // 'CM' or 'PERCENT'
+
   sortOrder?: number;
+
+  // Validation threshold for import (0-100, default 30 means 30% of capacity)
+  validationThreshold?: number;
+
+  // Max capacity warning threshold (kg) - alerts if level would exceed this after delivery
+  maxCapacityWarningKg?: number;
 }
 
 // Table A: Tank Levels

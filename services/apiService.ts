@@ -4,7 +4,8 @@
 // 開發環境: 指向生產伺服器 API（因為本地無法連接資料庫）
 // 生產環境: /WTCA/api (透過 IIS 反向代理)
 const isDev = window.location.hostname === 'localhost' && window.location.port !== '';
-const API_BASE_URL = isDev ? 'http://10.122.51.61/WTCA/api' : '/WTCA/api';
+// Use relative path for both Dev (via Proxy) and Prod
+const API_BASE_URL = '/WTCA/api';
 
 // ==================== Tanks ====================
 
@@ -231,7 +232,10 @@ export const saveBWSParams = async (params: any): Promise<any> => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params)
     });
-    if (!response.ok) throw new Error('Failed to save BWS params');
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Failed to save BWS params: ${response.status} ${errText}`);
+    }
     return await response.json();
 };
 

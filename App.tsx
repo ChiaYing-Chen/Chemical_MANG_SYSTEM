@@ -1,16 +1,19 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { StorageService } from './services/storageService';
-import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod } from './types';
+import { calculateTankVolume } from './utils/calculationUtils';
+import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType } from './types';
 import { Icons } from './components/Icons';
 import * as XLSX from 'xlsx';
 import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
     BarChart, Bar, ComposedChart, Area
 } from 'recharts';
+import AnnualDataView from './views/AnnualDataView';
+import { ExcelImportView } from './views/ExcelImportView';
 
 // --- Helper Components ---
 
-const Card: React.FC<{ children: React.ReactNode; className?: string; title?: string; action?: React.ReactNode }> = ({ children, className = "", title, action }) => (
+export const Card: React.FC<{ children: React.ReactNode; className?: string; title?: string; action?: React.ReactNode }> = ({ children, className = "", title, action }) => (
     <div className={`bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden ${className}`}>
         {(title || action) && (
             <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
@@ -22,7 +25,7 @@ const Card: React.FC<{ children: React.ReactNode; className?: string; title?: st
     </div>
 );
 
-const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'danger' | 'ghost' }> = ({ children, variant = 'primary', className = "", ...props }) => {
+export const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'danger' | 'ghost' }> = ({ children, variant = 'primary', className = "", ...props }) => {
     const baseStyle = "inline-flex items-center px-4 py-2 rounded-lg text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1 disabled:opacity-50 disabled:cursor-not-allowed";
     const variants = {
         primary: "bg-brand-600 text-white hover:bg-brand-700 focus:ring-brand-500",
@@ -39,6 +42,26 @@ const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant
 
 // Common input styles
 const inputClassName = "w-full rounded-lg border-slate-600 border p-2.5 bg-slate-900 text-white placeholder-slate-400 focus:ring-brand-500 focus:border-brand-500";
+
+const BWS_TAGS = [
+    "W52_FI-MS27-A.PV",
+    "W52_FI-MS27-B.PV",
+    "W52_FI-MS27-C.PV",
+    "W52_FI-MS27-D.PV"
+];
+
+const CWS_TAGS_CONFIG: any = {
+    'CT-1': {
+        flow: ['W52_FI-CW56-Z.PV', 'W52_FI-CW57-Z.PV'],
+        tempOut: ['W52_TI-CW77-Z.PV'],
+        tempRet: ['W52_TI-CW76-Z.PV']
+    },
+    'CT-2': {
+        flow: ['W52_FI-CW56-Y.PV', 'W52_FI-CW57-Y.PV'],
+        tempOut: ['W52_TI-AC77-Y.PV'],
+        tempRet: ['W52_TI-CW76-Y.PV']
+    }
+};
 
 // --- Utility Functions ---
 
@@ -77,7 +100,37 @@ const readExcelFile = (file: File): Promise<any[]> => {
                 const workbook = XLSX.read(data, { type: 'binary', cellDates: true });
                 const sheetName = workbook.SheetNames[0];
                 const sheet = workbook.Sheets[sheetName];
-                const jsonData = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+                // Use header: 1 to get raw array of arrays
+                const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }) as any[][];
+
+                if (rawRows.length === 0) {
+                    resolve([]);
+                    return;
+                }
+
+                // Process Headers (Row 0)
+                const headers = rawRows[0].map((h: any) => {
+                    if (h instanceof Date) {
+                        // Force Date Headers to YYYY/MM/DD format to avoid ambiguous parsing
+                        const offset = h.getTimezoneOffset();
+                        const localDate = new Date(h.getTime() - (offset * 60 * 1000));
+                        return localDate.toISOString().split('T')[0].replace(/-/g, '/');
+                    }
+                    return String(h).trim();
+                });
+
+                // Map Rows 1..N to JSON objects
+                const jsonData = rawRows.slice(1).map(row => {
+                    const rowData: any = {};
+                    headers.forEach((header, index) => {
+                        // Use header as key
+                        // Handle case where row might be shorter than headers
+                        rowData[header] = row[index] !== undefined ? row[index] : "";
+                    });
+                    return rowData;
+                });
+
                 resolve(jsonData);
             } catch (err) {
                 reject(err);
@@ -102,22 +155,44 @@ const formatDateForInput = (date: any): string => {
 
 // Helper: Normalize date string "YYYY-MM-DD" or "YYYY/MM/DD" to timestamp at Local Midnight
 // This ensures consistency between Manual Input and Excel Import for "Same Day" checks
-const getNormalizedTimestamp = (dateStr: string | Date | number): number => {
-    if (!dateStr) return Date.now();
+const getNormalizedTimestamp = (dateStr: string | Date | number): number | null => {
+    if (!dateStr) return null; // Strict check: Return null if empty
     if (typeof dateStr === 'number') return dateStr;
     const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return null; // Strict check: Return null if invalid
+
     // Reset to midnight
     d.setHours(0, 0, 0, 0);
     return d.getTime();
 };
 
 const parseDateKey = (key: string): Date | null => {
-    // 1. Check if key contains a 4-digit year (YYYY)
+    // 0. Check if key contains a 4-digit year (YYYY) - PRIORITY 1 (Western Date)
     const hasYear = /\d{4}/.test(key);
 
     if (hasYear) {
         const d = new Date(key);
         if (!isNaN(d.getTime())) return d;
+    }
+
+    // 1. Check for ROC Date format (e.g., 104/01, 111-05-20)
+    // Matches 2-3 digits (year), separator, 1-2 digits (month), optional separator+day
+    const rocMatch = key.match(/^(\d{2,3})[/.-](\d{1,2})([/.-](\d{1,2}))?/);
+    if (rocMatch) {
+        const rocYear = parseInt(rocMatch[1]);
+        // Basic sanity check: ROC year usually between 1 and ~200 (current year 114 is 2025)
+        // To avoid confusing simple numbers or short ISO years (though <4 digits usually implies something else)
+        if (rocYear > 0 && rocYear < 200) {
+            const year = rocYear + 1911;
+            const month = parseInt(rocMatch[2]);
+            const day = rocMatch[4] ? parseInt(rocMatch[4]) : 1;
+
+            // Validation: Month must be 1-12, Day 1-31
+            if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+                const d = new Date(year, month - 1, day);
+                if (!isNaN(d.getTime())) return d;
+            }
+        }
     }
 
     // 2. If no Year, try appending current year
@@ -129,17 +204,7 @@ const parseDateKey = (key: string): Date | null => {
     // 3. Fallback: Try straight parse (in case of other formats), but be careful of 2001 default
     const d3 = new Date(key);
     if (!isNaN(d3.getTime()) && d3.getFullYear() > 2000) {
-        // Only accept if it has year (handled above) OR if we really trust JS.
-        // But since we want to avoid 2001 default for "1/1", we loop back.
-        // If "1/1" is parsed as 2001, hasYear is false, so we hit step 2.
-        // So d3 is only for cases that failed step 2 but somehow parseable?
-        // e.g. "Jan 1" -> might parse.
-        // If "Jan 1" -> 2001. We want 2024.
-        // Better to strictly prefer current year if no year digits found.
         if (hasYear) return d3;
-
-        // If no year digit, and step 2 failed, maybe format is weird.
-        // Let's force current year on d3 components?
         d3.setFullYear(currentYear);
         return d3;
     }
@@ -149,11 +214,31 @@ const parseDateKey = (key: string): Date | null => {
 
 // --- Views ---
 
-const TankStatusCard: React.FC<{ tank: any, dragProps?: any }> = ({ tank, dragProps }) => {
+const TankStatusCard: React.FC<{
+    tank: any,
+    dragProps?: any,
+    onNavigate?: (tankId: string) => void,
+    onDeliveryClick?: (tank: any) => void
+}> = ({ tank, dragProps, onNavigate, onDeliveryClick }) => {
+
+    const handleCardClick = () => {
+        if (onNavigate) {
+            onNavigate(tank.id);
+        }
+    };
+
+    const handleDeliveryClick = (e: React.MouseEvent) => {
+        e.stopPropagation(); // Prevent card click
+        if (onDeliveryClick) {
+            onDeliveryClick(tank);
+        }
+    };
+
     return (
         <div
-            className={`bg-white rounded-lg border border-slate-200 shadow-sm p-4 hover:border-brand-300 transition-colors relative overflow-hidden ${dragProps ? 'cursor-default' : ''}`}
+            className={`bg-white rounded-lg border border-slate-200 shadow-sm p-4 hover:border-brand-300 transition-colors relative overflow-hidden ${onNavigate ? 'cursor-pointer hover:shadow-md' : 'cursor-default'}`}
             {...dragProps}
+            onClick={handleCardClick}
         >
             {dragProps && (
                 <div className="absolute top-2 left-2 text-slate-300 hover:text-slate-500 cursor-grab active:cursor-grabbing z-20">
@@ -192,7 +277,14 @@ const TankStatusCard: React.FC<{ tank: any, dragProps?: any }> = ({ tank, dragPr
                 <div className="grid grid-cols-2 gap-2 text-xs border-t border-slate-50 pt-2">
                     <div>
                         <span className="text-slate-400 block">液位 (H)</span>
-                        <span className="font-medium text-slate-700">{tank.lastReading?.levelCm || 0} cm</span>
+                        <span className="font-medium text-slate-700">
+                            {tank.lastReading?.levelCm || 0} cm
+                            {tank.inputUnit === 'PERCENT' && tank.dimensions && (tank.dimensions.diameter || tank.dimensions.height) ? (
+                                <span className="text-slate-400 text-[10px] ml-1">
+                                    ({((tank.lastReading?.levelCm || 0) / (tank.dimensions.height || tank.dimensions.diameter || 1) * 100).toFixed(1)}%)
+                                </span>
+                            ) : null}
+                        </span>
                     </div>
                     <div className="text-right">
                         <span className="text-slate-400 block">重量 (W)</span>
@@ -200,23 +292,251 @@ const TankStatusCard: React.FC<{ tank: any, dragProps?: any }> = ({ tank, dragPr
                     </div>
                 </div>
 
-                <div className="text-[10px] text-slate-400 flex items-center justify-end mt-1">
-                    <Icons.ClipboardPen className="w-3 h-3 mr-1 opacity-50" />
-                    {tank.lastReading ? new Date(tank.lastReading.timestamp).toLocaleDateString() : '無紀錄'}
+                {/* Daily Usage & Remaining Days */}
+                <div className="grid grid-cols-2 gap-2 text-xs border-t border-slate-100 pt-2 bg-slate-50 -mx-4 px-4 py-2">
+                    <div>
+                        <span className="text-slate-400 block">日用量</span>
+                        <span className="font-medium text-blue-600">
+                            {tank.avgDailyUsageKg > 0 ? `${tank.avgDailyUsageKg.toFixed(1)} kg/日` : '-'}
+                        </span>
+                    </div>
+                    <div className="text-right">
+                        <span className="text-slate-400 block">剩餘天數</span>
+                        <span className={`font-bold ${tank.remainingDays !== null && tank.remainingDays < 30 ? 'text-red-600' : 'text-emerald-600'}`}>
+                            {tank.remainingDays !== null ? `約 ${tank.remainingDays} 天` : '-'}
+                        </span>
+                    </div>
+                </div>
+
+                <div className="flex items-center justify-between mt-1">
+                    <div className="text-[10px] text-slate-400 flex items-center">
+                        <Icons.ClipboardPen className="w-3 h-3 mr-1 opacity-50" />
+                        {tank.lastReading ? new Date(tank.lastReading.timestamp).toLocaleDateString() : '無紀錄'}
+                    </div>
+
+                    {onDeliveryClick && (
+                        <button
+                            onClick={handleDeliveryClick}
+                            className="text-xs bg-amber-100 hover:bg-amber-200 text-amber-700 px-2 py-1 rounded flex items-center gap-1 transition-colors"
+                            title="交貨評估"
+                        >
+                            📦 評估
+                        </button>
+                    )}
                 </div>
             </div>
         </div>
     );
 }
 
-const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void }> = ({ tanks, readings, onRefresh }) => {
+// Delivery Estimation Modal
+const DeliveryEstimationModal: React.FC<{
+    tank: any;
+    onClose: () => void;
+}> = ({ tank, onClose }) => {
+    const [deliveryDate, setDeliveryDate] = useState<string>(() => {
+        const d = new Date();
+        d.setDate(d.getDate() + 7); // Default 7 days ahead
+        return d.toISOString().split('T')[0];
+    });
+    const [deliveryKg, setDeliveryKg] = useState<number>(0);
+
+    // Calculate projections
+    const daysUntilDelivery = useMemo(() => {
+        const deliveryTs = new Date(deliveryDate).getTime();
+        const now = Date.now();
+        return Math.max(0, Math.floor((deliveryTs - now) / (24 * 60 * 60 * 1000)));
+    }, [deliveryDate]);
+
+    const sg = tank.lastReading?.appliedSpecificGravity || 1;
+    const avgDailyUsageLiters = tank.avgDailyUsageLiters || 0;
+    const avgDailyUsageKg = avgDailyUsageLiters * sg;
+
+    // Projected level on delivery day
+    const currentWeightKg = tank.currentWeightKg || 0;
+    const projectedUsageKg = avgDailyUsageKg * daysUntilDelivery;
+    const projectedLevelKg = Math.max(0, currentWeightKg - projectedUsageKg);
+    const projectedLevelLiters = projectedLevelKg / sg;
+
+    // After delivery
+    const afterDeliveryKg = projectedLevelKg + deliveryKg;
+    const afterDeliveryLiters = afterDeliveryKg / sg;
+    const afterDeliveryPercent = (afterDeliveryLiters / tank.capacityLiters) * 100;
+
+    // Check max capacity warning
+    const maxWarning = tank.maxCapacityWarningKg || (tank.capacityLiters * sg);
+    const exceedsMax = afterDeliveryKg > maxWarning;
+
+    // New remaining days after delivery
+    const newRemainingDays = avgDailyUsageLiters > 0
+        ? Math.floor(afterDeliveryLiters / avgDailyUsageLiters)
+        : null;
+
+    return (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={onClose}>
+            <div
+                className="bg-white rounded-xl shadow-2xl max-w-md w-full mx-4 overflow-hidden"
+                onClick={e => e.stopPropagation()}
+            >
+                <div className="bg-amber-50 px-6 py-4 border-b border-amber-100">
+                    <h2 className="text-lg font-bold text-amber-900 flex items-center gap-2">
+                        📦 交貨評估 - {tank.name}
+                    </h2>
+                </div>
+
+                <div className="p-6 space-y-4">
+                    {/* Current Status */}
+                    <div className="bg-slate-50 rounded-lg p-4 text-sm">
+                        <div className="font-medium text-slate-700 mb-2">目前狀態</div>
+                        <div className="grid grid-cols-2 gap-2 text-xs">
+                            <div>存量：<span className="font-bold">{currentWeightKg.toFixed(0)} kg</span></div>
+                            <div>日用量：<span className="font-bold text-blue-600">{avgDailyUsageKg.toFixed(1)} kg/日</span></div>
+                        </div>
+                    </div>
+
+                    {/* Input Fields */}
+                    <div className="grid grid-cols-2 gap-4">
+                        <div>
+                            <label className="block text-sm font-medium text-slate-700 mb-1">交貨日期</label>
+                            <input
+                                type="date"
+                                value={deliveryDate}
+                                onChange={e => setDeliveryDate(e.target.value)}
+                                className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-slate-700 mb-1">交貨量 (kg)</label>
+                            <input
+                                type="number"
+                                value={deliveryKg || ''}
+                                onChange={e => setDeliveryKg(parseFloat(e.target.value) || 0)}
+                                placeholder="例: 1000"
+                                className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm"
+                            />
+                        </div>
+                    </div>
+
+                    {/* Projection Results */}
+                    <div className="border border-slate-200 rounded-lg p-4 space-y-3">
+                        <div className="text-sm text-slate-600">
+                            <span className="text-slate-400">距交貨：</span>
+                            <span className="font-medium">{daysUntilDelivery} 天</span>
+                        </div>
+
+                        <div className="text-sm">
+                            <span className="text-slate-400">預估交貨當日存量：</span>
+                            <span className={`font-bold ${projectedLevelKg < 0 ? 'text-red-600' : 'text-slate-700'}`}>
+                                {projectedLevelKg.toFixed(0)} kg
+                            </span>
+                            {projectedLevelKg <= 0 && (
+                                <span className="text-red-500 text-xs ml-2">⚠️ 交貨前可能用盡！</span>
+                            )}
+                        </div>
+
+                        <div className="border-t border-slate-100 pt-3">
+                            <div className="text-sm font-medium text-slate-700 mb-2">入藥後</div>
+                            <div className="grid grid-cols-2 gap-2 text-sm">
+                                <div>
+                                    存量：
+                                    <span className={`font-bold ${exceedsMax ? 'text-red-600' : 'text-emerald-600'}`}>
+                                        {afterDeliveryKg.toFixed(0)} kg
+                                    </span>
+                                </div>
+                                <div>
+                                    容量：
+                                    <span className={`font-bold ${afterDeliveryPercent > 100 ? 'text-red-600' : 'text-slate-700'}`}>
+                                        {afterDeliveryPercent.toFixed(1)}%
+                                    </span>
+                                </div>
+                            </div>
+
+                            {exceedsMax && (
+                                <div className="mt-2 bg-red-50 border border-red-200 rounded-lg p-2 text-sm text-red-700 flex items-center gap-2">
+                                    ⚠️ 將超過上限警報 ({maxWarning.toFixed(0)} kg)！
+                                </div>
+                            )}
+
+                            <div className="mt-2 text-sm">
+                                新剩餘天數：
+                                <span className="font-bold text-emerald-600">
+                                    {newRemainingDays !== null ? `約 ${newRemainingDays} 天` : '-'}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div className="bg-slate-50 px-6 py-4 border-t border-slate-200 flex justify-end">
+                    <button
+                        onClick={onClose}
+                        className="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                    >
+                        關閉
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onNavigate?: (tankId: string, month: number, year: number) => void }> = ({ tanks, readings, onRefresh, onNavigate }) => {
+    const [deliveryModalTank, setDeliveryModalTank] = useState<any>(null);
+
     const tanksWithStatus = useMemo(() => {
+        const fourWeeksAgo = Date.now() - 28 * 24 * 60 * 60 * 1000;
+
         return tanks.map(tank => {
             const tankReadings = readings.filter(r => r.tankId === tank.id).sort((a, b) => b.timestamp - a.timestamp);
             const lastReading = tankReadings[0];
-            const currentLevel = lastReading ? (lastReading.calculatedVolume / tank.capacityLiters) * 100 : 0;
+            const currentVolume = lastReading?.calculatedVolume || 0;
+            const currentWeightKg = lastReading?.calculatedWeightKg || 0;
+            const currentLevel = lastReading ? (currentVolume / tank.capacityLiters) * 100 : 0;
             const isLow = currentLevel < tank.safeMinLevel;
-            return { ...tank, currentLevel, lastReading, isLow };
+
+            // Calculate average daily usage from past 4 weeks
+            const recentReadings = tankReadings.filter(r => r.timestamp >= fourWeeksAgo).sort((a, b) => a.timestamp - b.timestamp);
+            let avgDailyUsageLiters = 0;
+            let avgDailyUsageKg = 0;
+
+            if (recentReadings.length >= 2) {
+                // Sum up usage between consecutive readings
+                let totalUsageLiters = 0;
+                for (let i = 1; i < recentReadings.length; i++) {
+                    const prev = recentReadings[i - 1];
+                    const curr = recentReadings[i];
+                    // Usage = previous volume - current volume + any added amount
+                    const usage = prev.calculatedVolume - curr.calculatedVolume + (curr.addedAmountLiters || 0);
+                    if (usage > 0) totalUsageLiters += usage;
+                }
+
+                // Days covered
+                const firstTs = recentReadings[0].timestamp;
+                const lastTs = recentReadings[recentReadings.length - 1].timestamp;
+                const daysCovered = Math.max(1, (lastTs - firstTs) / (24 * 60 * 60 * 1000));
+
+                avgDailyUsageLiters = totalUsageLiters / daysCovered;
+                // Approximate kg using last reading's SG
+                const sg = lastReading?.appliedSpecificGravity || 1;
+                avgDailyUsageKg = avgDailyUsageLiters * sg;
+            }
+
+            // Remaining days
+            const remainingDays = avgDailyUsageLiters > 0
+                ? Math.floor(currentVolume / avgDailyUsageLiters)
+                : null;
+
+            return {
+                ...tank,
+                currentLevel,
+                currentVolume,
+                currentWeightKg,
+                lastReading,
+                isLow,
+                avgDailyUsageLiters,
+                avgDailyUsageKg,
+                remainingDays
+            };
         });
     }, [tanks, readings]);
 
@@ -256,6 +576,16 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
             ]
         };
     }, [tanksWithStatus]);
+
+    const handleNavigate = (tankId: string) => {
+        if (onNavigate) {
+            // Pass 0 for month/year to indicate "show all data" (no filter)
+            onNavigate(tankId, 0, 0);
+        }
+    };
+
+
+
 
 
 
@@ -352,6 +682,8 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                 <TankStatusCard
                                     key={t.id}
                                     tank={t}
+                                    onNavigate={handleNavigate}
+                                    onDeliveryClick={setDeliveryModalTank}
                                     dragProps={{
                                         draggable: true,
                                         onDragStart: (e: React.DragEvent) => handleDragStart(e, t.id, 'coolingArea1'),
@@ -372,6 +704,8 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                 <TankStatusCard
                                     key={t.id}
                                     tank={t}
+                                    onNavigate={handleNavigate}
+                                    onDeliveryClick={setDeliveryModalTank}
                                     dragProps={{
                                         draggable: true,
                                         onDragStart: (e: React.DragEvent) => handleDragStart(e, t.id, 'coolingArea2'),
@@ -398,7 +732,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} />)}
+                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} />)}
                         </div>
                     </div>
                 </section>
@@ -415,7 +749,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 gap-4">
-                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} />)}
+                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} />)}
                         </div>
                     </div>
                 </section>
@@ -429,10 +763,18 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} />)}
+                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} />)}
                         </div>
                     </div>
                 </section>
+            )}
+
+            {/* Delivery Estimation Modal */}
+            {deliveryModalTank && (
+                <DeliveryEstimationModal
+                    tank={deliveryModalTank}
+                    onClose={() => setDeliveryModalTank(null)}
+                />
             )}
         </div>
     );
@@ -465,6 +807,227 @@ const DataEntryView: React.FC<{
 
     // File input for Excel import
     const [file, setFile] = useState<File | null>(null);
+
+    // --- PI Import State ---
+    const [piBaseUrl, setPiBaseUrl] = useState(() => localStorage.getItem('piWebApiUrl') || 'https://10.122.51.61/piwebapi');
+    const [importWeeks, setImportWeeks] = useState(1);
+    const [importing, setImporting] = useState(false);
+    const [importLogs, setImportLogs] = useState<string[]>([]);
+
+    useEffect(() => {
+        localStorage.setItem('piWebApiUrl', piBaseUrl);
+    }, [piBaseUrl]);
+
+    // Helper to get Monday
+    const getMonday = (d: Date) => {
+        d = new Date(d);
+        const day = d.getDay();
+        const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+        const mon = new Date(d.setDate(diff));
+        mon.setHours(0, 0, 0, 0);
+        return mon;
+    };
+
+    const fetchPiValue = async (tagName: string, startTime: string, endTime: string, summaryType: 'Total' | 'Average'): Promise<{ value: number, error?: string }> => {
+        try {
+            const fetchOptions: RequestInit = { credentials: 'include' };
+            // 1. Get Data Servers
+            const serversRes = await fetch(`${piBaseUrl}/dataservers`, fetchOptions);
+            if (!serversRes.ok) throw new Error("Auth Failed or API unreachable");
+            const serversData = await serversRes.json();
+            const serverWebId = serversData.Items[0].WebId;
+            // 2. Search Point
+            const searchRes = await fetch(`${piBaseUrl}/dataservers/${serverWebId}/points?nameFilter=${tagName}`, fetchOptions);
+            const searchData = await searchRes.json();
+            if (!searchData.Items || searchData.Items.length === 0) return { value: 0, error: "Tag Not Found" };
+            const webId = searchData.Items[0].WebId;
+            // 3. Get Summary
+            const summaryUrl = `${piBaseUrl}/streams/${webId}/summary?startTime=${startTime}&endTime=${endTime}&summaryType=${summaryType}`;
+            const summaryRes = await fetch(summaryUrl, fetchOptions);
+            if (!summaryRes.ok) return { value: 0, error: `Summary Failed` };
+            const summaryData = await summaryRes.json();
+            const item = summaryData.Items ? summaryData.Items[0] : summaryData;
+            let rawVal = item.Value;
+            if (typeof rawVal === 'object' && rawVal !== null && rawVal.Value !== undefined) rawVal = rawVal.Value;
+            const num = Number(rawVal);
+            return { value: isNaN(num) ? 0 : num };
+        } catch (e: any) {
+            return { value: 0, error: e.message || String(e) };
+        }
+    };
+
+    const handleBatchImportBWS = async () => {
+        if (!confirm(`確定要匯入「近 ${importWeeks} 週」的數據至資料庫嗎？\n這將寫入所有鍋爐儲槽的生產參數。`)) return;
+        setImporting(true);
+        setImportLogs([]);
+        const addLog = (msg: string) => setImportLogs(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`]);
+        try {
+            addLog("開始初始化...");
+            const currentWeekMonday = getMonday(new Date());
+            const targetWeeks = [];
+            for (let i = 1; i <= importWeeks; i++) {
+                const endDate = new Date(currentWeekMonday);
+                endDate.setDate(currentWeekMonday.getDate() - (7 * (i - 1)));
+                const startDate = new Date(endDate);
+                startDate.setDate(endDate.getDate() - 7);
+                targetWeeks.push({ start: startDate, end: endDate });
+            }
+            targetWeeks.reverse();
+            addLog(`準備處理 ${targetWeeks.length} 個週次...`);
+
+            const boilerTanks = tanks.filter(t => t.system === SystemType.BOILER);
+
+            for (const week of targetWeeks) {
+                const startStr = week.start.toISOString().split('T')[0] + 'T00:00:00';
+                const endStr = week.end.toISOString().split('T')[0] + 'T00:00:00';
+                addLog(`處理週次: ${week.start.toLocaleDateString()} ~ ${week.end.toLocaleDateString()}`);
+
+                let weekTotalSum = 0;
+                for (const tag of BWS_TAGS) {
+                    const result = await fetchPiValue(tag, startStr, endStr, 'Total');
+                    if (result.error) addLog(`    [Error] ${tag}: ${result.error}`);
+                    weekTotalSum += result.value;
+                }
+                const safeTotal = Math.round(weekTotalSum * 24);
+                addLog(`  -> 總和: ${safeTotal}`);
+                const dateTs = week.start.getTime();
+                let saveCount = 0;
+                for (const tank of boilerTanks) {
+                    const record: BWSParameterRecord = {
+                        id: generateUUID(),
+                        tankId: tank.id,
+                        steamProduction: safeTotal,
+                        date: dateTs
+                    };
+                    const history = await StorageService.getBWSParamsHistory(tank.id);
+                    const existing = history.find(h => h.date === dateTs);
+                    if (existing) {
+                        await StorageService.updateBWSParamRecord({ ...existing, steamProduction: safeTotal });
+                    } else {
+                        await StorageService.saveBWSParam(record);
+                    }
+                    saveCount++;
+                }
+                addLog(`  -> 已更新 ${saveCount} 個儲槽`);
+            }
+            addLog("完成");
+            await loadHistory();
+        } catch (e: any) {
+            addLog(`錯誤: ${e.message}`);
+        } finally {
+            setImporting(false);
+        }
+    };
+
+    const handleBatchImportCWS = async () => {
+        if (!confirm(`確定要匯入「近 ${importWeeks} 週」的數據至資料庫嗎？\n這將寫入冷卻水系統的循環量與溫度參數。`)) return;
+        setImporting(true);
+        setImportLogs([]);
+        const addLog = (msg: string) => setImportLogs(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`]);
+        try {
+            addLog("開始 CWS 資料匯入...");
+            const cwsTanks = tanks.filter(t => t.system === SystemType.COOLING);
+            const ct1Tanks = cwsTanks.filter(t => t.name.includes('CWS-1') || t.name.includes('CT-1') || (t.description || '').includes('一階'));
+            const ct2Tanks = cwsTanks.filter(t => !ct1Tanks.find(ct1 => ct1.id === t.id));
+            addLog(`偵測到 CT-1: ${ct1Tanks.length}, CT-2: ${ct2Tanks.length}`);
+
+            const currentWeekMonday = getMonday(new Date());
+            const targetWeeks = [];
+            for (let i = 1; i <= importWeeks; i++) {
+                const endDate = new Date(currentWeekMonday);
+                endDate.setDate(currentWeekMonday.getDate() - (7 * (i - 1)));
+                const startDate = new Date(endDate);
+                startDate.setDate(endDate.getDate() - 7);
+                targetWeeks.push({ start: startDate, end: endDate });
+            }
+            targetWeeks.reverse();
+
+            const fetchAreaData = async (areaKey: 'CT-1' | 'CT-2', start: string, end: string) => {
+                const config = CWS_TAGS_CONFIG[areaKey];
+                let flowSum = 0;
+                for (const tag of config.flow) {
+                    const r = await fetchPiValue(tag, start, end, 'Average');
+                    if (r.error) addLog(`  [Warn] ${tag}: ${r.error}`);
+                    flowSum += r.value;
+                }
+                let tOutSum = 0, tOutCount = 0;
+                for (const tag of config.tempOut) {
+                    const r = await fetchPiValue(tag, start, end, 'Average');
+                    if (!r.error) { tOutSum += r.value; tOutCount++; }
+                }
+                const tOut = tOutCount > 0 ? tOutSum / tOutCount : 0;
+                let tRetSum = 0, tRetCount = 0;
+                for (const tag of config.tempRet) {
+                    const r = await fetchPiValue(tag, start, end, 'Average');
+                    if (!r.error) { tRetSum += r.value; tRetCount++; }
+                }
+                const tRet = tRetCount > 0 ? tRetSum / tRetCount : 0;
+                return { circulationRate: flowSum, tempOutlet: tOut, tempReturn: tRet, tempDiff: tRet - tOut };
+            };
+
+            for (const week of targetWeeks) {
+                const startStr = week.start.toISOString().split('T')[0] + 'T00:00:00';
+                const endStr = week.end.toISOString().split('T')[0] + 'T00:00:00';
+                const dateTs = week.start.getTime();
+                addLog(`處理週次: ${week.start.toLocaleDateString()}`);
+
+                if (ct1Tanks.length > 0) {
+                    const d1 = await fetchAreaData('CT-1', startStr, endStr);
+                    for (const tank of ct1Tanks) {
+                        const history = await StorageService.getCWSParamsHistory(tank.id);
+                        const existing = history.find(h => h.date === dateTs);
+                        const cwsHardness = existing?.cwsHardness || 0;
+                        const makeupHardness = existing?.makeupHardness || 0;
+                        const cycles = makeupHardness > 0 ? cwsHardness / makeupHardness : 1;
+                        const record: CWSParameterRecord = {
+                            id: existing?.id || generateUUID(),
+                            tankId: tank.id,
+                            date: dateTs,
+                            circulationRate: d1.circulationRate,
+                            tempOutlet: d1.tempOutlet,
+                            tempReturn: d1.tempReturn,
+                            tempDiff: d1.tempDiff,
+                            cwsHardness: cwsHardness,
+                            makeupHardness: makeupHardness,
+                            concentrationCycles: cycles
+                        };
+                        await StorageService.saveCWSParam(record);
+                    }
+                    addLog(`  -> Updated CT-1`);
+                }
+                if (ct2Tanks.length > 0) {
+                    const d2 = await fetchAreaData('CT-2', startStr, endStr);
+                    for (const tank of ct2Tanks) {
+                        const history = await StorageService.getCWSParamsHistory(tank.id);
+                        const existing = history.find(h => h.date === dateTs);
+                        const cwsHardness = existing?.cwsHardness || 0;
+                        const makeupHardness = existing?.makeupHardness || 0;
+                        const cycles = makeupHardness > 0 ? cwsHardness / makeupHardness : 1;
+                        const record: CWSParameterRecord = {
+                            id: existing?.id || generateUUID(),
+                            tankId: tank.id,
+                            date: dateTs,
+                            circulationRate: d2.circulationRate,
+                            tempOutlet: d2.tempOutlet,
+                            tempReturn: d2.tempReturn,
+                            tempDiff: d2.tempDiff,
+                            cwsHardness: cwsHardness,
+                            makeupHardness: makeupHardness,
+                            concentrationCycles: cycles
+                        };
+                        await StorageService.saveCWSParam(record);
+                    }
+                    addLog(`  -> Updated CT-2`);
+                }
+            }
+            addLog("完成");
+            await loadHistory();
+        } catch (e: any) {
+            addLog(`錯誤: ${e.message}`);
+        } finally {
+            setImporting(false);
+        }
+    };
 
     // Initial Tanks Effect - select first one
     useEffect(() => {
@@ -534,6 +1097,27 @@ const DataEntryView: React.FC<{
         loadActiveSupply();
     }, [selectedTankId, date, readings, activeType]);
 
+    // Pre-fill CWS Input from History when Date/Tank changes
+    useEffect(() => {
+        if (activeType === 'C' && selectedTankId && date) {
+            const timestamp = getNormalizedTimestamp(date);
+            if (timestamp && historyCWS.length > 0) {
+                const existing = historyCWS.find(h => h.date === timestamp);
+                if (existing) {
+                    // Found existing record (e.g. from PI Import)
+                    setCwsInput(prev => ({
+                        ...prev,
+                        ...existing,
+                        dateStr: date // Ensure dateStr is kept
+                    }));
+                    return;
+                }
+            }
+            // Reset if no existing record found (but keep date/tankId implicit)
+            setCwsInput({ dateStr: date });
+        }
+    }, [activeType, selectedTankId, date, historyCWS]);
+
     const handleSubmitReadings = (e: React.FormEvent) => {
         e.preventDefault();
         if (!selectedTank) return;
@@ -543,14 +1127,25 @@ const DataEntryView: React.FC<{
         else if (lastReadingSG) finalSG = lastReadingSG;
         else if (activeSupply) finalSG = activeSupply.specificGravity;
 
-        const vol = parseFloat(levelCm) * selectedTank.factor;
+        // --- Handle Input Unit Conversion ---
+        let finalLevelCm = parseFloat(levelCm);
+        const inputVal = parseFloat(levelCm); // Keep original input for reference if needed
+
+        if (selectedTank.inputUnit === 'PERCENT') {
+            // Interpret "PERCENT" mode as "Meters Input" based on user requirement (e.g., 1.3 meters -> 130 cm)
+            // So we simply multiply by 100.
+            finalLevelCm = inputVal * 100;
+        }
+        // ------------------------------------
+
+        const vol = calculateTankVolume(selectedTank, finalLevelCm);
         const weight = vol * finalSG;
 
         const newReading: Reading = {
             id: Date.now().toString(),
             tankId: selectedTankId,
             timestamp: new Date(date).getTime(),
-            levelCm: parseFloat(levelCm),
+            levelCm: finalLevelCm,
             calculatedVolume: vol,
             calculatedWeightKg: weight,
             appliedSpecificGravity: finalSG,
@@ -562,7 +1157,7 @@ const DataEntryView: React.FC<{
         onSave(newReading);
         setLevelCm('');
         setCustomSG('');
-        alert('Table A: 液位紀錄已儲存');
+        alert(`Table A: 液位紀錄已儲存 (輸入: ${levelCm}${selectedTank.inputUnit === 'PERCENT' ? '%' : 'cm'} => 轉換: ${finalLevelCm.toFixed(1)}cm)`);
     };
 
     const handleSubmitContract = async (e: React.FormEvent) => {
@@ -571,36 +1166,79 @@ const DataEntryView: React.FC<{
             alert("請填寫所有必要欄位");
             return;
         }
-        const supply: ChemicalSupply = {
-            id: Date.now().toString(),
-            tankId: newSupply.tankId,
-            supplierName: newSupply.supplierName,
-            chemicalName: newSupply.chemicalName || '',
-            specificGravity: Number(newSupply.specificGravity),
-            price: newSupply.price ? Number(newSupply.price) : undefined,
-            startDate: new Date(newSupply.startDate).getTime(),
-            notes: newSupply.notes
-        } as ChemicalSupply;
 
-        await StorageService.saveSupply(supply);
+        // Fetch all supplies for validation and inheritance
+        const allSupplies = await StorageService.getSupplies();
+
+        // Check for inheritance if targetPpm is missing
+        let finalTargetPpm = newSupply.targetPpm ? Number(newSupply.targetPpm) : undefined;
+        if (finalTargetPpm === undefined) {
+            const tankSupplies = allSupplies
+                .filter(s => s.tankId === newSupply.tankId)
+                .sort((a, b) => b.startDate - a.startDate); // Latest first
+
+            if (tankSupplies.length > 0) {
+                finalTargetPpm = tankSupplies[0].targetPpm;
+            }
+        }
+
+        // Check for existing supply on the same day to prevent duplicates
+        const sameDaySupply = allSupplies.find(s =>
+            s.tankId === newSupply.tankId &&
+            s.startDate === new Date(newSupply.startDate as any).getTime()
+        );
+
+        let savedSupply: ChemicalSupply;
+
+        if (sameDaySupply) {
+            if (!confirm(`該儲槽在 ${newSupply.startDate} 已有合約紀錄，確定要覆蓋嗎？`)) return;
+
+            savedSupply = {
+                ...sameDaySupply, // Keep ID
+                supplierName: newSupply.supplierName,
+                chemicalName: newSupply.chemicalName || '',
+                specificGravity: Number(newSupply.specificGravity),
+                price: newSupply.price ? Number(newSupply.price) : undefined,
+                notes: newSupply.notes,
+                targetPpm: finalTargetPpm
+            };
+            await StorageService.updateSupply(savedSupply);
+            alert(`已更新現有的合約紀錄`);
+        } else {
+            savedSupply = {
+                id: generateUUID(),
+                tankId: newSupply.tankId!,
+                supplierName: newSupply.supplierName,
+                chemicalName: newSupply.chemicalName || '',
+                specificGravity: Number(newSupply.specificGravity),
+                price: newSupply.price ? Number(newSupply.price) : undefined,
+                startDate: new Date(newSupply.startDate as any).getTime(),
+                notes: newSupply.notes,
+                targetPpm: finalTargetPpm
+            };
+            await StorageService.saveSupply(savedSupply);
+            alert(`已新增合約紀錄`);
+        }
 
         // 自動重新計算該儲槽相關的液位紀錄比重
-        const supplyStartDate = supply.startDate;
+        const supplyStartDate = savedSupply.startDate;
         let sgUpdatedCount = 0;
         for (const reading of readings) {
             // 只處理同一儲槽且日期 >= 合約生效日的紀錄
-            if (reading.tankId === supply.tankId && reading.timestamp >= supplyStartDate) {
+            if (reading.tankId === savedSupply.tankId && reading.timestamp >= supplyStartDate) {
                 const activeSupply = await StorageService.getActiveSupply(reading.tankId, reading.timestamp);
                 if (activeSupply && activeSupply.specificGravity !== reading.appliedSpecificGravity) {
                     const tank = tanks.find(t => t.id === reading.tankId);
-                    const vol = reading.levelCm * (tank?.factor || 1);
-                    await StorageService.updateReading({
-                        ...reading,
-                        appliedSpecificGravity: activeSupply.specificGravity,
-                        calculatedWeightKg: vol * activeSupply.specificGravity,
-                        supplyId: activeSupply.id
-                    });
-                    sgUpdatedCount++;
+                    if (tank) {
+                        const vol = calculateTankVolume(tank, reading.levelCm);
+                        await StorageService.updateReading({
+                            ...reading,
+                            appliedSpecificGravity: activeSupply.specificGravity,
+                            calculatedWeightKg: vol * activeSupply.specificGravity,
+                            supplyId: activeSupply.id
+                        });
+                        sgUpdatedCount++;
+                    }
                 }
             }
         }
@@ -611,7 +1249,7 @@ const DataEntryView: React.FC<{
 
         setNewSupply({});
         loadHistory();
-        alert(`Table B: 合約紀錄已儲存${sgUpdatedCount > 0 ? `，並更新 ${sgUpdatedCount} 筆液位紀錄的比重` : ''}`);
+        alert(`Table B: 合約紀錄處理完成${sgUpdatedCount > 0 ? `，並更新 ${sgUpdatedCount} 筆液位紀錄的比重` : ''}`);
     }
 
     // Helper: Normalize date string "YYYY-MM-DD" or "YYYY/MM/DD" to timestamp at Local Midnight
@@ -620,31 +1258,64 @@ const DataEntryView: React.FC<{
 
     const handleSubmitCWS = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!cwsInput.tankId || !cwsInput.dateStr) return;
+        // Here tankId might be "CT-1", "CT-2" or specific tank ID (legacy support)
+        const selectedAreaOrTank = cwsInput.tankId;
+        if (!selectedAreaOrTank || !cwsInput.dateStr) return;
 
         try {
-            await StorageService.saveCWSParam({
-                tankId: cwsInput.tankId,
-                circulationRate: Number(cwsInput.circulationRate) || 0,
-                tempDiff: Number(cwsInput.tempDiff) || 0,
-                cwsHardness: Number(cwsInput.cwsHardness) || 0,
-                makeupHardness: Number(cwsInput.makeupHardness) || 0,
-                concentrationCycles: 1, // Default to 1 for manual entry
-                targetPpm: Number(cwsInput.targetPpm) || 0,
-                tempOutlet: Number(cwsInput.tempOutlet) || 0,
-                tempReturn: Number(cwsInput.tempReturn) || 0,
-                // Use normalized timestamp
-                date: getNormalizedTimestamp(cwsInput.dateStr)
-            });
-            onUpdateTank();
+            const tempOutlet = Number(cwsInput.tempOutlet) || 0;
+            const tempReturn = Number(cwsInput.tempReturn) || 0;
+            const cwsHardness = Number(cwsInput.cwsHardness) || 0;
+            const makeupHardness = Number(cwsInput.makeupHardness) || 0;
+
+            // 自動計算溫差
+            const tempDiff = tempReturn - tempOutlet;
+
+            // 自動計算濃縮倍數
+            const concentrationCycles = (makeupHardness > 0) ? cwsHardness / makeupHardness : 1;
+
+            // Determine target tanks
+            let targetTanks: Tank[] = [];
+            if (selectedAreaOrTank === 'CT-1' || selectedAreaOrTank === 'CT-2') {
+                targetTanks = tanks.filter(t =>
+                    t.system === SystemType.COOLING &&
+                    t.name.trim().toUpperCase().startsWith(selectedAreaOrTank)
+                );
+            } else {
+                const singleTank = tanks.find(t => t.id === selectedAreaOrTank);
+                if (singleTank) targetTanks = [singleTank];
+            }
+
+            if (targetTanks.length === 0) {
+                alert('找不到對應的儲槽');
+                return;
+            }
+
+            for (const tank of targetTanks) {
+                await StorageService.saveCWSParam({
+                    tankId: tank.id,
+                    circulationRate: Number(cwsInput.circulationRate) || 0,
+                    tempDiff: tempDiff,
+                    cwsHardness: cwsHardness,
+                    makeupHardness: makeupHardness,
+                    concentrationCycles: concentrationCycles,
+                    tempOutlet: tempOutlet,
+                    tempReturn: tempReturn,
+                    // Use normalized timestamp
+                    date: getNormalizedTimestamp(cwsInput.dateStr)
+                });
+            }
+
+
             await loadHistory();
-            setCwsInput({ ...cwsInput, circulationRate: undefined, tempDiff: undefined, cwsHardness: undefined, makeupHardness: undefined, targetPpm: undefined, tempOutlet: undefined, tempReturn: undefined }); // partial reset
-            alert('已更新 CWS 參數');
+            setCwsInput({ ...cwsInput, circulationRate: undefined, tempDiff: undefined, cwsHardness: undefined, makeupHardness: undefined, tempOutlet: undefined, tempReturn: undefined }); // partial reset
+            alert(`已更新 ${targetTanks.length} 個儲槽的 CWS 參數`);
         } catch (error) {
             console.error(error);
             alert('更新失敗');
         }
     };
+
 
     const handleSubmitBWS = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -654,13 +1325,20 @@ const DataEntryView: React.FC<{
             await StorageService.saveBWSParam({
                 tankId: bwsInput.tankId,
                 steamProduction: Number(bwsInput.steamProduction) || 0,
-                targetPpm: Number(bwsInput.targetPpm) || 0,
-                // Use normalized timestamp
-                date: getNormalizedTimestamp(bwsInput.dateStr)
+                // targetPpm removed from input, defaulting to 0 or handled by migration
+                // We keep the field optional in type but don't save it from input
+                // Or better: The backend might still expect it? The type definition says optional?
+                // Let's assume we just don't send it or send undefined.
+                // However, existing type BWSParameterRecord might have it.
+                // We will send undefined/null if the backend supports it, or 0.
+                // Since we are migrating, let's just omit it from the UI.
+                // For safety, checks if the backend needs it. 
+                // Assuming backend update isn't needed immediately if we just stop sending it or send 0.
+                date: getNormalizedTimestamp(bwsInput.dateStr) || Date.now()
             });
             onUpdateTank();
             await loadHistory();
-            setBwsInput({ ...bwsInput, steamProduction: undefined, targetPpm: undefined }); // partial reset
+            setBwsInput({ ...bwsInput, steamProduction: undefined }); // partial reset
             alert('已更新 BWS 參數');
         } catch (error) {
             console.error(error);
@@ -672,9 +1350,20 @@ const DataEntryView: React.FC<{
         if (!file) return;
 
         try {
-            const jsonData = await readExcelFile(file);
+            const rawJsonData = await readExcelFile(file);
+            // 1. Normalize keys (Trim whitespace)
+            const jsonData = rawJsonData.map((row: any) => {
+                const newRow: any = {};
+                Object.keys(row).forEach(key => {
+                    newRow[key.trim()] = row[key];
+                });
+                return newRow;
+            });
+
             let successCount = 0;
+            let failCount = 0; // Track skipped records
             let sgUpdatedCount = 0; // 追蹤比重更新的筆數
+            let convertedCount = 0; // Track % conversions
             const updatedTanks: Tank[] = []; // To trigger onUpdateTank for affected tanks
 
             // 偵錯輸出
@@ -687,6 +1376,7 @@ const DataEntryView: React.FC<{
             console.log('系統中的儲槽名稱:', tanks.map(t => t.name));
 
             if (activeType === 'A') {
+
                 const newReadings: Reading[] = [];
                 for (const row of jsonData) {
                     const tankName = row['儲槽名稱'] || row['TankName'] || row['儲槽'];
@@ -695,22 +1385,62 @@ const DataEntryView: React.FC<{
                     if (!targetTank) continue;
 
                     const keys = Object.keys(row);
+                    const i = jsonData.indexOf(row);
                     for (const key of keys) {
                         const readingDate = parseDateKey(key);
                         if (readingDate) {
                             const levelVal = row[key];
                             if (levelVal !== undefined && levelVal !== '' && !isNaN(Number(levelVal))) {
-                                const timestamp = readingDate.getTime();
-                                const lvl = parseFloat(levelVal);
+                                // Important: Use normalized timestamp (Midnight)
+                                const timestamp = getNormalizedTimestamp(readingDate);
+
+                                // DEBUG: Check specifically for Sulfuric tanks (CT-1 / CT-2 硫酸)
+                                // We check this for every row until we alert once.
+                                if (targetTank.name.includes('硫酸')) {
+                                    if (!(window as any).hasAlertedDebug) {
+                                        alert(`偵錯檢查:\n儲槽: ${targetTank.name}\n設定單位: ${targetTank.inputUnit}\n直徑/高度: ${targetTank.dimensions?.height || targetTank.dimensions?.diameter}\n讀取數值範例: ${levelVal}`);
+                                        (window as any).hasAlertedDebug = true;
+                                    }
+                                }
+
+                                if (!timestamp) {
+                                    console.warn(`[Skip] Row ${i + 1} Col ${key}: 無效日期`);
+                                    failCount++;
+                                    continue;
+                                }
+
+                                // Check future
+                                if (timestamp > Date.now()) {
+                                    console.warn(`[Skip] Row ${i + 1} Col ${key}: 未來日期 ${new Date(timestamp).toLocaleDateString()}`);
+                                    failCount++;
+                                    continue;
+                                }
+
+                                let lvl = parseFloat(levelVal);
+
+                                // Enhanced Percentage Detection logic
+                                const valStr = String(levelVal).trim();
+                                const hasPercentSign = valStr.includes('%');
+                                const isPercentMode = targetTank.inputUnit === 'PERCENT';
+
+                                if (isPercentMode || hasPercentSign) {
+                                    // Interpret as Meters -> CM (e.g. 1.3 -> 130cm)
+                                    // This applies to both manual "1.3%" (excel formatting) or "1.3" (raw number)
+                                    // We multiply by 100.
+                                    lvl = lvl * 100;
+                                    convertedCount++;
+                                }
+
+
                                 const supply = await StorageService.getActiveSupply(targetTank.id, timestamp);
                                 const sg = supply?.specificGravity || 1.0;
-                                const vol = lvl * targetTank.factor;
+                                const vol = calculateTankVolume(targetTank, lvl);
 
                                 // 這裡加入檢查邏輯：是否已經有同一天、同一個儲槽的紀錄？
                                 // 如果有，沿用該 ID 以達成「覆蓋」效果 (搭配後端 upsert)
                                 const existingReading = readings.find(r =>
                                     r.tankId === targetTank.id &&
-                                    new Date(r.timestamp).toDateString() === readingDate.toDateString()
+                                    new Date(r.timestamp).toDateString() === new Date(timestamp).toDateString()
                                 );
 
                                 newReadings.push({
@@ -730,9 +1460,87 @@ const DataEntryView: React.FC<{
                         }
                     }
                 }
-                if (successCount > 0) onBatchSave(newReadings);
+
+                if (newReadings.length > 0) {
+                    // === 液位合理性檢查 ===
+                    const warnings: string[] = [];
+
+                    // Group by tank for validation
+                    const tankGroups = new Map<string, Reading[]>();
+                    newReadings.forEach(r => {
+                        if (!tankGroups.has(r.tankId)) tankGroups.set(r.tankId, []);
+                        tankGroups.get(r.tankId)!.push(r);
+                    });
+
+                    tankGroups.forEach((tankNewReadings, tankId) => {
+                        const tank = tanks.find(t => t.id === tankId);
+                        if (!tank) return;
+
+                        // Combine existing + new readings for this tank, sorted by date
+                        const existingTankReadings = readings
+                            .filter(r => r.tankId === tankId)
+                            .sort((a, b) => a.timestamp - b.timestamp);
+
+                        const allReadings = [...existingTankReadings, ...tankNewReadings]
+                            .sort((a, b) => a.timestamp - b.timestamp);
+
+                        // Calculate tank capacity for threshold (use volume if available)
+                        const tankCapacity = tank.dimensions?.height
+                            ? calculateTankVolume(tank, tank.dimensions.height)
+                            : 10000; // Default 10000L if unknown
+                        const thresholdPercent = tank.validationThreshold ?? 30; // Use tank setting or default 30%
+                        const dailyThreshold = tankCapacity * (thresholdPercent / 100);
+
+                        // Check each new reading against its predecessor
+                        for (const newReading of tankNewReadings) {
+                            const idx = allReadings.findIndex(r => r.id === newReading.id);
+                            if (idx <= 0) continue; // No predecessor
+
+                            const prev = allReadings[idx - 1];
+                            const curr = newReading;
+
+                            const daysDiff = (curr.timestamp - prev.timestamp) / (1000 * 60 * 60 * 24);
+                            if (daysDiff <= 0) continue;
+
+                            // Calculate level change (considering refill)
+                            const addedAmount = curr.addedAmountLiters || 0;
+                            const levelChange = (prev.calculatedVolume + addedAmount) - curr.calculatedVolume;
+                            const dailyChange = Math.abs(levelChange) / daysDiff;
+
+                            // Check for abnormal change
+                            if (dailyChange > dailyThreshold) {
+                                const dateStr = new Date(curr.timestamp).toLocaleDateString();
+                                warnings.push(`[${dateStr}] ${tank.name}: 日均變動 ${dailyChange.toFixed(0)} L (閾值 ${dailyThreshold.toFixed(0)} L)`);
+                            }
+
+                            // Check for negative usage (level increased without refill record)
+                            if (levelChange < -100 && addedAmount === 0) { // Allow small tolerance
+                                const dateStr = new Date(curr.timestamp).toLocaleDateString();
+                                warnings.push(`[${dateStr}] ${tank.name}: 液位異常上升 ${Math.abs(levelChange).toFixed(0)} L (無補藥記錄)`);
+                            }
+                        }
+                    });
+
+                    // Show warning if any issues found
+                    if (warnings.length > 0) {
+                        const warningMsg = `發現 ${warnings.length} 筆可能異常的液位記錄:\n\n${warnings.slice(0, 10).join('\n')}${warnings.length > 10 ? `\n... 及另外 ${warnings.length - 10} 筆` : ''}\n\n這些數據可能是輸入錯誤。確定要繼續匯入嗎?`;
+                        if (!confirm(warningMsg)) {
+                            alert('已取消匯入，請核對資料後再試。');
+                            setFile(null);
+                            return;
+                        }
+                    }
+
+                    await onBatchSave(newReadings);
+                    (window as any).hasAlertedDebug = false; // Reset debug flag
+                    alert(`成功匯入 ${newReadings.length} 筆資料 (其中 ${convertedCount} 筆已自動從百分比換算為公分)。`);
+                }
             } else if (activeType === 'B') {
                 const newSupplies: ChemicalSupply[] = [];
+                const updatesToPerform: ChemicalSupply[] = [];
+                // Pre-fetch existing supplies for inheritance and duplicate check
+                const existingSupplies = await StorageService.getSupplies();
+
                 for (const row of jsonData) {
                     const dateRaw = row['生效日期'] || row['Date'];
                     const supplier = row['供應商'] || row['Supplier'];
@@ -747,22 +1555,81 @@ const DataEntryView: React.FC<{
                         const dateStr = formatDateForInput(dateRaw);
                         if (!dateStr) continue;
 
-                        newSupplies.push({
-                            id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+                        const targetPpmInput = row['目標藥劑濃度'] || row['目標濃度'] || row['Target PPM'];
+                        let finalTargetPpm = targetPpmInput ? parseFloat(targetPpmInput) : undefined;
+
+                        // Auto-inherit from previous record if missing
+                        if (finalTargetPpm === undefined) {
+                            // 1. Try to find in newly added supplies for this tank (Fill-down behavior within file)
+                            // We look for any PREVIOUSLY processed row for this tank in this batch
+                            const lastAdded = [...newSupplies, ...updatesToPerform].filter(s => s.tankId === t.id).sort((a, b) => b.startDate - a.startDate)[0];
+                            if (lastAdded && lastAdded.targetPpm !== undefined) {
+                                finalTargetPpm = lastAdded.targetPpm;
+                            } else {
+                                // 2. Try to find in existing DB history
+                                const dateMs = new Date(dateStr).getTime();
+                                const history = existingSupplies
+                                    .filter(s => s.tankId === t.id && s.startDate < dateMs)
+                                    .sort((a, b) => b.startDate - a.startDate);
+
+                                if (history.length > 0 && history[0].targetPpm !== undefined) {
+                                    finalTargetPpm = history[0].targetPpm;
+                                }
+                            }
+                        }
+
+                        const targetDateMs = new Date(dateStr).getTime();
+
+                        // Check if we already have this tank+date in current batch (deduplicate within file -> keep last one)
+                        // If we encounter a duplicate within the file, we should update the entry in 'newSupplies' or 'updatesToPerform' usually.
+                        // Ideally the file shouldn't have same date twice. If it does, last one wins.
+                        // We will remove previous entry from newSupplies if exists.
+                        const existingInBatchIndex = newSupplies.findIndex(s => s.tankId === t.id && s.startDate === targetDateMs);
+                        if (existingInBatchIndex >= 0) {
+                            newSupplies.splice(existingInBatchIndex, 1);
+                        }
+                        const existingInUpdatesBatchIndex = updatesToPerform.findIndex(s => s.tankId === t.id && s.startDate === targetDateMs);
+                        if (existingInUpdatesBatchIndex >= 0) {
+                            updatesToPerform.splice(existingInUpdatesBatchIndex, 1);
+                        }
+
+                        // Check if we already have this tank+date in DB (Overwrite logic)
+                        const existingInDB = existingSupplies.find(s => s.tankId === t.id && s.startDate === targetDateMs);
+
+                        const supplyObj: ChemicalSupply = {
+                            id: existingInDB ? existingInDB.id : generateUUID(), // Use existing ID if overwriting
                             tankId: t.id,
                             supplierName: supplier,
                             chemicalName: chem || '',
                             specificGravity: parseFloat(sg),
                             price: row['單價'] || row['Price'] ? parseFloat(row['單價'] || row['Price']) : undefined,
-                            startDate: new Date(dateStr).getTime(),
-                            notes: row['備註'] || row['Notes'] || ''
-                        });
+                            startDate: targetDateMs,
+                            notes: row['備註'] || row['Notes'] || '',
+                            targetPpm: finalTargetPpm
+                        };
+
+                        if (existingInDB) {
+                            updatesToPerform.push(supplyObj);
+                        } else {
+                            newSupplies.push(supplyObj);
+                        }
                         successCount++;
                     }
                 }
-                if (successCount > 0) {
-                    await StorageService.addSuppliesBatch(newSupplies);
 
+                // Batch Create New
+                if (newSupplies.length > 0) {
+                    await StorageService.addSuppliesBatch(newSupplies);
+                }
+
+                // Execute Updates (Sequentially or Parallel)
+                if (updatesToPerform.length > 0) {
+                    for (const update of updatesToPerform) {
+                        await StorageService.updateSupply(update);
+                    }
+                }
+
+                if (successCount > 0) {
                     // 自動重新計算所有液位紀錄的比重
                     for (const reading of readings) {
                         const supply = await StorageService.getActiveSupply(reading.tankId, reading.timestamp);
@@ -784,33 +1651,101 @@ const DataEntryView: React.FC<{
                     loadHistory();
                 }
             } else if (activeType === 'C') {
+                // 1. Pre-process and Sort (Sort by Date ASC for Fill-Down logic)
+                const validRows: any[] = [];
                 for (const row of jsonData) {
-                    const tankName = row['儲槽名稱'] || row['Tank'];
-                    if (!tankName) continue;
-                    const t = tanks.find(tank => tank.name.trim() === String(tankName).trim());
-                    if (!t) continue;
+                    // 使用「區域」欄位 (CT-1 或 CT-2)
+                    const areaName = row['區域'] || row['儲槽名稱'] || row['Tank'];
+                    if (!areaName) continue;
+                    const areaStr = String(areaName).trim().toUpperCase(); // Force uppercase for CT-1/CT-2 check
+
+                    let targetTanks: Tank[] = [];
+                    if (areaStr === 'CT-1' || areaStr === 'CT-2') {
+                        targetTanks = tanks.filter(t => t.system === SystemType.COOLING && t.name.startsWith(areaStr));
+                    } else {
+                        // Fallback: fuzzy match for single tank
+                        const t = tanks.find(tank => tank.name.includes(areaStr));
+                        if (t) targetTanks = [t];
+                    }
+
+                    if (targetTanks.length === 0) continue;
+
+                    const normalizedTs = getNormalizedTimestamp(row['日期'] || row['填表日期'] || row['Date']);
+                    const dateVal = normalizedTs ? getMonday(new Date(normalizedTs)).getTime() : null;
+                    const i = jsonData.indexOf(row);
+
+                    if (!dateVal) {
+                        console.warn(`[Skip] Row ${i + 1}: 無效日期`, row);
+                        failCount++;
+                        continue;
+                    }
+                    // Skip future
+                    if (dateVal > Date.now()) {
+                        console.warn(`[Skip] Row ${i + 1}: 未來日期 ${new Date(dateVal).toLocaleDateString()}`);
+                        failCount++;
+                        continue;
+                    }
+
+                    // Push a valid row for EACH target tank
+                    for (const t of targetTanks) {
+                        validRows.push({ row, t, date: dateVal, i });
+                    }
+                }
+
+                validRows.sort((a, b) => a.date - b.date);
+
+                // 2. Process each row
+                for (const { row, t, date } of validRows) {
                     const targetTankId = t.id;
 
-                    // Type C: CWS Parameters
-                    // Try to map Excel columns
-                    const record: CWSParameterRecord = {
-                        id: generateUUID(), // Temp ID
-                        tankId: targetTankId,
-                        circulationRate: parseFloat(row['循環水量'] || row['Circulation Rate'] || '0'),
-                        tempDiff: parseFloat(row['溫差'] || row['Delta T'] || '0'),
-                        cwsHardness: parseFloat(row['冷卻水硬度'] || row['CWS Hardness'] || '0'),
-                        makeupHardness: parseFloat(row['補水硬度'] || row['Makeup Hardness'] || '0'),
-                        concentrationCycles: parseFloat(row['濃縮倍數'] || row['Concentration Cycles'] || '1'),
-                        targetPpm: parseFloat(row['目標濃度'] || row['目標藥劑濃度'] || row['Target PPM'] || '0'),
-                        tempOutlet: parseFloat(row['出水溫'] || row['T1'] || '0'),
-                        tempReturn: parseFloat(row['回水溫'] || row['T2'] || '0'),
-                        date: getNormalizedTimestamp(row['日期'] || row['填表日期'] || row['Date'])
-                    };
+                    // Parse Excel Values
+                    const rowCirculation = parseFloat(row['循環水量'] || row['Circulation Rate'] || '0');
+                    const rowTempOutlet = parseFloat(row['出水溫'] || row['出水溫度'] || row['T1'] || '0');
+                    const rowTempReturn = parseFloat(row['回水溫'] || row['回水溫度'] || row['T2'] || '0');
+                    const cwsHardness = parseFloat(row['冷卻水硬度'] || row['CWS Hardness'] || '0');
+                    const makeupHardness = parseFloat(row['補水硬度'] || row['Makeup Hardness'] || '0');
 
-                    // Skip future dates
-                    if (record.date > Date.now()) {
-                        console.warn(`Skipping future CWS param: ${record.date}`);
-                        continue;
+                    // 自動計算 (Excel Row)
+                    const rowTempDiff = rowTempReturn - rowTempOutlet;
+                    const concentrationCycles = (makeupHardness > 0) ? cwsHardness / makeupHardness : 1;
+
+                    // 檢查是否已存在相同 tankId + date 的紀錄
+                    const existingHistory = await StorageService.getCWSParamsHistory(targetTankId);
+                    const existingRecord = existingHistory.find(h => h.date === date);
+
+                    let record: CWSParameterRecord;
+
+                    if (existingRecord) {
+                        // 若已存在：只更新硬度與濃縮倍數，保留原有的溫度與流量數據 (避免覆蓋 PI 系統數據)
+                        record = {
+                            ...existingRecord,
+                            id: existingRecord.id,
+                            tankId: targetTankId,
+                            date: date,
+                            // 更新欄位
+                            cwsHardness: cwsHardness,
+                            makeupHardness: makeupHardness,
+                            concentrationCycles: concentrationCycles,
+                            // 保護欄位 (明確保留原值)
+                            circulationRate: existingRecord.circulationRate,
+                            tempOutlet: existingRecord.tempOutlet,
+                            tempReturn: existingRecord.tempReturn,
+                            tempDiff: existingRecord.tempDiff
+                        };
+                    } else {
+                        // 若為新紀錄：使用 Excel 中的所有數據
+                        record = {
+                            id: generateUUID(),
+                            tankId: targetTankId,
+                            date: date,
+                            circulationRate: rowCirculation,
+                            tempOutlet: rowTempOutlet,
+                            tempReturn: rowTempReturn,
+                            tempDiff: rowTempDiff,
+                            cwsHardness: cwsHardness,
+                            makeupHardness: makeupHardness,
+                            concentrationCycles: concentrationCycles
+                        };
                     }
 
                     await StorageService.saveCWSParam(record);
@@ -819,51 +1754,81 @@ const DataEntryView: React.FC<{
                     }
                     successCount++;
                 }
+
                 if (updatedTanks.length > 0) {
-                    onUpdateTank(); // Trigger refresh for all affected tanks
+                    onUpdateTank();
+                    // Auto-Switch to populated tank
+                    const first = updatedTanks[0];
+                    setSelectedTankId(first.id);
+                    setCwsInput(prev => ({ ...prev, tankId: first.id }));
                 }
-                await loadHistory();
+                alert(`已匯入 ${successCount} 筆 CWS 數據 (略過 ${failCount} 筆)`);
             } else if (activeType === 'D') {
+                // BWS Excel Import
+                const newParams: BWSParameterRecord[] = [];
+
                 for (const row of jsonData) {
-                    const tankName = row['儲槽名稱'] || row['Tank'];
-                    if (!tankName) continue;
-                    const t = tanks.find(tank => tank.name.trim() === String(tankName).trim());
-                    if (!t) continue;
-                    const targetTankId = t.id;
+                    const tankName = row['儲槽名稱'] || row['TankName'] || row['儲槽'];
+                    const steam = row['蒸氣量'] || row['Steam'] || row['蒸氣總產量'];
 
-                    // Type D: BWS Parameters
-                    const record: BWSParameterRecord = {
-                        id: generateUUID(), // Temp ID
-                        tankId: targetTankId,
-                        steamProduction: parseFloat(row['蒸汽總產量'] || row['Steam Production'] || '0'),
-                        targetPpm: parseFloat(row['目標濃度'] || row['Target PPM'] || '0'),
-                        date: getNormalizedTimestamp(row['日期'] || row['填表日期'] || row['Date'])
-                    };
+                    if (tankName && steam !== undefined) {
+                        const targetTank = tanks.find(t => t.name.trim() === String(tankName).trim());
+                        if (!targetTank) continue;
 
-                    // Skip future dates
-                    if (record.date > Date.now()) {
-                        console.warn(`Skipping future BWS param: ${record.date}`);
-                        continue;
+                        const normalizedTs = getNormalizedTimestamp(row['日期'] || row['填表日期'] || row['Date']);
+                        const dateVal = normalizedTs ? getMonday(new Date(normalizedTs)).getTime() : null;
+                        const i = jsonData.indexOf(row);
+
+                        if (!dateVal) {
+                            console.warn(`[Skip] Row ${i + 1}: 無效日期`, row);
+                            failCount++;
+                            continue;
+                        }
+
+                        // 檢查是否已存在相同 tankId + date 的紀錄 (Overwrite Logic)
+                        const existingHistory = await StorageService.getBWSParamsHistory(targetTank.id);
+                        const existingRecord = existingHistory.find(h => h.date === dateVal);
+
+                        const newParam: BWSParameterRecord = {
+                            id: existingRecord?.id || generateUUID(), // 使用現有 ID 以達成覆蓋
+                            tankId: targetTank.id,
+                            steamProduction: Number(steam),
+                            date: dateVal
+                        };
+                        newParams.push(newParam);
+                        if (!updatedTanks.find(t => t.id === targetTank.id)) {
+                            updatedTanks.push(targetTank);
+                        }
+                        successCount++;
                     }
+                }
 
-                    await StorageService.saveBWSParam(record);
-                    if (updatedTanks.findIndex(tank => tank.id === targetTankId) === -1) {
-                        updatedTanks.push(t);
+                if (newParams.length > 0) {
+                    for (const param of newParams) {
+                        await StorageService.saveBWSParam(param);
                     }
-                    successCount++;
+                    if (updatedTanks.length > 0) {
+                        onUpdateTank();
+                    }
+                    loadHistory();
+                    alert(`已匯入 ${successCount} 筆 BWS 數據 (略過 ${failCount} 筆)`);
+                } else {
+                    alert('未找到有效數據');
                 }
-                if (updatedTanks.length > 0) {
-                    onUpdateTank(); // Trigger refresh for all affected tanks
-                }
-                await loadHistory();
             }
 
             // 組合完成訊息
-            let message = `匯入完成! 成功處理 ${successCount} 筆資料 (Type ${activeType})`;
+            let message = `匯入完成!\n成功: ${successCount} 筆`;
+            if (failCount > 0) {
+                message += `\n失敗/跳過: ${failCount} 筆 (請查看 Console 確認詳情)`;
+            }
             if (activeType === 'B' && sgUpdatedCount > 0) {
                 message += `\n\n已自動更新 ${sgUpdatedCount} 筆液位紀錄的比重`;
             }
-            alert(message);
+            // 不要為 C/D 顯示同樣的 alert 因為它們各自有
+            if (activeType === 'A' || activeType === 'B') {
+                alert(message);
+            }
             setFile(null);
 
         } catch (e: any) {
@@ -889,15 +1854,17 @@ const DataEntryView: React.FC<{
                 // 只在有找到合約且比重不同時才更新
                 if (supply && newSG !== reading.appliedSpecificGravity) {
                     const tank = tanks.find(t => t.id === reading.tankId);
-                    const vol = reading.levelCm * (tank?.factor || 1);
+                    if (tank) {
+                        const vol = calculateTankVolume(tank, reading.levelCm);
 
-                    updatedReadings.push({
-                        ...reading,
-                        appliedSpecificGravity: newSG,
-                        calculatedWeightKg: vol * newSG,
-                        supplyId: supply.id
-                    });
-                    updatedCount++;
+                        updatedReadings.push({
+                            ...reading,
+                            appliedSpecificGravity: newSG,
+                            calculatedWeightKg: vol * newSG,
+                            supplyId: supply.id
+                        });
+                        updatedCount++;
+                    }
                 }
             }
 
@@ -943,7 +1910,7 @@ const DataEntryView: React.FC<{
     };
 
     return (
-        <div className="max-w-5xl mx-auto space-y-6">
+        <div className="max-w-[1600px] mx-auto space-y-6">
             <div className="bg-white p-2 rounded-xl shadow-sm border border-slate-200 grid grid-cols-4 gap-2">
                 <button
                     onClick={() => setActiveType('A')}
@@ -979,7 +1946,7 @@ const DataEntryView: React.FC<{
                 </button>
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div className={`grid grid-cols-1 gap-8 ${['C', 'D'].includes(activeType) ? 'lg:grid-cols-3' : 'lg:grid-cols-2'}`}>
                 <Card
                     title={
                         activeType === 'A' ? "手動輸入 - 液位紀錄" :
@@ -1171,16 +2138,14 @@ const DataEntryView: React.FC<{
                                         tempDiff: Number(editForm.tempDiff),
                                         cwsHardness: Number(editForm.cwsHardness),
                                         makeupHardness: Number(editForm.makeupHardness),
-                                        concentrationCycles: Number(editForm.concentrationCycles),
-                                        targetPpm: Number(editForm.targetPpm)
+                                        concentrationCycles: Number(editForm.concentrationCycles)
                                     });
                                 } else if (activeType === 'D') {
                                     await StorageService.updateBWSParamRecord({
                                         ...editingItem,
                                         ...editForm,
                                         date: new Date(editForm.dateStr).getTime(),
-                                        steamProduction: Number(editForm.steamProduction),
-                                        targetPpm: Number(editForm.targetPpm)
+                                        steamProduction: Number(editForm.steamProduction)
                                     });
                                 }
 
@@ -1353,15 +2318,6 @@ const DataEntryView: React.FC<{
                                         {editForm.concentrationCycles || '-'} (自動計算: 冷卻水硬度/補水硬度)
                                     </div>
                                 </div>
-                                <div>
-                                    <label className="block text-sm font-medium text-slate-700">目標藥劑濃度 (ppm)</label>
-                                    <input
-                                        type="number" step="1"
-                                        className={inputClassName}
-                                        value={editForm.targetPpm || ''}
-                                        onChange={e => setEditForm({ ...editForm, targetPpm: e.target.value })}
-                                    />
-                                </div>
                             </>
                         )}
 
@@ -1375,15 +2331,6 @@ const DataEntryView: React.FC<{
                                         className={inputClassName}
                                         value={editForm.steamProduction || ''}
                                         onChange={e => setEditForm({ ...editForm, steamProduction: e.target.value })}
-                                    />
-                                </div>
-                                <div>
-                                    <label className="block text-sm font-medium text-slate-700">基準添加量 (ppm)</label>
-                                    <input
-                                        type="number" step="1"
-                                        className={inputClassName}
-                                        value={editForm.targetPpm || ''}
-                                        onChange={e => setEditForm({ ...editForm, targetPpm: e.target.value })}
                                     />
                                 </div>
                             </>
@@ -1428,8 +2375,14 @@ const DataEntryView: React.FC<{
                                     <input type="number" step="0.1" value={newSupply.price || ''} onChange={e => setNewSupply({ ...newSupply, price: parseFloat(e.target.value) })} className={inputClassName} />
                                 </div>
                                 <div>
+                                    <label className="block text-sm font-medium text-slate-700 mb-1">目標藥劑濃度 (ppm)</label>
+                                    <input type="number" step="0.1" value={newSupply.targetPpm || ''} onChange={e => setNewSupply({ ...newSupply, targetPpm: parseFloat(e.target.value) })} className={inputClassName} placeholder="選填" />
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-1 gap-4">
+                                <div>
                                     <label className="block text-sm font-medium text-slate-700 mb-1">生效日期</label>
-                                    <input type="date" onChange={e => setNewSupply({ ...newSupply, startDate: e.target.value as any })} className={inputClassName} required />
+                                    <input type="date" value={newSupply.startDate as any || ''} onClick={(e) => e.currentTarget.showPicker()} onChange={e => setNewSupply({ ...newSupply, startDate: e.target.value as any })} className={inputClassName} required />
                                 </div>
                             </div>
                             <div className="pt-2">
@@ -1490,6 +2443,7 @@ const DataEntryView: React.FC<{
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">供應商</th>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">藥劑名稱</th>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">比重</th>
+                                                <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">目標濃度</th>
                                                 <th className="px-3 py-2 text-right text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">操作</th>
                                             </tr>
                                         </thead>
@@ -1502,6 +2456,7 @@ const DataEntryView: React.FC<{
                                                     <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">{item.supplierName}</td>
                                                     <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">{item.chemicalName || '-'}</td>
                                                     <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">{item.specificGravity}</td>
+                                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">{item.targetPpm || '-'}</td>
                                                     <td className="px-3 py-2 whitespace-nowrap text-right text-sm">
                                                         <button
                                                             onClick={() => handleHistoryEdit(item)}
@@ -1537,26 +2492,32 @@ const DataEntryView: React.FC<{
                     {activeType === 'C' && (
                         <form onSubmit={handleSubmitCWS} className="space-y-4">
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">1. 選擇儲槽 (僅限 CWS)</label>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">1. 選擇區域 (僅限 CWS)</label>
                                 <select
                                     value={cwsInput.tankId || ''}
                                     onChange={e => {
                                         setCwsInput({ ...cwsInput, tankId: e.target.value });
-                                        setSelectedTankId(e.target.value);
+                                        // Clear current tank selection effectively or handle logic
+                                        // setSelectedTankId is mainly for displaying history below.
+                                        // If we pick a group, maybe we pick the first tank of the group to show history?
+                                        if (e.target.value === 'CT-1' || e.target.value === 'CT-2') {
+                                            const firstTank = tanks.find(t => t.name.startsWith(e.target.value));
+                                            if (firstTank) setSelectedTankId(firstTank.id);
+                                        } else {
+                                            setSelectedTankId(e.target.value);
+                                        }
                                     }}
                                     className={inputClassName}
                                     required
                                 >
                                     <option value="">-- 請選擇 --</option>
-                                    {tanks
-                                        .filter(t => t.system === SystemType.COOLING && t.calculationMethod === 'CWS_BLOWDOWN')
-                                        .map(t => <option key={t.id} value={t.id}>{t.name}</option>)
-                                    }
+                                    <option value="CT-1">CT-1 區域</option>
+                                    <option value="CT-2">CT-2 區域</option>
                                 </select>
                             </div>
                             <div>
                                 <label className="block text-sm font-medium text-slate-700 mb-1">2. 填表日期</label>
-                                <input type="date" value={cwsInput.dateStr || ''} onChange={e => setCwsInput({ ...cwsInput, dateStr: e.target.value })} className={inputClassName} required />
+                                <input type="date" value={cwsInput.dateStr || ''} onClick={(e) => e.currentTarget.showPicker()} onChange={e => setCwsInput({ ...cwsInput, dateStr: e.target.value })} className={inputClassName} required />
                             </div>
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
@@ -1564,8 +2525,18 @@ const DataEntryView: React.FC<{
                                     <input type="number" value={cwsInput.circulationRate || ''} onChange={e => setCwsInput({ ...cwsInput, circulationRate: parseFloat(e.target.value) })} className={inputClassName} placeholder="R" />
                                 </div>
                                 <div>
-                                    <label className="block text-sm font-medium text-slate-700 mb-1">溫差 ΔT (°C)</label>
-                                    <input type="number" step="0.1" value={cwsInput.tempDiff || ''} onChange={e => setCwsInput({ ...cwsInput, tempDiff: parseFloat(e.target.value) })} className={inputClassName} placeholder="dT" />
+                                    <label className="block text-sm font-medium text-slate-700 mb-1">出水溫度 T1 (°C)</label>
+                                    <input type="number" step="0.1" value={cwsInput.tempOutlet || ''} onChange={e => setCwsInput({ ...cwsInput, tempOutlet: parseFloat(e.target.value) })} className={inputClassName} placeholder="T1" />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-700 mb-1">回水溫度 T2 (°C)</label>
+                                    <input type="number" step="0.1" value={cwsInput.tempReturn || ''} onChange={e => setCwsInput({ ...cwsInput, tempReturn: parseFloat(e.target.value) })} className={inputClassName} placeholder="T2" />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-700 mb-1">溫差 ΔT (°C) <span className="text-slate-400 text-xs">(自動計算)</span></label>
+                                    <div className={`${inputClassName} bg-slate-100 text-slate-600`}>
+                                        {((cwsInput.tempOutlet || 0) - (cwsInput.tempReturn || 0)).toFixed(2) || '-'}
+                                    </div>
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-slate-700 mb-1">冷卻水硬度 (ppm)</label>
@@ -1576,8 +2547,12 @@ const DataEntryView: React.FC<{
                                     <input type="number" value={cwsInput.makeupHardness || ''} onChange={e => setCwsInput({ ...cwsInput, makeupHardness: parseFloat(e.target.value) })} className={inputClassName} />
                                 </div>
                                 <div className="col-span-2">
-                                    <label className="block text-sm font-medium text-slate-700 mb-1">目標藥劑濃度 (ppm)</label>
-                                    <input type="number" step="0.1" value={cwsInput.targetPpm || ''} onChange={e => setCwsInput({ ...cwsInput, targetPpm: parseFloat(e.target.value) })} className={inputClassName} />
+                                    <label className="block text-sm font-medium text-slate-700 mb-1">濃縮倍數 N <span className="text-slate-400 text-xs">(自動計算: 冷卻水硬度 / 補水硬度)</span></label>
+                                    <div className={`${inputClassName} bg-slate-100 text-slate-600`}>
+                                        {(cwsInput.cwsHardness && cwsInput.makeupHardness && cwsInput.makeupHardness > 0)
+                                            ? (cwsInput.cwsHardness / cwsInput.makeupHardness).toFixed(2)
+                                            : '-'}
+                                    </div>
                                 </div>
                             </div>
                             <div className="pt-2">
@@ -1637,7 +2612,6 @@ const DataEntryView: React.FC<{
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">週起始日</th>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">循環水量 (m³/hr)</th>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">溫差 (°C)</th>
-                                                <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">目標濃度 (ppm)</th>
                                                 <th className="px-3 py-2 text-right text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">操作</th>
                                             </tr>
                                         </thead>
@@ -1652,9 +2626,6 @@ const DataEntryView: React.FC<{
                                                     </td>
                                                     <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
                                                         {item.tempDiff || '-'}
-                                                    </td>
-                                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
-                                                        {item.targetPpm || '-'}
                                                     </td>
                                                     <td className="px-3 py-2 whitespace-nowrap text-right text-sm">
                                                         <button
@@ -1698,15 +2669,11 @@ const DataEntryView: React.FC<{
                             </div>
                             <div>
                                 <label className="block text-sm font-medium text-slate-700 mb-1">2. 填表日期</label>
-                                <input type="date" value={bwsInput.dateStr || ''} onChange={e => setBwsInput({ ...bwsInput, dateStr: e.target.value })} className={inputClassName} required />
+                                <input type="date" value={bwsInput.dateStr || ''} onClick={(e) => e.currentTarget.showPicker()} onChange={e => setBwsInput({ ...bwsInput, dateStr: e.target.value })} className={inputClassName} required />
                             </div>
                             <div>
                                 <label className="block text-sm font-medium text-slate-700 mb-1">週蒸汽總產量 (Ton/Week)</label>
                                 <input type="number" value={bwsInput.steamProduction || ''} onChange={e => setBwsInput({ ...bwsInput, steamProduction: parseFloat(e.target.value) })} className={inputClassName} placeholder="Steam" />
-                            </div>
-                            <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">目標藥劑濃度 (ppm)</label>
-                                <input type="number" step="0.1" value={bwsInput.targetPpm || ''} onChange={e => setBwsInput({ ...bwsInput, targetPpm: parseFloat(e.target.value) })} className={inputClassName} placeholder="Target" />
                             </div>
                             <div className="pt-2">
                                 <Button type="submit" className="w-full justify-center bg-orange-600 hover:bg-orange-700">更新 BWS 參數</Button>
@@ -1764,7 +2731,6 @@ const DataEntryView: React.FC<{
                                             <tr>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">週起始日</th>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">蒸汽總產量 (ton)</th>
-                                                <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">目標濃度 (ppm)</th>
                                                 <th className="px-3 py-2 text-right text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">操作</th>
                                             </tr>
                                         </thead>
@@ -1776,9 +2742,6 @@ const DataEntryView: React.FC<{
                                                     </td>
                                                     <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
                                                         {item.steamProduction || '-'}
-                                                    </td>
-                                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
-                                                        {item.targetPpm || '-'}
                                                     </td>
                                                     <td className="px-3 py-2 whitespace-nowrap text-right text-sm">
                                                         <button
@@ -1804,6 +2767,7 @@ const DataEntryView: React.FC<{
                     })()}
                 </Card>
 
+
                 <Card
                     title="Excel 批次匯入"
                     className="border-l-4 border-l-slate-400 bg-slate-50"
@@ -1822,14 +2786,15 @@ const DataEntryView: React.FC<{
                             {activeType === 'B' && (
                                 <ul className="list-disc list-inside">
                                     <li>必要欄位: <strong>儲槽名稱</strong> (或適用儲槽), <strong>供應商</strong>, <strong>比重</strong>, <strong>生效日期</strong></li>
-                                    <li>選填欄位: <strong>藥劑名稱</strong>, <strong>單價</strong>, <strong>備註</strong></li>
+                                    <li>選填欄位: <strong>藥劑名稱</strong>, <strong>單價</strong>, <strong>目標藥劑濃度</strong>, <strong>備註</strong></li>
                                 </ul>
                             )}
 
                             {activeType === 'C' && (
                                 <ul className="list-disc list-inside">
-                                    <li>必要欄位: <strong>儲槽名稱</strong></li>
-                                    <li>參數欄位: <strong>循環水量, 溫差...</strong></li>
+                                    <li>必要欄位: <strong>區域</strong></li>
+                                    <li>參數欄位: <strong>循環水量, 出水溫, 回水溫, 冷卻水硬度, 補水硬度...</strong></li>
+                                    <li>注意: <strong>溫差</strong> 與 <strong>濃縮倍數</strong> 將自動計算</li>
                                 </ul>
                             )}
 
@@ -1848,12 +2813,12 @@ const DataEntryView: React.FC<{
                                 accept=".csv, .xlsx, .xls"
                                 onChange={e => setFile(e.target.files ? e.target.files[0] : null)}
                                 className={`block w-full text-sm text-slate-500
-                          file:mr-4 file:py-2 file:px-4
-                          file:rounded-full file:border-0
-                          file:text-sm file:font-semibold
-                          file:bg-slate-200 file:text-slate-700
-                          hover:file:bg-slate-300
-                          cursor-pointer ${inputClassName} pl-1`}
+                              file:mr-4 file:py-2 file:px-4
+                              file:rounded-full file:border-0
+                              file:text-sm file:font-semibold
+                              file:bg-slate-200 file:text-slate-700
+                              hover:file:bg-slate-300
+                              cursor-pointer ${inputClassName} pl-1`}
                             />
                         </div>
 
@@ -1863,6 +2828,60 @@ const DataEntryView: React.FC<{
                         </Button>
                     </div>
                 </Card>
+
+                {/* PI Import Card for CWS & BWS */}
+                {(activeType === 'C' || activeType === 'D') && (
+                    <Card title={activeType === 'C' ? "冷卻水系統 (CWS) PI 匯入" : "鍋爐系統 (BWS) PI 匯入"} className="border-l-4 border-l-brand-400 bg-brand-50/30">
+                        <div className="space-y-4">
+                            <div className="bg-white p-4 rounded-lg border border-slate-200 text-sm text-slate-600">
+                                {activeType === 'C' ? (
+                                    <>讀取 CT-1 / CT-2 區域 Tags 的 <strong>Average</strong> 值。<br />自動寫入該週次的循環水量與溫度。</>
+                                ) : (
+                                    <>讀取 4 個 Steam Tags 的 <strong>Total</strong> 值 (加總 x 24)。<br />寫入所有鍋爐儲槽。</>
+                                )}
+                            </div>
+
+                            <div>
+                                <label className="block text-slate-500 text-xs mb-1">PI Web API URL</label>
+                                <input
+                                    type="text"
+                                    value={piBaseUrl}
+                                    onChange={e => setPiBaseUrl(e.target.value)}
+                                    className="w-full text-xs rounded border-slate-300 bg-white"
+                                />
+                            </div>
+
+                            <div className="flex items-end gap-3">
+                                <div className="flex-1">
+                                    <label className="block text-slate-500 text-sm mb-1">時間範圍</label>
+                                    <select
+                                        value={importWeeks}
+                                        onChange={(e) => setImportWeeks(Number(e.target.value))}
+                                        className="w-full rounded-lg border-slate-300 border p-2 bg-white text-slate-700"
+                                    >
+                                        <option value={1}>近 1 週</option>
+                                        <option value={4}>近 4 週</option>
+                                        <option value={12}>近 12 週</option>
+                                    </select>
+                                </div>
+                                <Button
+                                    onClick={activeType === 'C' ? handleBatchImportCWS : handleBatchImportBWS}
+                                    disabled={importing}
+                                    className="bg-brand-600 hover:bg-brand-700 text-white h-[40px] px-6"
+                                >
+                                    {importing ? "匯入中..." : `開始 ${activeType === 'C' ? 'CWS' : 'BWS'} 匯入`}
+                                </Button>
+                            </div>
+
+                            {importLogs.length > 0 && (
+                                <div className="mt-4 p-3 bg-slate-900 rounded border border-slate-700 max-h-32 overflow-y-auto font-mono text-xs text-slate-400">
+                                    {importLogs.map((log, i) => <div key={i}>{log}</div>)}
+                                </div>
+                            )}
+                        </div>
+                    </Card>
+                )}
+
             </div>
 
             <div className="flex justify-between pt-4 border-t border-slate-200">
@@ -1902,42 +2921,115 @@ const EditDialog: React.FC<{
     );
 };
 
-const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks, readings }) => {
+const AnalysisView: React.FC<{
+    tanks: Tank[],
+    readings: Reading[],
+    initialState?: { tankId: string, monthStr: string } | null,
+    onStateConsumed?: () => void
+}> = ({ tanks, readings, initialState, onStateConsumed }) => {
     const [selectedTankId, setSelectedTankId] = useState<string>(tanks[0]?.id || '');
 
-    const getLastCompleteWeek = () => {
+    const getLastMonthRange = () => {
         const today = new Date();
-        const dayOfWeek = today.getDay(); // 0(Sun) - 6(Sat)
-        const daysSinceLastSunday = dayOfWeek === 0 ? 7 : dayOfWeek;
-        const lastSunday = new Date(today);
-        lastSunday.setDate(today.getDate() - daysSinceLastSunday);
-        const lastMonday = new Date(lastSunday);
-        lastMonday.setDate(lastSunday.getDate() - 6);
+        const year = today.getFullYear();
+        const month = today.getMonth(); // 0-indexed (Jan=0)
+
+        // Previous month logic
+        // If Jan 2026 (month=0), we want Dec 2025.
+        // new Date(year, month - 1, 1) automatically handles year wrap-around.
+        const startOfLastMonth = new Date(year, month - 1, 1);
+        const endOfLastMonth = new Date(year, month, 0); // Last day of previous month
+
         return {
-            start: lastMonday.toISOString().split('T')[0],
-            end: lastSunday.toISOString().split('T')[0]
+            start: startOfLastMonth.toLocaleDateString('zh-CA'), // YYYY-MM-DD
+            end: endOfLastMonth.toLocaleDateString('zh-CA'),
+            yearMonth: `${startOfLastMonth.getFullYear()}-${String(startOfLastMonth.getMonth() + 1).padStart(2, '0')}`
         };
     };
-    const defaultRange = useMemo(() => getLastCompleteWeek(), []);
 
-    const [tempDateRange, setTempDateRange] = useState(defaultRange);
-    const [appliedDateRange, setAppliedDateRange] = useState(defaultRange);
+    const defaultRangeData = useMemo(() => getLastMonthRange(), []);
 
-    const [metric, setMetric] = useState<'KG' | 'L'>('KG');
+    // Default to Last Month Range
+    const [tempDateRange, setTempDateRange] = useState({ start: defaultRangeData.start, end: defaultRangeData.end });
+    const [appliedDateRange, setAppliedDateRange] = useState({ start: defaultRangeData.start, end: defaultRangeData.end });
+
+    // Month Picker State - Default to Last Month
+    const [selectedMonth, setSelectedMonth] = useState<string>(defaultRangeData.yearMonth);
+
+    // Initial State Handing
+    useEffect(() => {
+        if (initialState) {
+            console.log('AnalysisView applying initial state:', initialState);
+            if (initialState.tankId) setSelectedTankId(initialState.tankId);
+
+            if (initialState.monthStr) {
+                // Apply month string (YYYY-MM)
+                setSelectedMonth(initialState.monthStr);
+                const [year, month] = initialState.monthStr.split('-').map(Number);
+                const startDate = new Date(year, month - 1, 1);
+                const endDate = new Date(year, month, 0);
+
+                const startStr = startDate.toLocaleDateString('zh-CA');
+                const endStr = endDate.toLocaleDateString('zh-CA');
+
+                const newRange = { start: startStr, end: endStr };
+                setTempDateRange(newRange);
+                setAppliedDateRange(newRange);
+            }
+
+            if (onStateConsumed) onStateConsumed();
+        }
+    }, [initialState, onStateConsumed]);
+
+
+
+    // Help Tooltip State
+    const [helpTopic, setHelpTopic] = useState<'weekly' | 'monthly' | null>(null);
+
+    const handleMonthChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const val = e.target.value; // YYYY-MM
+        setSelectedMonth(val);
+        if (val) {
+            const [year, month] = val.split('-').map(Number);
+            const startDate = new Date(year, month - 1, 1);
+            const endDate = new Date(year, month, 0); // Last day of month
+
+            // Adjust to local timezone string YYYY-MM-DD
+            const startStr = startDate.toLocaleDateString('zh-CA'); // YYYY-MM-DD
+            const endStr = endDate.toLocaleDateString('zh-CA');
+
+            const newRange = { start: startStr, end: endStr };
+            setTempDateRange(newRange);
+            // Optional: Auto-apply? Let's just update temp range for consistency with user flow
+            // If user wants one-click apply, we can do setAppliedDateRange here too?
+            // Current flow suggests user clicks "Apply" button (filter icon?).
+            // Let's stick to update params, user clicks button if that exists, OR if the UI has auto-apply on month change?
+            // Looking at UI code (not fully visible here but assuming standard pattern):
+            // Usually there is handleApply or similar.
+            // But for Month Picking convenience, it might be better to auto-apply tempRange if the user uses the specific month picker.
+            // Let's just update temp for now.
+        }
+    };
+
+    const [metric, setMetric] = useState<'KG' | 'L' | '$'>('KG');
     const [bwsParamsHistory, setBwsParamsHistory] = useState<BWSParameterRecord[]>([]);
     const [cwsParamsHistory, setCwsParamsHistory] = useState<CWSParameterRecord[]>([]);
+    const [suppliesHistory, setSuppliesHistory] = useState<ChemicalSupply[]>([]);
 
     const selectedTank = tanks.find(t => t.id === selectedTankId);
 
-    // 載入該儲槽的參數歷史記錄
+    // 載入該儲槽的參數歷史記錄和藥劑合約歷史
     useEffect(() => {
         const loadParamsHistory = async () => {
             if (!selectedTankId) return;
             try {
                 const bwsHistory = await StorageService.getBWSParamsHistory(selectedTankId);
                 const cwsHistory = await StorageService.getCWSParamsHistory(selectedTankId);
+                const supplies = await StorageService.getSupplies();
+                const tankSupplies = supplies.filter(s => s.tankId === selectedTankId);
                 setBwsParamsHistory(bwsHistory);
                 setCwsParamsHistory(cwsHistory);
+                setSuppliesHistory(tankSupplies.sort((a, b) => b.startDate - a.startDate));
             } catch (error) {
                 console.error('載入參數歷史記錄失敗:', error);
             }
@@ -1945,40 +3037,34 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
         loadParamsHistory();
     }, [selectedTankId]);
 
-    // Time Range Options
-    const timeRanges = [
-        { label: '近 1 個月', value: 30 },
-        { label: '近 3 個月', value: 90 },
-        { label: '近 6 個月', value: 180 },
-        { label: '近 1 年', value: 365 },
-    ];
-
-    // 1. Process readings into daily continuous data
+    // 1. Process readings into daily continuous data (Extended for Weekly View)
+    // We strictly follow "Weekly View should show complete weeks (Mon-Sun)".
+    // So if user selects 12/1 (Tue) - 12/31, we extend start to 11/30 (Mon) and end to nearest Sun.
     const dailyData = useMemo(() => {
-        if (!selectedTank || readings.length < 2) {
-            console.log('[每週用量] dailyData: 數據不足', {
-                selectedTank: selectedTank?.name,
-                totalReadingsCount: readings.length
-            });
-            return [];
-        }
+        if (!selectedTank || readings.length < 2) return [];
 
-        const startTs = getNormalizedTimestamp(appliedDateRange.start);
-        const endTs = getNormalizedTimestamp(appliedDateRange.end) + (24 * 60 * 60 * 1000 - 1); // End of day
+        // Calculate Extended Range for Data Fetching
+        const userStart = new Date(appliedDateRange.start);
+        const userEnd = new Date(appliedDateRange.end);
+
+        // Extend Start to Monday
+        const startDay = userStart.getDay(); // 0=Sun, 1=Mon
+        const daysToMon = (startDay + 6) % 7; // If Mon(1)->0, Tue(2)->1... Sun(0)->6
+        const extStart = new Date(userStart);
+        extStart.setDate(userStart.getDate() - daysToMon);
+
+        // Extend End to Sunday
+        const endDay = userEnd.getDay(); // 0=Sun...
+        const daysToSun = (7 - endDay) % 7; // If Sun(0)->0, Mon(1)->6...
+        const extEnd = new Date(userEnd);
+        extEnd.setDate(userEnd.getDate() + daysToSun);
+
+        const startTs = getNormalizedTimestamp(extStart);
+        const endTs = getNormalizedTimestamp(extEnd) + (24 * 60 * 60 * 1000 - 1);
 
         const tankReadings = readings
             .filter(r => r.tankId === selectedTankId && r.timestamp >= startTs && r.timestamp <= endTs)
             .sort((a, b) => a.timestamp - b.timestamp);
-
-        console.log('[每週用量] 該儲槽讀數', {
-            tankId: selectedTankId,
-            tankName: selectedTank.name,
-            count: tankReadings.length,
-            dateRange: tankReadings.length > 0 ? {
-                from: new Date(tankReadings[0].timestamp).toLocaleDateString('zh-TW'),
-                to: new Date(tankReadings[tankReadings.length - 1].timestamp).toLocaleDateString('zh-TW')
-            } : null
-        });
 
         if (tankReadings.length < 1) return [];
 
@@ -2002,7 +3088,7 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                 endLevel = next.calculatedVolume;
                 totalUsage = (startLevel + next.addedAmountLiters) - endLevel;
             } else {
-                // Apply historic specific gravity
+                // Apply historic specific gravity for KG or Cost ($)
                 const addedKg = next.addedAmountLiters * next.appliedSpecificGravity;
                 startLevel = curr.calculatedWeightKg;
                 endLevel = next.calculatedWeightKg;
@@ -2015,9 +3101,20 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
             while (iterDate < new Date(next.timestamp)) {
                 const dateKey = iterDate.toISOString().split('T')[0];
                 if (!dailyMap.has(dateKey)) {
+                    let finalValue = dailyUsage;
+
+                    // If Cost metric, multiply by price
+                    if (metric === '$') {
+                        // Find active supply for this specific day to get price
+                        const dayTime = iterDate.getTime();
+                        const activeSupply = suppliesHistory.find(s => s.startDate <= dayTime);
+                        const price = activeSupply?.price || 0;
+                        finalValue = dailyUsage * price;
+                    }
+
                     dailyMap.set(dateKey, {
                         date: new Date(iterDate),
-                        usage: dailyUsage,
+                        usage: finalValue,
                         refill: 0,
                         level: metric === 'L' ? curr.calculatedVolume : curr.calculatedWeightKg
                     });
@@ -2026,39 +3123,18 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
             }
         }
 
-        const result = Array.from(dailyMap.values()).sort((a, b) => a.date.getTime() - b.date.getTime());
-        console.log('[每週用量] dailyData 生成完成', {
-            count: result.length,
-            dateRange: result.length > 0 ? {
-                from: result[0].date.toLocaleDateString('zh-TW'),
-                to: result[result.length - 1].date.toLocaleDateString('zh-TW')
-            } : null
-        });
-        return result;
+        return Array.from(dailyMap.values()).sort((a, b) => a.date.getTime() - b.date.getTime());
     }, [readings, selectedTankId, metric, selectedTank, appliedDateRange]);
 
-    // 2. Weekly Aggregation
+    // 2. Weekly Aggregation (Directly uses extended dailyData to form complete weeks)
     const weeklyData = useMemo(() => {
-        if (dailyData.length === 0) {
-            console.log('[每週用量] weeklyData: 每日數據為空');
-            return [];
-        }
-
-        // dailyData is already filtered by dateRange, so we just use it directly
-        const filteredDaily = dailyData;
-
-        console.log('[每週用量] 時間範圍篩選', {
-            dateRange: appliedDateRange,
-            filteredCount: filteredDaily.length
-        });
+        if (dailyData.length === 0) return [];
 
         const weeklyMap = new Map<string, { date: Date, dateStr: string, usage: number, avgLevel: number, count: number }>();
 
-        filteredDaily.forEach(day => {
+        dailyData.forEach(day => {
             const dayDate = new Date(day.date);
-            const dayNum = dayDate.getDay(); // 0=Sunday, 1=Monday, ..., 6=Saturday
-            // 計算距離本週星期一的天數
-            // 星期一=0天, 星期二=1天, ..., 星期日=6天
+            const dayNum = dayDate.getDay();
             const daysSinceMonday = (dayNum + 6) % 7;
             const weekStart = new Date(dayDate);
             weekStart.setDate(dayDate.getDate() - daysSinceMonday);
@@ -2082,32 +3158,27 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
             w.count += 1;
         });
 
-        const result = Array.from(weeklyMap.values()).map(w => ({
+        return Array.from(weeklyMap.values()).map(w => ({
             ...w,
             level: w.avgLevel / (w.count || 1)
         })).sort((a, b) => a.date.getTime() - b.date.getTime());
-
-        console.log('[每週用量] weeklyData 生成完成', {
-            count: result.length,
-            weeks: result.map(w => ({
-                week: w.dateStr,
-                usage: w.usage.toFixed(2),
-                level: w.level.toFixed(2),
-                days: w.count
-            }))
-        });
-
-        return result;
     }, [dailyData]);
 
     // 3. Monthly Comparison Data (Actual vs Theoretical)
     const monthlyComparisonData = useMemo(() => {
         if (!selectedTank || dailyData.length === 0) return [];
 
-        // dailyData is already filtered by dateRange
-        const filteredDaily = dailyData;
+        // STRICT filtering by appliedDateRange for Monthly Charts
+        // We do NOT want the extended days (padding for weeks) to affect monthly stats.
+        const userStart = getNormalizedTimestamp(appliedDateRange.start);
+        const userEnd = getNormalizedTimestamp(appliedDateRange.end) + (24 * 60 * 60 * 1000 - 1);
 
-        const monthlyMap = new Map<string, { date: Date, dateStr: string, actual: number, days: number }>();
+        const filteredDaily = dailyData.filter(d => {
+            const t = d.date.getTime();
+            return t >= userStart && t <= userEnd;
+        });
+
+        const monthlyMap = new Map<string, { date: Date, dateStr: string, actual: number, theoretical: number, days: number }>();
 
         filteredDaily.forEach(day => {
             const mKey = `${day.date.getFullYear()}-${String(day.date.getMonth() + 1).padStart(2, '0')}`;
@@ -2116,61 +3187,83 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                     date: new Date(day.date.getFullYear(), day.date.getMonth(), 1),
                     dateStr: `${day.date.getFullYear()}/${day.date.getMonth() + 1}`,
                     actual: 0,
+                    theoretical: 0,
                     days: 0
                 });
             }
             const m = monthlyMap.get(mKey)!;
             m.actual += day.usage;
             m.days++;
+
+            // --- Daily Theoretical Calculation ---
+            let dailyTheoretical = 0;
+            const dayTime = day.date.getTime();
+
+            // 1. Find effective Supply
+            const activeSupply = suppliesHistory.find(s => s.startDate <= dayTime);
+            const targetPpm = activeSupply?.targetPpm || 0;
+            const price = activeSupply?.price || 0; // Get price for cost calc
+
+            const calcMethod = selectedTank.calculationMethod || 'NONE';
+
+            if (calcMethod === 'CWS_BLOWDOWN') {
+                // Find parameters that COVER this day (Week Logic: Monday to Sunday)
+                // Assuming cwsParamsHistory stores date as Monday of the week
+                // We need to find a record where: record.date (Monday) <= dayTime < record.date + 7 days
+                const cwsParam = cwsParamsHistory.find(p => {
+                    const pDate = p.date || 0;
+                    const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                    return dayTime >= pDate && dayTime < pEnd;
+                }) || selectedTank.cwsParams;
+
+                if (cwsParam) {
+                    const { circulationRate, tempDiff, cwsHardness, makeupHardness, concentrationCycles } = cwsParam;
+                    const R = circulationRate || 0;
+                    const dT = tempDiff || 0;
+                    let C = 1;
+                    if (cwsHardness && makeupHardness && makeupHardness > 0) {
+                        C = cwsHardness / makeupHardness;
+                    } else if (concentrationCycles && concentrationCycles > 1) {
+                        C = concentrationCycles;
+                    }
+                    const E = (R * dT * 1.8 * 24) / 1000;
+                    const B = C > 1 ? E / (C - 1) : 0;
+                    dailyTheoretical = (B * targetPpm) / 1000;
+                }
+            } else if (calcMethod === 'BWS_STEAM') {
+                // Find parameters that COVER this day (Week Logic)
+                const bwsParam = bwsParamsHistory.find(p => {
+                    const pDate = p.date || 0;
+                    const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                    return dayTime >= pDate && dayTime < pEnd;
+                }) || selectedTank.bwsParams;
+
+                if (bwsParam && bwsParam.steamProduction) {
+                    const weeklySteam = bwsParam.steamProduction;
+                    const dailySteam = weeklySteam / 7;
+                    // targetPpm Migrated to Chemical Contract (already found as targetPpm variables above line 2266)
+                    const effectivePpm = targetPpm || 0;
+                    dailyTheoretical = (dailySteam * effectivePpm) / 1000;
+                }
+            }
+
+            // Convert Theoretical KG to Cost if metric is '$'
+            if (metric === '$') {
+                dailyTheoretical = dailyTheoretical * price;
+            }
+
+            m.theoretical += dailyTheoretical;
         });
 
-        const calcMethod = selectedTank.calculationMethod || 'NONE';
+        return Array.from(monthlyMap.values()).map(m => ({
+            dateStr: m.dateStr,
+            date: m.date,
+            actual: m.actual,
+            theoretical: m.theoretical,
+            deviation: m.theoretical > 0 ? ((m.actual - m.theoretical) / m.theoretical) * 100 : 0
+        })).sort((a, b) => a.date.getTime() - b.date.getTime());
 
-        return Array.from(monthlyMap.values()).map(m => {
-            let theoreticalTotal = 0;
-
-            if (calcMethod === 'CWS_BLOWDOWN' && selectedTank.cwsParams) {
-                const { circulationRate, tempDiff, targetPpm, cwsHardness, makeupHardness } = selectedTank.cwsParams;
-
-                let cycles = 1;
-                if (cwsHardness && makeupHardness && makeupHardness > 0) {
-                    cycles = cwsHardness / makeupHardness;
-                }
-
-                // Formula: E = R * dT * 1.8 / 1000 * 24 * Days
-                const E = (circulationRate * tempDiff * 1.8 * 24 * m.days) / 1000;
-                // B = E / (Cycles - 1)
-                const B = cycles > 1 ? E / (cycles - 1) : 0;
-                // Theoretical (kg) = B(m3) * ppm / 1000
-                theoreticalTotal = (B * targetPpm) / 1000;
-
-            } else if (calcMethod === 'BWS_STEAM' && selectedTank.bwsParams) {
-                const { steamProduction, targetPpm } = selectedTank.bwsParams;
-                // steamProduction is now Weekly.
-                // Formula: Daily = Weekly / 7. Total = Daily * Days
-                // Theoretical (kg) = Total Steam (Ton) * ppm / 1000
-                const dailySteam = steamProduction / 7;
-                theoreticalTotal = (dailySteam * m.days * targetPpm) / 1000;
-            }
-
-            // If metric is L, we need SG to convert theoretical KG back to L
-            // Simplified: assuming SG=1.0 for theoretical display in Liters, or user should switch to KG
-            // For accuracy, we usually compare KG in chemical engineering.
-            if (metric === 'L' && theoreticalTotal > 0) {
-                // Not converting back to L for theoretical currently as SG varies per batch. 
-                // Suggest viewing in KG.
-            }
-
-            return {
-                dateStr: m.dateStr,
-                date: m.date,
-                actual: m.actual,
-                theoretical: theoreticalTotal,
-                deviation: theoreticalTotal > 0 ? ((m.actual - theoreticalTotal) / theoreticalTotal) * 100 : 0
-            };
-        }).sort((a, b) => a.date.getTime() - b.date.getTime());
-
-    }, [dailyData, selectedTank, metric]);
+    }, [dailyData, selectedTank, metric, suppliesHistory, cwsParamsHistory, bwsParamsHistory, appliedDateRange]);
 
     // 4. Weekly Comparison Data (Actual vs Theoretical)
     const weeklyComparisonData = useMemo(() => {
@@ -2192,13 +3285,18 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                 // Only calculate if we have steamProduction for this week
                 if (weekData && weekData.steamProduction) {
                     const steamProduction = weekData.steamProduction;
-                    // targetPpm can fallback to previous week or default
-                    const targetPpm = weekData.targetPpm ||
-                        bwsParamsHistory
-                            .filter(p => (p.date || 0) < weekEndTime && p.targetPpm)
-                            .sort((a, b) => (b.date || 0) - (a.date || 0))[0]?.targetPpm ||
-                        selectedTank.bwsParams?.targetPpm || 0;
+                    // targetPpm Migrated to Chemical Contract check
+                    const activeSupply = suppliesHistory
+                        .filter(s => s.startDate <= weekEndTime)
+                        .sort((a, b) => b.startDate - a.startDate)[0];
+                    const targetPpm = activeSupply?.targetPpm || 0;
+                    const price = activeSupply?.price || 0;
+
                     theoreticalTotal = (steamProduction * targetPpm) / 1000;
+
+                    if (metric === '$') {
+                        theoreticalTotal = theoreticalTotal * price;
+                    }
                 }
                 // If no weekData with steamProduction, theoreticalTotal stays 0
             } else if (selectedTank.calculationMethod === 'CWS_BLOWDOWN') {
@@ -2215,21 +3313,11 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                 if (params && params.circulationRate && params.tempDiff) {
                     const { circulationRate, tempDiff, cwsHardness, makeupHardness, concentrationCycles } = params;
 
-                    // targetPpm priority: weekData > history fallback > tank default
-                    // Since 'params' might be 'selectedTank.cwsParams', we need to be careful.
-                    // If weekData exists, use its logic. If not, 'params' is tank defaults.
-
-                    let targetPpm = params.targetPpm || 0;
-                    if (weekData) {
-                        targetPpm = weekData.targetPpm ||
-                            cwsParamsHistory
-                                .filter(p => (p.date || 0) < weekEndTime && p.targetPpm)
-                                .sort((a, b) => (b.date || 0) - (a.date || 0))[0]?.targetPpm ||
-                            selectedTank.cwsParams?.targetPpm || 0;
-                    } else {
-                        // Fallback case: using tank defaults, so use tank's targetPpm
-                        targetPpm = selectedTank.cwsParams?.targetPpm || 0;
-                    }
+                    // targetPpm 從藥劑合約取得
+                    const activeSupply = suppliesHistory
+                        .filter(s => s.startDate <= weekEndTime)
+                        .sort((a, b) => b.startDate - a.startDate)[0];
+                    const targetPpm = activeSupply?.targetPpm || 0;
 
                     const days = 7;
                     const E = (circulationRate * tempDiff * 1.8 * 24 * days) / 1000;
@@ -2243,6 +3331,14 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
 
                     const BW = C > 1 ? E / (C - 1) : 0;
                     theoreticalTotal = (BW * targetPpm) / 1000;
+
+                    if (metric === '$') {
+                        const activeSupply = suppliesHistory
+                            .filter(s => s.startDate <= weekEndTime)
+                            .sort((a, b) => b.startDate - a.startDate)[0];
+                        const price = activeSupply?.price || 0;
+                        theoreticalTotal = theoreticalTotal * price;
+                    }
                 }
                 // If no weekData with production data, theoreticalTotal stays 0
             }
@@ -2261,6 +3357,15 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
 
     // Theoretical Calculation Details Card
     const TheoreticalUsageCard: React.FC<{ tank: Tank, weeklyData: any[] }> = ({ tank, weeklyData }) => {
+        // 取得該日期有效的藥劑合約 (用於取得 targetPpm)
+        const getActiveSupplyForDate = (date: Date): ChemicalSupply | undefined => {
+            const timestamp = date.getTime();
+            // 找到該日期之前最近的合約
+            return suppliesHistory
+                .filter(s => s.startDate <= timestamp)
+                .sort((a, b) => b.startDate - a.startDate)[0];
+        };
+
         // 對於每週數據,找出對應的參數記錄
         const getParamsForWeek = (weekStart: Date) => {
             const weekStartTime = weekStart.getTime();
@@ -2304,7 +3409,10 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
         const [selectedWeek, setSelectedWeek] = useState<{
             weekStr: string;
             params: any;
+
             calc: { E: number, C: number, BW: number, theoryUsage: number, cFormula: string };
+            targetPpm: number;
+            price: number;
         } | null>(null);
 
         if (tank.calculationMethod === 'CWS_BLOWDOWN') {
@@ -2321,8 +3429,8 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                                     <th className="p-2 font-semibold text-slate-800 text-right">溫差 ΔT (°C)</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">濃縮倍數 N</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">目標濃度 (ppm)</th>
-                                    <th className="p-2 font-semibold text-slate-800 text-right">理論用量 (kg)</th>
-                                    <th className="p-2 font-semibold text-slate-800 text-right">實際用量 (kg)</th>
+                                    <th className="p-2 font-semibold text-slate-800 text-right">理論用量 ({metric})</th>
+                                    <th className="p-2 font-semibold text-slate-800 text-right">實際用量 ({metric})</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">差異 %</th>
                                     <th className="p-2 font-semibold text-slate-800 text-center">操作</th>
                                 </tr>
@@ -2337,7 +3445,10 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                                     const tempDiff = p.tempDiff || 0;
                                     const cwsHardness = p.cwsHardness || 0;
                                     const makeupHardness = p.makeupHardness || 0;
-                                    const targetPpm = p.targetPpm || 0;
+
+                                    // 從藥劑合約取得 targetPpm
+                                    const activeSupply = getActiveSupplyForDate(week.date);
+                                    const targetPpm = activeSupply?.targetPpm || 0;
 
                                     const days = 7;
                                     const E = (circulationRate * tempDiff * 1.8 * 24 * days) / 1000;
@@ -2354,9 +3465,17 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                                     }
 
                                     const BW = C > 1 ? E / (C - 1) : 0;
-                                    const theoryUsage = (BW * targetPpm) / 1000;
 
-                                    const actualUsage = week.usage;
+                                    // Calculate Theoretical Usage
+                                    // If metric is '$', convert to Cost
+                                    // activeSupply already found above (Need to ensure price is available)
+                                    const price = activeSupply?.price || 0;
+                                    let theoryUsage = (BW * targetPpm) / 1000;
+                                    if (metric === '$') {
+                                        theoryUsage = theoryUsage * price;
+                                    }
+
+                                    const actualUsage = week.usage; // This is already in correct metric from weeklyData
                                     const diffPercent = theoryUsage > 0 ? ((actualUsage - theoryUsage) / theoryUsage * 100) : 0;
                                     const diffColor = Math.abs(diffPercent) > 20 ? 'text-red-600' :
                                         Math.abs(diffPercent) > 10 ? 'text-yellow-600' : 'text-green-600';
@@ -2370,7 +3489,9 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                                             onClick={() => setSelectedWeek({
                                                 weekStr: week.dateStr,
                                                 params: p,
-                                                calc: { E, C, BW, theoryUsage, cFormula }
+                                                calc: { E, C, BW, theoryUsage, cFormula },
+                                                targetPpm: targetPpm,
+                                                price: price
                                             })}
                                         >
                                             <td className="p-2 font-medium text-slate-700">{week.dateStr}</td>
@@ -2427,7 +3548,7 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                                         </div>
                                         <div className="bg-slate-50 p-3 rounded border border-slate-100">
                                             <span className="text-slate-500 block">目標濃度</span>
-                                            <span className="font-mono text-lg font-bold text-slate-800">{selectedWeek.params.targetPpm || 0} ppm</span>
+                                            <span className="font-mono text-lg font-bold text-slate-800">{selectedWeek.targetPpm || 0} ppm</span>
                                         </div>
                                     </div>
 
@@ -2462,11 +3583,21 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                                             </div>
 
                                             <div className="bg-yellow-50 p-4 rounded border border-yellow-200">
-                                                <h4 className="font-bold text-slate-800 mb-2">4. 藥品理論週用量</h4>
+                                                <h4 className="font-bold text-slate-800 mb-2">4. 藥品理論週用量 ({metric})</h4>
                                                 <div className="font-mono text-sm text-slate-700">
-                                                    = B.W x 目標濃度 ({selectedWeek.params.targetPpm} ppm) / 1000<br />
-                                                    = {selectedWeek.calc.BW.toFixed(1)} x {selectedWeek.params.targetPpm} / 1000<br />
-                                                    = <span className="text-red-600 font-bold text-xl">{selectedWeek.calc.theoryUsage.toFixed(1)} kg</span>
+                                                    {metric === '$' ? (
+                                                        <>
+                                                            = B.W x 目標濃度 / 1000 x 單價<br />
+                                                            = {selectedWeek.calc.BW.toFixed(1)} x {selectedWeek.targetPpm} / 1000 x {selectedWeek.price}<br />
+                                                            = <span className="text-red-600 font-bold text-xl">{selectedWeek.calc.theoryUsage.toFixed(1)} {metric}</span>
+                                                        </>
+                                                    ) : (
+                                                        <>
+                                                            = B.W x 目標濃度 ({selectedWeek.targetPpm} ppm) / 1000<br />
+                                                            = {selectedWeek.calc.BW.toFixed(1)} x {selectedWeek.targetPpm} / 1000<br />
+                                                            = <span className="text-red-600 font-bold text-xl">{selectedWeek.calc.theoryUsage.toFixed(1)} {metric}</span>
+                                                        </>
+                                                    )}
                                                 </div>
                                             </div>
                                         </div>
@@ -2498,8 +3629,8 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                                     <th className="p-2 font-semibold text-slate-800">週次</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">蒸汽總產量 (ton)</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">目標濃度 (ppm)</th>
-                                    <th className="p-2 font-semibold text-slate-800 text-right">理論用量 (kg)</th>
-                                    <th className="p-2 font-semibold text-slate-800 text-right">實際用量 (kg)</th>
+                                    <th className="p-2 font-semibold text-slate-800 text-right">理論用量 ({metric})</th>
+                                    <th className="p-2 font-semibold text-slate-800 text-right">實際用量 ({metric})</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">差異 %</th>
                                     <th className="p-2 font-semibold text-slate-800 text-center">數據來源</th>
                                 </tr>
@@ -2508,8 +3639,16 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                                 {weeklyData.map((week, idx) => {
                                     const params = getParamsForWeek(week.date) as BWSParameterRecord | undefined;
                                     const steamProduction = params?.steamProduction || tank.bwsParams?.steamProduction || 0;
-                                    const targetPpm = params?.targetPpm || tank.bwsParams?.targetPpm || 0;
-                                    const theoryUsage = (steamProduction * targetPpm) / 1000;
+
+                                    // Get Target PPM from Contract
+                                    const activeSupply = getActiveSupplyForDate(week.date);
+                                    const targetPpm = activeSupply?.targetPpm || 0;
+                                    const price = activeSupply?.price || 0;
+
+                                    let theoryUsage = (steamProduction * targetPpm) / 1000;
+                                    if (metric === '$') {
+                                        theoryUsage = theoryUsage * price;
+                                    }
 
                                     const weekStartTime = week.date.getTime();
                                     const weekEndTime = weekStartTime + (7 * 24 * 60 * 60 * 1000);
@@ -2569,6 +3708,14 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
 
                     <div className="flex items-center gap-2">
                         <input
+                            type="month"
+                            value={selectedMonth}
+                            onChange={handleMonthChange}
+                            className={`${inputClassName} w-40`}
+                            onClick={(e) => e.currentTarget.showPicker()}
+                        />
+                        <span className="text-slate-300">|</span>
+                        <input
                             type="date"
                             value={tempDateRange.start}
                             onClick={(e) => e.currentTarget.showPicker()}
@@ -2584,10 +3731,13 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                             className={inputClassName}
                         />
                         <Button
-                            onClick={() => setAppliedDateRange(tempDateRange)}
+                            onClick={() => {
+                                setAppliedDateRange(tempDateRange);
+                                setSelectedMonth(''); // Clear month selection if custom range applied
+                            }}
                             className="bg-brand-600 hover:bg-brand-700 text-white ml-2"
                         >
-                            套用
+                            查 用
                         </Button>
                     </div>
                 </div>
@@ -2595,6 +3745,7 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                     <div className="bg-white border rounded-lg p-1 flex">
                         <button onClick={() => setMetric('KG')} className={`px-3 py-1 rounded text-sm ${metric === 'KG' ? 'bg-brand-500 text-white' : 'text-slate-600'}`}>KG</button>
                         <button onClick={() => setMetric('L')} className={`px-3 py-1 rounded text-sm ${metric === 'L' ? 'bg-brand-500 text-white' : 'text-slate-600'}`}>L</button>
+                        <button onClick={() => setMetric('$')} className={`px-3 py-1 rounded text-sm ${metric === '$' ? 'bg-brand-500 text-white' : 'text-slate-600'}`}>$</button>
                     </div>
                 </div>
             </div>
@@ -2603,8 +3754,13 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                 {/* Weekly Comparison Chart - Left */}
                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                     <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
-                        <h3 className="font-semibold text-slate-800">
+                        <h3 className="font-semibold text-slate-800 flex items-center gap-2">
                             {hasCalculation ? `週用量 vs 理論值 (${metric})` : `週用量趨勢 (${metric})`}
+                            {hasCalculation && (
+                                <button onClick={() => setHelpTopic('weekly')} className="text-slate-400 hover:text-brand-500 transition-colors">
+                                    <Icons.Help className="w-4 h-4" />
+                                </button>
+                            )}
                         </h3>
                     </div>
                     <div className="p-6" style={{ height: '400px' }}>
@@ -2651,8 +3807,13 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
                 {/* Monthly Comparison Chart - Right */}
                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                     <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
-                        <h3 className="font-semibold text-slate-800">
+                        <h3 className="font-semibold text-slate-800 flex items-center gap-2">
                             {hasCalculation ? `月用量 vs 理論值 (${metric})` : `月用量趨勢 (${metric})`}
+                            {hasCalculation && (
+                                <button onClick={() => setHelpTopic('monthly')} className="text-slate-400 hover:text-brand-500 transition-colors">
+                                    <Icons.Help className="w-4 h-4" />
+                                </button>
+                            )}
                         </h3>
                     </div>
                     <div className="p-6" style={{ height: '400px' }}>
@@ -2699,6 +3860,62 @@ const AnalysisView: React.FC<{ tanks: Tank[], readings: Reading[] }> = ({ tanks,
             </div>
 
             <TheoreticalUsageCard tank={selectedTank} weeklyData={weeklyData} />
+
+            {/* Help Modal */}
+            {helpTopic && (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4" onClick={() => setHelpTopic(null)}>
+                    <div className="bg-white rounded-lg shadow-xl w-full max-w-lg animate-in fade-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
+                        <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-lg">
+                            <h3 className="text-lg font-bold text-slate-800 flex items-center">
+                                <Icons.Help className="w-5 h-5 mr-2 text-brand-500" />
+                                {helpTopic === 'weekly' ? '週理論用量計算說明' : '月理論用量計算說明'}
+                            </h3>
+                            <button onClick={() => setHelpTopic(null)} className="text-slate-400 hover:text-slate-600">
+                                <Icons.X className="w-5 h-5" />
+                            </button>
+                        </div>
+                        <div className="p-6 space-y-4 text-slate-700 text-sm">
+                            {helpTopic === 'weekly' ? (
+                                <div className="space-y-4">
+                                    <h4 className="font-bold text-brand-700">冷卻水系統 (CWS)</h4>
+                                    <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                        (循環水量 × 溫差 × 1.8 × 24hr × 7天) / 1000 / (濃縮倍數 - 1) × 目標濃度(ppm) / 1000
+                                    </div>
+                                    <p>依據當週的平均操作參數計算。</p>
+
+                                    <h4 className="font-bold text-orange-700 mt-4">鍋爐系統 (BWS)</h4>
+                                    <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                        (當週蒸氣總產量 × 目標濃度(ppm)) / 1000
+                                    </div>
+                                    <p>直接依據流量計回傳的蒸氣總量計算。</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    <h4 className="font-bold text-slate-800">計算原理</h4>
+                                    <p>月度理論值採用<span className="font-bold text-brand-600">「逐日加總」</span>方式計算：</p>
+                                    <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                        月總量 = ∑ (每日理論用量)
+                                    </div>
+                                    <ul className="list-disc pl-5 space-y-2 mt-2">
+                                        <li>
+                                            <span className="font-semibold">每日理論用量</span> = 對應週次的週理論用量 ÷ 7
+                                        </li>
+                                        <li>
+                                            系統會自動找出每一天所屬的週次參數進行計算。
+                                        </li>
+                                        <li>
+                                            此方式能精確處理由於月份天數不同 (28/30/31天) 以及週次跨月所導致的計算誤差，確保月度總和與實際天數完全吻合。
+                                        </li>
+                                    </ul>
+                                </div>
+                            )}
+                        </div>
+                        <div className="px-6 py-4 bg-slate-50 rounded-b-lg flex justify-end">
+                            <Button onClick={() => setHelpTopic(null)}>關閉</Button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };
@@ -2949,7 +4166,7 @@ const ImportantNotesView: React.FC = () => {
     );
 };
 
-const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tanks, onRefresh }) => {
+const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void }> = ({ tanks, readings, onRefresh }) => {
     const [editingTank, setEditingTank] = useState<Tank | null>(null);
 
     // Grouping logic similar to DashboardView
@@ -3083,6 +4300,38 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
         }
     }
 
+    const recalculateTankHistory = async (tankId: string) => {
+        const tank = tanks.find(t => t.id === tankId);
+        if (!tank) return;
+
+        const tankReadings = readings.filter(r => r.tankId === tankId);
+        let updatedCount = 0;
+        const updates: Reading[] = [];
+
+        for (const reading of tankReadings) {
+            const vol = calculateTankVolume(tank, reading.levelCm);
+            // Check if volume changed significantly (> 0.1 L)
+            if (Math.abs(vol - reading.calculatedVolume) > 0.1) {
+                const supply = await StorageService.getActiveSupply(reading.tankId, reading.timestamp);
+                const sg = supply?.specificGravity || reading.appliedSpecificGravity || 1.0;
+
+                updates.push({
+                    ...reading,
+                    calculatedVolume: vol,
+                    calculatedWeightKg: vol * sg,
+                    appliedSpecificGravity: sg
+                });
+                updatedCount++;
+            }
+        }
+
+        if (updates.length > 0) {
+            await StorageService.saveReadingsBatch(updates);
+            return updatedCount;
+        }
+        return 0;
+    };
+
     const handleSave = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!editingTank) return;
@@ -3097,14 +4346,31 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
         }
 
         await StorageService.saveTank(tankToSave);
+
+        // Ask for recalculation if dimensions might have changed
+        if (confirm('儲槽設定已更新。是否要根據新的設定重新計算此儲槽的所有歷史用量數據？\n(若您剛變更了形狀或尺寸，建議執行此操作)')) {
+            const count = await recalculateTankHistory(tankToSave.id);
+            alert(`已重新計算 ${count} 筆歷史資料`);
+        } else {
+            alert('儲槽設定已更新');
+        }
+
         await onRefresh();
         setEditingTank(null);
-        alert('儲槽設定已更新');
     };
 
     const updateTankField = (field: keyof Tank, value: any) => {
         if (!editingTank) return;
         setEditingTank({ ...editingTank, [field]: value });
+    };
+
+    const updateDimensions = (field: string, value: any) => {
+        if (!editingTank) return;
+        const currentDims = editingTank.dimensions || { diameter: 0 };
+        setEditingTank({
+            ...editingTank,
+            dimensions: { ...currentDims, [field]: value }
+        });
     };
 
     const updateCWSParam = (field: keyof CWSParameterRecord, value: any) => {
@@ -3153,21 +4419,193 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
                                 {Object.values(SystemType).map(s => <option key={s} value={s}>{s}</option>)}
                             </select>
                         </div>
-                        <div>
-                            <label className="block text-sm font-medium text-slate-700 mb-1">容量 (L)</label>
-                            <input type="number" value={editingTank.capacityLiters} onChange={e => updateTankField('capacityLiters', Number(e.target.value))} className={inputClassName} />
-                        </div>
-                        <div>
-                            <label className="block text-sm font-medium text-slate-700 mb-1">換算因子 (L/cm)</label>
-                            <input type="number" step="0.1" value={editingTank.factor} onChange={e => updateTankField('factor', Number(e.target.value))} className={inputClassName} />
-                        </div>
-                        <div>
-                            <label className="block text-sm font-medium text-slate-700 mb-1">安全低液位警戒 (%)</label>
-                            <input type="number" value={editingTank.safeMinLevel} onChange={e => updateTankField('safeMinLevel', Number(e.target.value))} className={inputClassName} />
-                        </div>
-                        <div className="md:col-span-2">
-                            <label className="block text-sm font-medium text-slate-700 mb-1">描述</label>
-                            <input type="text" value={editingTank.description || ''} onChange={e => updateTankField('description', e.target.value)} className={inputClassName} />
+                    </div>
+
+                    <div className="bg-slate-50 p-4 rounded-lg border border-slate-200">
+                        <h4 className="font-bold text-slate-700 mb-4">桶槽規格與形狀 (體積計算)</h4>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">形狀類型</label>
+                                <select
+                                    value={editingTank.shapeType || 'VERTICAL_CYLINDER'}
+                                    onChange={e => updateTankField('shapeType', e.target.value)}
+                                    className={inputClassName}
+                                >
+                                    <option value="VERTICAL_CYLINDER">垂直圓柱 (Vertical Cylinder)</option>
+                                    <option value="HORIZONTAL_CYLINDER">臥式圓柱 (Horizontal Cylinder)</option>
+                                    <option value="RECTANGULAR">方形/矩形 (Rectangular)</option>
+                                </select>
+                            </div>
+
+                            {/* Height / Max Level */}
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">桶槽高度/最大液位 (cm)</label>
+                                <input
+                                    type="number"
+                                    value={editingTank.dimensions?.height || ''}
+                                    onChange={e => updateDimensions('height', Number(e.target.value))}
+                                    className={inputClassName}
+                                    placeholder="參考用"
+                                />
+                            </div>
+
+                            {/* Sensor Offset */}
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">
+                                    液位計零點偏差 (cm)
+                                    <span className="text-xs text-slate-400 ml-1">(若法蘭非桶底)</span>
+                                </label>
+                                <input
+                                    type="number"
+                                    value={editingTank.dimensions?.sensorOffset || 0}
+                                    onChange={e => updateDimensions('sensorOffset', Number(e.target.value))}
+                                    className={inputClassName}
+                                />
+                            </div>
+
+                            {/* Shape Specific Dimensions */}
+                            {(editingTank.shapeType === 'VERTICAL_CYLINDER' || !editingTank.shapeType) && (
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-700 mb-1">直徑 (ID, cm)</label>
+                                    <input
+                                        type="number"
+                                        value={editingTank.dimensions?.diameter || ''}
+                                        onChange={e => updateDimensions('diameter', Number(e.target.value))}
+                                        className={inputClassName}
+                                    />
+                                </div>
+                            )}
+
+                            {editingTank.shapeType === 'HORIZONTAL_CYLINDER' && (
+                                <>
+                                    <div>
+                                        <label className="block text-sm font-medium text-slate-700 mb-1">直徑 (ID, cm)</label>
+                                        <input
+                                            type="number"
+                                            value={editingTank.dimensions?.diameter || ''}
+                                            onChange={e => updateDimensions('diameter', Number(e.target.value))}
+                                            className={inputClassName}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-slate-700 mb-1">
+                                            直管段長度 (T.L.-T.L., cm)
+                                        </label>
+                                        <input
+                                            type="number"
+                                            value={editingTank.dimensions?.length || ''}
+                                            onChange={e => updateDimensions('length', Number(e.target.value))}
+                                            className={inputClassName}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-slate-700 mb-1">封頭形狀</label>
+                                        <select
+                                            value={editingTank.dimensions?.headType || 'SEMI_ELLIPTICAL_2_1'}
+                                            onChange={e => updateDimensions('headType', e.target.value)}
+                                            className={inputClassName}
+                                        >
+                                            <option value="SEMI_ELLIPTICAL_2_1">2:1 半橢圓 (Standard)</option>
+                                            <option value="HEMISPHERICAL">半球形 (Hemispherical)</option>
+                                            <option value="FLAT">平底 (Flat)</option>
+                                        </select>
+                                    </div>
+                                </>
+                            )}
+
+                            {editingTank.shapeType === 'RECTANGULAR' && (
+                                <>
+                                    <div>
+                                        <label className="block text-sm font-medium text-slate-700 mb-1">長度 (cm)</label>
+                                        <input
+                                            type="number"
+                                            value={editingTank.dimensions?.length || ''}
+                                            onChange={e => updateDimensions('length', Number(e.target.value))}
+                                            className={inputClassName}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-slate-700 mb-1">寬度 (cm)</label>
+                                        <input
+                                            type="number"
+                                            value={editingTank.dimensions?.width || ''}
+                                            onChange={e => updateDimensions('width', Number(e.target.value))}
+                                            className={inputClassName}
+                                        />
+                                    </div>
+                                </>
+                            )}
+
+                            {/* Legacy Factor Override */}
+                            <div className="md:col-span-2 border-t border-slate-200 pt-4 mt-2">
+                                <label className="block text-sm font-medium text-slate-500 mb-1">
+                                    換算因子 Override (L/cm)
+                                    <span className="text-xs text-slate-400 ml-2">(若設定此值，與計算結果不符時可能導致混淆，建議僅在「垂直圓柱」且未輸入直徑時使用)</span>
+                                </label>
+                                <input type="number" step="0.1" value={editingTank.factor} onChange={e => updateTankField('factor', Number(e.target.value))} className={`${inputClassName} bg-slate-800 text-slate-300`} />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">容量標示 (L)</label>
+                                <input type="number" value={editingTank.capacityLiters} onChange={e => updateTankField('capacityLiters', Number(e.target.value))} className={inputClassName} />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">安全低液位警戒 (%)</label>
+                                <input type="number" value={editingTank.safeMinLevel} onChange={e => updateTankField('safeMinLevel', Number(e.target.value))} className={inputClassName} />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">
+                                    匯入異常檢測閾值 (%)
+                                    <span className="text-xs text-slate-400 ml-1">(日均變動超過容量此比例則警告)</span>
+                                </label>
+                                <input
+                                    type="number"
+                                    min="0.1"
+                                    max="100"
+                                    step="0.1"
+                                    value={editingTank.validationThreshold ?? 30}
+                                    onChange={e => updateTankField('validationThreshold', Number(e.target.value))}
+                                    className={inputClassName}
+                                    placeholder="預設 30"
+                                />
+                            </div>
+                            <div className="md:col-span-2">
+                                <label className="block text-sm font-medium text-slate-700 mb-1">描述</label>
+                                <input type="text" value={editingTank.description || ''} onChange={e => updateTankField('description', e.target.value)} className={inputClassName} />
+                            </div>
+
+                            <div className="md:col-span-2 mt-4 p-3 bg-slate-50 rounded border border-slate-200">
+                                <label className="block text-sm font-medium text-slate-700 mb-2">輸入單位 (Input Unit)</label>
+                                <div className="flex gap-4">
+                                    <label className="flex items-center gap-2 cursor-pointer">
+                                        <input
+                                            type="radio"
+                                            name="inputUnit"
+                                            value="CM"
+                                            checked={editingTank.inputUnit !== 'PERCENT'}
+                                            onChange={() => updateTankField('inputUnit', 'CM')}
+                                            className="text-brand-600 focus:ring-brand-500"
+                                        />
+                                        <span>公分 (cm)</span>
+                                    </label>
+                                    <label className="flex items-center gap-2 cursor-pointer">
+                                        <input
+                                            type="radio"
+                                            name="inputUnit"
+                                            value="PERCENT"
+                                            checked={editingTank.inputUnit === 'PERCENT'}
+                                            onChange={() => updateTankField('inputUnit', 'PERCENT')}
+                                            className="text-brand-600 focus:ring-brand-500"
+                                        />
+                                        <span>百分比 (%)</span>
+                                    </label>
+                                </div>
+                                {editingTank.inputUnit === 'PERCENT' && (
+                                    <p className="text-xs text-amber-600 mt-1">
+                                        注意：選擇百分比模式時，系統將依據「直徑」或「最大液位」自動換算為公分 ( 100% = 最大液位 )。
+                                    </p>
+                                )}
+                            </div>
                         </div>
                     </div>
 
@@ -3206,10 +4644,6 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
                                     <label className="block text-xs font-medium text-sky-700 mb-1">濃縮倍數 N</label>
                                     <input type="number" step="0.1" value={editingTank.cwsParams?.concentrationCycles || 0} onChange={e => updateCWSParam('concentrationCycles', Number(e.target.value))} className={inputClassName} />
                                 </div>
-                                <div>
-                                    <label className="block text-xs font-medium text-sky-700 mb-1">目標點 ppm</label>
-                                    <input type="number" step="0.1" value={editingTank.cwsParams?.targetPpm || 0} onChange={e => updateCWSParam('targetPpm', Number(e.target.value))} className={inputClassName} />
-                                </div>
                             </div>
                         </div>
                     )}
@@ -3224,10 +4658,7 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
                                     <label className="block text-xs font-medium text-orange-700 mb-1">每週蒸汽總產量 (Tons/Week)</label>
                                     <input type="number" value={editingTank.bwsParams?.steamProduction || 0} onChange={e => updateBWSParam('steamProduction', Number(e.target.value))} className={inputClassName} />
                                 </div>
-                                <div>
-                                    <label className="block text-xs font-medium text-orange-700 mb-1">目標點 ppm</label>
-                                    <input type="number" step="0.1" value={editingTank.bwsParams?.targetPpm || 0} onChange={e => updateBWSParam('targetPpm', Number(e.target.value))} className={inputClassName} />
-                                </div>
+
                             </div>
                         </div>
                     )}
@@ -3429,14 +4860,55 @@ const SettingsView: React.FC<{ tanks: Tank[], onRefresh: () => void }> = ({ tank
     )
 }
 
-type ViewType = 'dashboard' | 'entry' | 'analysis' | 'settings' | 'notes';
+type ViewType = 'dashboard' | 'entry' | 'analysis' | 'settings' | 'notes' | 'annual' | 'pi-test' | 'import';
 
 const App: React.FC = () => {
     const [currentView, setCurrentView] = useState<ViewType>('dashboard');
     const [tanks, setTanks] = useState<Tank[]>([]);
     const [readings, setReadings] = useState<Reading[]>([]);
 
+    // Navigation State for jumping to Analysis
+    const [analysisInitialState, setAnalysisInitialState] = useState<{ tankId: string, monthStr: string } | null>(null);
 
+    // Persist UserName
+    const [userName, setUserName] = useState(() => localStorage.getItem('appUserName') || 'OP');
+
+    // Auto-detect user from server
+    useEffect(() => {
+        const fetchUser = async () => {
+            try {
+                const res = await fetch('./api/whoami');
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.username) {
+                        setUserName(data.username);
+                        localStorage.setItem('appUserName', data.username);
+                    }
+                }
+            } catch (e) {
+                console.warn('Failed to auto-detect user:', e);
+            }
+        };
+        fetchUser();
+    }, []);
+
+    const handleNameChange = () => {
+        const newName = prompt("請輸入您的名稱 (顯示於右上角):", userName);
+        if (newName && newName.trim()) {
+            setUserName(newName.trim());
+            localStorage.setItem('appUserName', newName.trim());
+        }
+    };
+
+
+
+    const handleNavigateToAnalysis = (tankId: string, month: number, year: number) => {
+        // month is 1-based (1-12)
+        const monthStr = `${year}-${String(month).padStart(2, '0')}`;
+        console.log('Navigating to Analysis:', { tankId, monthStr });
+        setAnalysisInitialState({ tankId, monthStr });
+        setCurrentView('analysis');
+    };
 
     const refreshData = async () => {
         try {
@@ -3467,11 +4939,20 @@ const App: React.FC = () => {
 
     const renderContent = () => {
         switch (currentView) {
-            case 'dashboard': return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} />;
+            case 'dashboard': return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} onNavigate={handleNavigateToAnalysis} />;
             case 'entry': return <DataEntryView tanks={tanks} readings={readings} onSave={handleSaveReading} onBatchSave={handleBatchSaveReadings} onUpdateTank={() => refreshData()} />;
-            case 'analysis': return <AnalysisView tanks={tanks} readings={readings} />;
-            case 'settings': return <SettingsView tanks={tanks} onRefresh={refreshData} />;
+            case 'analysis': return (
+                <AnalysisView
+                    tanks={tanks}
+                    readings={readings}
+                    initialState={analysisInitialState}
+                    onStateConsumed={() => setAnalysisInitialState(null)}
+                />
+            );
+            case 'settings': return <SettingsView tanks={tanks} readings={readings} onRefresh={refreshData} />;
             case 'notes': return <ImportantNotesView />;
+            case 'annual': return <AnnualDataView tanks={tanks} readings={readings} onNavigate={handleNavigateToAnalysis} />;
+            case 'import': return <ExcelImportView tanks={tanks} onComplete={refreshData} />;
             default: return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} />;
         }
     };
@@ -3498,9 +4979,11 @@ const App: React.FC = () => {
 
                 <nav className="flex-1 overflow-y-auto py-4 space-y-1">
                     <NavItem view="dashboard" icon={Icons.Dashboard} label="總覽看板" />
-                    <NavItem view="entry" icon={Icons.Entry} label="數據輸入" />
                     <NavItem view="analysis" icon={Icons.Analysis} label="用量分析" />
+                    <NavItem view="annual" icon={Icons.Calendar} label="年度數據" />
                     <NavItem view="notes" icon={Icons.Notes} label="重要紀事" />
+                    <NavItem view="entry" icon={Icons.Entry} label="數據輸入" />
+                    <NavItem view="import" icon={Icons.FileText} label="辨識匯入" />
                     <NavItem view="settings" icon={Icons.Settings} label="儲槽設定" />
                 </nav>
             </aside>
@@ -3518,8 +5001,12 @@ const App: React.FC = () => {
                         <div className="text-sm text-slate-500">
                             {new Date().toLocaleDateString()}
                         </div>
-                        <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center text-slate-600 font-bold text-xs">
-                            OP
+                        <div
+                            onClick={handleNameChange}
+                            className="w-8 h-8 rounded-full bg-slate-200 hover:bg-slate-300 cursor-pointer flex items-center justify-center text-slate-600 font-bold text-xs transition-colors"
+                            title="點擊修改名稱"
+                        >
+                            {userName.substring(0, 2).toUpperCase()}
                         </div>
                     </div>
                 </header>

@@ -23,7 +23,10 @@ import {
   GripVertical,
   RefreshCw,
   Calculator,
-  Import
+  Import,
+  Calendar,
+  FileText,
+  HelpCircle
 } from 'lucide-react';
 
 export const Icons = {
@@ -52,5 +55,8 @@ export const Icons = {
   DragHandle: GripVertical,
   Import: Import,
   Recycle: RefreshCw,
-  Calculator: Calculator
+  Calculator: Calculator,
+  Calendar: Calendar,
+  FileText: FileText,
+  Help: HelpCircle
 };

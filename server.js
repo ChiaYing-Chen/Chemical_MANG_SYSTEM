@@ -1,9 +1,15 @@
 import express from 'express';
 import pg from 'pg';
 import cors from 'cors';
+import fetch from 'node-fetch';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
+// ... (skip down to proxy imports/setup if needed, but cleanest to add import at top)
+
+// ...
+
+
 
 const { Pool } = pg;
 const app = express();
@@ -198,6 +204,34 @@ app.get('/', (req, res) => {
     `);
 });
 
+
+
+// ==================== User Identity API ====================
+app.get('/api/whoami', (req, res) => {
+    // Check various headers that IIS or proxies might set
+    // x-iisnode-auth_user is standard for iisnode with Windows Auth
+    // remote_user, x-forwarded-user are common in other setups
+    const rawUser = req.headers['x-iisnode-auth_user'] ||
+        req.headers['auth-user'] ||
+        req.headers['x-forwarded-user'] ||
+        req.headers['remote_user'] ||
+        '';
+
+    let username = String(rawUser).trim();
+
+    // If empty, we can't detect
+    if (!username) {
+        return res.json({ username: null });
+    }
+
+    // Remove domain prefix if present (e.g. "DOMAIN\User" -> "User")
+    if (username.includes('\\')) {
+        username = username.split('\\').pop();
+    }
+
+    res.json({ username });
+});
+
 // ==================== Tank APIs ====================
 
 // 取得所有儲槽
@@ -213,6 +247,7 @@ app.get('/api/tanks', async (req, res) => {
             let cws_params = null;
             let bws_params = null;
 
+            // Load params based on logic...
             try {
                 if (tank.calculation_method === 'CWS_BLOWDOWN') {
                     const cwsResult = await pool.query(
@@ -222,7 +257,6 @@ app.get('/api/tanks', async (req, res) => {
                     cws_params = cwsResult.rows[0] || null;
                 }
             } catch (e) {
-                // cws_parameters 表可能不存在或欄位不存在，忽略錯誤
                 console.error('CWS params fetch error:', e.message);
             }
 
@@ -235,12 +269,16 @@ app.get('/api/tanks', async (req, res) => {
                     bws_params = bwsResult.rows[0] || null;
                 }
             } catch (e) {
-                // bws_parameters 表可能不存在或欄位不存在，忽略錯誤
                 console.error('BWS params fetch error:', e.message);
             }
 
+            // Ensure dimensions is parsed if it's a string (though pg usually parses json)
+            let dimensions = tank.dimensions;
+            if (typeof dimensions === 'string') {
+                try { dimensions = JSON.parse(dimensions); } catch (e) { }
+            }
 
-            return { ...tank, cws_params, bws_params };
+            return { ...tank, cws_params, bws_params, dimensions };
         }));
 
         res.json(tanksWithParams);
@@ -321,11 +359,11 @@ app.get('/api/tanks/:id', async (req, res) => {
 // 新增儲槽
 app.post('/api/tanks', async (req, res) => {
     try {
-        const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order } = req.body;
+        const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold } = req.body;
         const result = await pool.query(
-            `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level || 20.0, target_daily_usage, calculation_method, sort_order || 0]
+            `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level || 20.0, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -333,25 +371,33 @@ app.post('/api/tanks', async (req, res) => {
         res.status(500).json({ error: '新增儲槽失敗' });
     }
 });
-
 // 更新儲槽
 app.put('/api/tanks/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order } = req.body;
+        const { name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold } = req.body;
+
+        // DEBUG LOG
+        console.log('=== PUT /api/tanks/:id DEBUG ===');
+        console.log('Tank ID:', id);
+        console.log('Received validation_threshold:', validation_threshold);
+        console.log('Full request body:', JSON.stringify(req.body, null, 2));
+
         const result = await pool.query(
             `UPDATE tanks SET name=$2, system_type=$3, capacity_liters=$4, geo_factor=$5, description=$6, 
-       safe_min_level=$7, target_daily_usage=$8, calculation_method=$9, sort_order=$10
+       safe_min_level=$7, target_daily_usage=$8, calculation_method=$9, sort_order=$10, shape_type=$11, dimensions=$12, input_unit=$13, validation_threshold=$14
        WHERE id=$1 RETURNING *`,
-            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order || 0]
+            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30]
         );
+
+        console.log('Update result:', result.rows[0]);
 
         if (result.rows.length === 0) {
             return res.status(404).json({ error: '找不到此儲槽' });
         }
         res.json(result.rows[0]);
     } catch (err) {
-        console.error(err);
+        console.error('PUT /api/tanks/:id ERROR:', err);
         res.status(500).json({ error: '更新儲槽失敗' });
     }
 });
@@ -385,12 +431,12 @@ app.post('/api/tanks/batch', async (req, res) => {
 
 
         for (const tank of tanks) {
-            const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, cws_params, bws_params } = tank;
+            const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, cws_params, bws_params, shape_type, dimensions } = tank;
 
             // Upsert tank
             const tankResult = await client.query(
-                `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, shape_type, dimensions)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
                     system_type = EXCLUDED.system_type,
@@ -399,9 +445,11 @@ app.post('/api/tanks/batch', async (req, res) => {
                     description = EXCLUDED.description,
                     safe_min_level = EXCLUDED.safe_min_level,
                     sort_order = EXCLUDED.sort_order,
-                    calculation_method = EXCLUDED.calculation_method
+                    calculation_method = EXCLUDED.calculation_method,
+                    shape_type = EXCLUDED.shape_type,
+                    dimensions = EXCLUDED.dimensions
                  RETURNING *`,
-                [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method]
+                [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, shape_type, dimensions]
             );
 
             // Handle params
@@ -419,13 +467,12 @@ app.post('/api/tanks/batch', async (req, res) => {
                 );
             } else if (calculation_method === 'BWS_STEAM' && bws_params) {
                 await client.query(
-                    `INSERT INTO bws_parameters (tank_id, steam_production, target_ppm, date)
-                     VALUES ($1, $2, $3, $4)
+                    `INSERT INTO bws_parameters (tank_id, steam_production, date)
+                     VALUES ($1, $2, $3)
                      ON CONFLICT (tank_id) DO UPDATE SET
                         steam_production = EXCLUDED.steam_production,
-                        target_ppm = EXCLUDED.target_ppm,
                         date = EXCLUDED.date`,
-                    [id, bws_params.steam_production, bws_params.target_ppm, bws_params.date || Date.now()]
+                    [id, bws_params.steam_production, bws_params.date || Date.now()]
                 );
             }
             results.push(tankResult.rows[0]);
@@ -626,6 +673,10 @@ const migrateDatabase = async () => {
         // Ensure updated_at column exists
         await client.query('ALTER TABLE bws_parameters ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP');
 
+        // 3. Tanks table - validation_threshold column
+        console.log('Ensuring validation_threshold column in tanks table...');
+        await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS validation_threshold NUMERIC DEFAULT 30');
+
         await client.query('COMMIT');
         console.log('Database migration completed.');
     } catch (err) {
@@ -667,11 +718,11 @@ app.get('/api/supplies', async (req, res) => {
 // 新增藥劑合約
 app.post('/api/supplies', async (req, res) => {
     try {
-        const { id, tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes } = req.body;
+        const { id, tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes, target_ppm } = req.body;
         const result = await pool.query(
-            `INSERT INTO chemical_supplies (id, tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-            [id || crypto.randomUUID(), tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes]
+            `INSERT INTO chemical_supplies (id, tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes, target_ppm)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+            [id || crypto.randomUUID(), tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes, target_ppm]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -684,7 +735,7 @@ app.post('/api/supplies', async (req, res) => {
 app.put('/api/supplies/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { supplier_name, chemical_name, specific_gravity, price, start_date, notes } = req.body;
+        const { supplier_name, chemical_name, specific_gravity, price, start_date, notes, target_ppm } = req.body;
         const result = await pool.query(
             `UPDATE chemical_supplies SET 
                 supplier_name = $1, 
@@ -692,9 +743,10 @@ app.put('/api/supplies/:id', async (req, res) => {
                 specific_gravity = $3, 
                 price = $4, 
                 start_date = $5, 
-                notes = $6
-             WHERE id = $7 RETURNING *`,
-            [supplier_name, chemical_name, specific_gravity, price, start_date, notes, id]
+                notes = $6,
+                target_ppm = $7
+             WHERE id = $8 RETURNING *`,
+            [supplier_name, chemical_name, specific_gravity, price, start_date, notes, target_ppm, id]
         );
         if (result.rows.length === 0) {
             return res.status(404).json({ error: '找不到此合約紀錄' });
@@ -715,11 +767,11 @@ app.post('/api/supplies/batch', async (req, res) => {
 
         const results = [];
         for (const supply of supplies) {
-            const { id, tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes } = supply;
+            const { id, tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes, target_ppm } = supply;
             const result = await client.query(
-                `INSERT INTO chemical_supplies (id, tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-                [id || crypto.randomUUID(), tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes]
+                `INSERT INTO chemical_supplies (id, tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes, target_ppm)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+                [id || crypto.randomUUID(), tank_id, supplier_name, chemical_name, specific_gravity, price, start_date, notes, target_ppm]
             );
             results.push(result.rows[0]);
         }
@@ -788,7 +840,7 @@ app.get('/api/cws-params/history/:tankId', async (req, res) => {
 // 新增冷卻水參數 (Create New History Record)
 app.post('/api/cws-params', async (req, res) => {
     try {
-        const { tank_id, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, target_ppm, date } = req.body;
+        const { tank_id, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, date } = req.body;
         const entryDate = date || Date.now();
 
         // Fetch all dates for this tank to find same-day collisions
@@ -810,10 +862,10 @@ app.post('/api/cws-params', async (req, res) => {
 
         // Always Insert new record
         const result = await pool.query(
-            `INSERT INTO cws_parameters (id, tank_id, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, target_ppm, date)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            `INSERT INTO cws_parameters (id, tank_id, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, date)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-            [tank_id, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, target_ppm, entryDate]
+            [tank_id, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, entryDate]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -826,7 +878,7 @@ app.post('/api/cws-params', async (req, res) => {
 app.put('/api/cws-params/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, target_ppm, date } = req.body;
+        const { circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, date } = req.body;
         const result = await pool.query(
             `UPDATE cws_parameters SET 
                 circulation_rate = $1, 
@@ -836,10 +888,9 @@ app.put('/api/cws-params/:id', async (req, res) => {
                 cws_hardness = $5, 
                 makeup_hardness = $6, 
                 concentration_cycles = $7, 
-                target_ppm = $8,
-                date = $9
-             WHERE id = $10 RETURNING *`,
-            [circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, target_ppm, date, id]
+                date = $8
+             WHERE id = $9 RETURNING *`,
+            [circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles, date, id]
         );
         if (result.rows.length === 0) return res.status(404).json({ error: '找不到紀錄' });
         res.json(result.rows[0]);
@@ -895,7 +946,7 @@ app.get('/api/bws-params/history/:tankId', async (req, res) => {
 // 新增鍋爐水參數
 app.post('/api/bws-params', async (req, res) => {
     try {
-        const { tank_id, steam_production, target_ppm, date } = req.body;
+        const { tank_id, steam_production, date } = req.body;
         const entryDate = date || Date.now();
 
         // Fetch all dates for this tank to find same-day collisions
@@ -916,15 +967,15 @@ app.post('/api/bws-params', async (req, res) => {
 
         // Always Insert new record
         const result = await pool.query(
-            `INSERT INTO bws_parameters (id, tank_id, steam_production, target_ppm, date)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4)
+            `INSERT INTO bws_parameters (id, tank_id, steam_production, date)
+       VALUES (gen_random_uuid(), $1, $2, $3)
        RETURNING *`,
-            [tank_id, steam_production, target_ppm, entryDate]
+            [tank_id, steam_production, entryDate]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
         console.error(err);
-        res.status(500).json({ error: '儲存鍋爐水參數失敗' });
+        res.status(500).json({ error: '儲存鍋爐水參數失敗', details: err.message });
     }
 });
 
@@ -932,14 +983,13 @@ app.post('/api/bws-params', async (req, res) => {
 app.put('/api/bws-params/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { steam_production, target_ppm, date } = req.body;
+        const { steam_production, date } = req.body;
         const result = await pool.query(
             `UPDATE bws_parameters SET 
                 steam_production = $1, 
-                target_ppm = $2,
-                date = $3
-             WHERE id = $4 RETURNING *`,
-            [steam_production, target_ppm, date, id]
+                date = $2
+             WHERE id = $3 RETURNING *`,
+            [steam_production, date, id]
         );
         if (result.rows.length === 0) return res.status(404).json({ error: '找不到紀錄' });
         res.json(result.rows[0]);
@@ -1335,6 +1385,53 @@ app.get('/mcp-connect/:token', async (req, res) => {
     }
 });
 
+// ==================== PI Web API Proxy ====================
+// Allow HTTP frontend to call HTTPS PI API via Backend to avoid Mixed Content / CORS
+app.post('/api/pi-proxy', async (req, res) => {
+    try {
+        const { url, method = 'GET', headers = {}, body } = req.body;
+
+        // Basic security check: Only allow PI Web API target
+        // if (!url.toLowerCase().includes('/piwebapi/')) {
+        //     return res.status(403).json({ error: 'Blocked: Only PI Web API is allowed' });
+        // }
+
+        console.log(`[Proxy] ${method} ${url}`);
+
+        // Forward credentials if present
+        // Note: Client should send 'Authorization' in body.headers or we rely on backend-side auth if configured.
+        // Here we passthrough what client sent.
+
+        // Need to handle https agent if using self-signed certs in internal network
+        // const httpsAgent = new https.Agent({ rejectUnauthorized: false }); // Use with caution
+
+        const response = await fetch(url, {
+            method,
+            headers: {
+                ...headers,
+                // Ensure we don't leak host headers that might confuse target
+                host: undefined
+            },
+            body: body ? JSON.stringify(body) : undefined,
+            // agent: httpsAgent // Only if using node-fetch with custom agent, but global fetch is different
+        });
+
+        const responseText = await response.text();
+        let json;
+        try {
+            json = JSON.parse(responseText);
+        } catch {
+            json = null; // not json
+        }
+
+        res.status(response.status).json(json || { text: responseText });
+
+    } catch (err) {
+        console.error('[Proxy] Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // MCP 訊息接收端點
 app.post('/messages/:token', async (req, res) => {
     const token = req.params.token;
@@ -1364,8 +1461,162 @@ app.get('/api/health', async (req, res) => {
     }
 });
 
+//
+// ==================== Important Notes APIs ====================
+
+// 取得所有重要紀事
+app.get('/api/notes', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM important_notes ORDER BY date_str DESC, created_at DESC');
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/notes error:', err);
+        // Table might not exist yet, return empty array instead of 500 to avoid breaking UI on first load
+        if (err.code === '42P01') { // undefined_table
+            res.json([]);
+        } else {
+            res.status(500).json({ error: '取得重要紀事失敗', details: err.message });
+        }
+    }
+});
+
+// 新增重要紀事
+app.post('/api/notes', async (req, res) => {
+    const note = req.body;
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        const sql = `
+            INSERT INTO important_notes (id, date_str, area, chemical_name, note)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *
+        `;
+
+        const result = await client.query(sql, [
+            note.id,
+            note.date_str,
+            note.area,
+            note.chemical_name,
+            note.note
+        ]);
+
+        await client.query('COMMIT');
+        res.json(result.rows[0]);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/notes error:', err);
+        res.status(500).json({ error: '新增重要紀事失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 批量新增重要紀事 (用於 Excel 匯入)
+app.post('/api/notes/batch', async (req, res) => {
+    const { notes } = req.body;
+
+    if (!notes || !Array.isArray(notes) || notes.length === 0) {
+        return res.status(400).json({ error: '無效的資料' });
+    }
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        const sql = `
+            INSERT INTO important_notes (id, date_str, area, chemical_name, note)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (id) DO UPDATE SET
+                date_str = EXCLUDED.date_str,
+                area = EXCLUDED.area,
+                chemical_name = EXCLUDED.chemical_name,
+                note = EXCLUDED.note
+        `;
+
+        for (const note of notes) {
+            await client.query(sql, [
+                note.id,
+                note.date_str,
+                note.area,
+                note.chemical_name,
+                note.note
+            ]);
+        }
+
+        await client.query('COMMIT');
+        res.json({ success: true, count: notes.length });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/notes/batch error:', err);
+        res.status(500).json({ error: '批量新增失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 更新重要紀事
+app.put('/api/notes/:id', async (req, res) => {
+    const { id } = req.params;
+    const note = req.body;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const sql = `
+            UPDATE important_notes 
+            SET date_str = $1, area = $2, chemical_name = $3, note = $4
+            WHERE id = $5
+            RETURNING *
+        `;
+
+        const result = await client.query(sql, [
+            note.date_str,
+            note.area,
+            note.chemical_name,
+            note.note,
+            id
+        ]);
+
+        if (result.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: '找不到該筆紀事' });
+        }
+
+        await client.query('COMMIT');
+        res.json(result.rows[0]);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`PUT /api/notes/${id} error:`, err);
+        res.status(500).json({ error: '更新重要紀事失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 刪除重要紀事
+app.delete('/api/notes/:id', async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const result = await pool.query('DELETE FROM important_notes WHERE id = $1 RETURNING id', [id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: '找不到該筆紀事' });
+        }
+
+        res.json({ success: true, id });
+    } catch (err) {
+        console.error(`DELETE /api/notes/${id} error:`, err);
+        res.status(500).json({ error: '刪除重要紀事失敗', details: err.message });
+    }
+});
+
 // 啟動伺服器
-app.listen(PORT, () => {
-    console.log(`🚀 後端伺服器運行於 http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
     console.log(`📊 API 文件: http://localhost:${PORT}/api/health`);
 });
