@@ -85,6 +85,10 @@ export interface Tank {
 
   // Max capacity warning threshold (kg) - alerts if level would exceed this after delivery
   maxCapacityWarningKg?: number;
+
+  // Valid specific gravity range for chemical supply validation
+  sgRangeMin?: number; // Minimum acceptable SG
+  sgRangeMax?: number; // Maximum acceptable SG
 }
 
 // Table A: Tank Levels

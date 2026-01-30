@@ -361,9 +361,9 @@ app.post('/api/tanks', async (req, res) => {
     try {
         const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold } = req.body;
         const result = await pool.query(
-            `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
-            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level || 20.0, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30]
+            `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold, sg_range_min, sg_range_max)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *`,
+            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level || 20.0, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -385,9 +385,9 @@ app.put('/api/tanks/:id', async (req, res) => {
 
         const result = await pool.query(
             `UPDATE tanks SET name=$2, system_type=$3, capacity_liters=$4, geo_factor=$5, description=$6, 
-       safe_min_level=$7, target_daily_usage=$8, calculation_method=$9, sort_order=$10, shape_type=$11, dimensions=$12, input_unit=$13, validation_threshold=$14
+       safe_min_level=$7, target_daily_usage=$8, calculation_method=$9, sort_order=$10, shape_type=$11, dimensions=$12, input_unit=$13, validation_threshold=$14, sg_range_min=$15, sg_range_max=$16
        WHERE id=$1 RETURNING *`,
-            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30]
+            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max]
         );
 
         console.log('Update result:', result.rows[0]);
@@ -431,12 +431,12 @@ app.post('/api/tanks/batch', async (req, res) => {
 
 
         for (const tank of tanks) {
-            const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, cws_params, bws_params, shape_type, dimensions } = tank;
+            const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, cws_params, bws_params, shape_type, dimensions, sg_range_min, sg_range_max } = tank;
 
             // Upsert tank
             const tankResult = await client.query(
-                `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, shape_type, dimensions)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, shape_type, dimensions, sg_range_min, sg_range_max)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
                     system_type = EXCLUDED.system_type,
@@ -447,9 +447,11 @@ app.post('/api/tanks/batch', async (req, res) => {
                     sort_order = EXCLUDED.sort_order,
                     calculation_method = EXCLUDED.calculation_method,
                     shape_type = EXCLUDED.shape_type,
-                    dimensions = EXCLUDED.dimensions
+                    dimensions = EXCLUDED.dimensions,
+                    sg_range_min = EXCLUDED.sg_range_min,
+                    sg_range_max = EXCLUDED.sg_range_max
                  RETURNING *`,
-                [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, shape_type, dimensions]
+                [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, sort_order, calculation_method, shape_type, dimensions, sg_range_min, sg_range_max]
             );
 
             // Handle params
@@ -676,6 +678,11 @@ const migrateDatabase = async () => {
         // 3. Tanks table - validation_threshold column
         console.log('Ensuring validation_threshold column in tanks table...');
         await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS validation_threshold NUMERIC DEFAULT 30');
+
+        // 4. Tanks table - sg_range columns
+        console.log('Ensuring sg_range columns in tanks table...');
+        await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS sg_range_min NUMERIC');
+        await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS sg_range_max NUMERIC');
 
         await client.query('COMMIT');
         console.log('Database migration completed.');

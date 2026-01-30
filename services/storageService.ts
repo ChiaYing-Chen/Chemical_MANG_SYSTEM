@@ -379,7 +379,9 @@ export class StorageService {
             shapeType: apiTank.shape_type,
             dimensions: apiTank.dimensions,
             inputUnit: apiTank.input_unit || 'CM',
-            validationThreshold: apiTank.validation_threshold ? parseFloat(apiTank.validation_threshold) : 30
+            validationThreshold: apiTank.validation_threshold ? parseFloat(apiTank.validation_threshold) : 30,
+            sgRangeMin: apiTank.sg_range_min ? parseFloat(apiTank.sg_range_min) : undefined,
+            sgRangeMax: apiTank.sg_range_max ? parseFloat(apiTank.sg_range_max) : undefined
         };
     }
 
@@ -398,7 +400,9 @@ export class StorageService {
             shape_type: tank.shapeType,
             dimensions: tank.dimensions,
             input_unit: tank.inputUnit,
-            validation_threshold: tank.validationThreshold ?? 30
+            validation_threshold: tank.validationThreshold ?? 30,
+            sg_range_min: tank.sgRangeMin,
+            sg_range_max: tank.sgRangeMax
         };
     }
 

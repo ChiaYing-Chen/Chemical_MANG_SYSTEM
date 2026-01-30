@@ -1167,6 +1167,23 @@ const DataEntryView: React.FC<{
             return;
         }
 
+        // 取得所選儲槽以檢查比重範圍
+        const selectedTank = tanks.find(t => t.id === newSupply.tankId);
+        if (selectedTank) {
+            const sg = Number(newSupply.specificGravity);
+            const minSG = selectedTank.sgRangeMin;
+            const maxSG = selectedTank.sgRangeMax;
+
+            if ((minSG !== undefined && sg < minSG) || (maxSG !== undefined && sg > maxSG)) {
+                const rangeStr = minSG !== undefined && maxSG !== undefined
+                    ? `${minSG} ~ ${maxSG}`
+                    : minSG !== undefined ? `≥ ${minSG}` : `≤ ${maxSG}`;
+                if (!confirm(`警告：輸入的比重 ${sg} 超出此儲槽的合格比重範圍 (${rangeStr})！\n\n確定要繼續儲存嗎？`)) {
+                    return;
+                }
+            }
+        }
+
         // Fetch all supplies for validation and inheritance
         const allSupplies = await StorageService.getSupplies();
 
@@ -1614,6 +1631,36 @@ const DataEntryView: React.FC<{
                             newSupplies.push(supplyObj);
                         }
                         successCount++;
+                    }
+                }
+
+                // 檢查比重是否在合格範圍內
+                const sgWarnings: string[] = [];
+                const allSupplyItems = [...newSupplies, ...updatesToPerform];
+                for (const supply of allSupplyItems) {
+                    const tank = tanks.find(t => t.id === supply.tankId);
+                    if (tank && (tank.sgRangeMin !== undefined || tank.sgRangeMax !== undefined)) {
+                        const sg = supply.specificGravity;
+                        const minSG = tank.sgRangeMin;
+                        const maxSG = tank.sgRangeMax;
+
+                        if ((minSG !== undefined && sg < minSG) || (maxSG !== undefined && sg > maxSG)) {
+                            const rangeStr = minSG !== undefined && maxSG !== undefined
+                                ? `${minSG} ~ ${maxSG}`
+                                : minSG !== undefined ? `≥ ${minSG}` : `≤ ${maxSG}`;
+                            const dateStr = new Date(supply.startDate).toLocaleDateString();
+                            sgWarnings.push(`[${dateStr}] ${tank.name}: 比重 ${sg} 超出範圍 (${rangeStr})`);
+                        }
+                    }
+                }
+
+                // 如有比重異常，提醒使用者確認
+                if (sgWarnings.length > 0) {
+                    const warningMsg = `發現 ${sgWarnings.length} 筆比重超出合格範圍的記錄:\n\n${sgWarnings.slice(0, 10).join('\n')}${sgWarnings.length > 10 ? `\n... 及另外 ${sgWarnings.length - 10} 筆` : ''}\n\n確定要繼續匯入嗎?`;
+                    if (!confirm(warningMsg)) {
+                        alert('已取消匯入，請核對資料後再試。');
+                        setFile(null);
+                        return;
                     }
                 }
 
@@ -3178,7 +3225,15 @@ const AnalysisView: React.FC<{
             return t >= userStart && t <= userEnd;
         });
 
-        const monthlyMap = new Map<string, { date: Date, dateStr: string, actual: number, theoretical: number, days: number }>();
+        const monthlyMap = new Map<string, {
+            date: Date,
+            dateStr: string,
+            actual: number,
+            theoretical: number,
+            days: number,
+            sgSet: Set<number>,
+            priceSet: Set<number>
+        }>();
 
         filteredDaily.forEach(day => {
             const mKey = `${day.date.getFullYear()}-${String(day.date.getMonth() + 1).padStart(2, '0')}`;
@@ -3188,7 +3243,9 @@ const AnalysisView: React.FC<{
                     dateStr: `${day.date.getFullYear()}/${day.date.getMonth() + 1}`,
                     actual: 0,
                     theoretical: 0,
-                    days: 0
+                    days: 0,
+                    sgSet: new Set(),
+                    priceSet: new Set()
                 });
             }
             const m = monthlyMap.get(mKey)!;
@@ -3203,6 +3260,11 @@ const AnalysisView: React.FC<{
             const activeSupply = suppliesHistory.find(s => s.startDate <= dayTime);
             const targetPpm = activeSupply?.targetPpm || 0;
             const price = activeSupply?.price || 0; // Get price for cost calc
+            const sg = activeSupply?.specificGravity;
+
+            // 追蹤該月用到的比重與單價 (使用固定精度避免浮點數比對問題)
+            if (sg !== undefined) m.sgSet.add(Math.round(sg * 10000) / 10000);
+            if (price) m.priceSet.add(Math.round(price * 100) / 100);
 
             const calcMethod = selectedTank.calculationMethod || 'NONE';
 
@@ -3255,13 +3317,25 @@ const AnalysisView: React.FC<{
             m.theoretical += dailyTheoretical;
         });
 
-        return Array.from(monthlyMap.values()).map(m => ({
-            dateStr: m.dateStr,
-            date: m.date,
-            actual: m.actual,
-            theoretical: m.theoretical,
-            deviation: m.theoretical > 0 ? ((m.actual - m.theoretical) / m.theoretical) * 100 : 0
-        })).sort((a, b) => a.date.getTime() - b.date.getTime());
+        return Array.from(monthlyMap.values()).map(m => {
+            // 取得該月最後一天有效的藥劑合約（而非逐日收集，避免舊合約干擾）
+            const monthEnd = new Date(m.date.getFullYear(), m.date.getMonth() + 1, 0); // 該月最後一天
+            const monthEndTime = monthEnd.getTime();
+            const activeSupplyForMonth = suppliesHistory.find(s => s.startDate <= monthEndTime);
+
+            const specificGravity = activeSupplyForMonth?.specificGravity;
+            const price = activeSupplyForMonth?.price;
+
+            return {
+                dateStr: m.dateStr,
+                date: m.date,
+                actual: m.actual,
+                theoretical: m.theoretical,
+                deviation: m.theoretical > 0 ? ((m.actual - m.theoretical) / m.theoretical) * 100 : 0,
+                specificGravity,
+                price
+            };
+        }).sort((a, b) => a.date.getTime() - b.date.getTime());
 
     }, [dailyData, selectedTank, metric, suppliesHistory, cwsParamsHistory, bwsParamsHistory, appliedDateRange]);
 
@@ -3274,6 +3348,28 @@ const AnalysisView: React.FC<{
             const weekStartTime = week.date.getTime();
             const weekEndTime = weekStartTime + (7 * 24 * 60 * 60 * 1000);
 
+            // 逐日收集該週使用的比重與單價
+            const sgSet = new Set<number>();
+            const priceSet = new Set<number>();
+
+            for (let i = 0; i < 7; i++) {
+                const dayTime = weekStartTime + i * 24 * 60 * 60 * 1000;
+                const activeSupplyForDay = suppliesHistory.find(s => s.startDate <= dayTime);
+                if (activeSupplyForDay?.specificGravity !== undefined) {
+                    sgSet.add(Math.round(activeSupplyForDay.specificGravity * 10000) / 10000);
+                }
+                if (activeSupplyForDay?.price) {
+                    priceSet.add(Math.round(activeSupplyForDay.price * 100) / 100);
+                }
+            }
+
+            // 取得該週末有效的藥劑合約（用於計算）
+            const activeSupply = suppliesHistory
+                .filter(s => s.startDate <= weekEndTime)
+                .sort((a, b) => b.startDate - a.startDate)[0];
+            const targetPpm = activeSupply?.targetPpm || 0;
+            const calcPrice = activeSupply?.price || 0;
+
             // Calculate theoretical usage based on tank calculation method
             if (selectedTank.calculationMethod === 'BWS_STEAM') {
                 // Find BWS data for this exact week (must have steamProduction for that week)
@@ -3285,17 +3381,10 @@ const AnalysisView: React.FC<{
                 // Only calculate if we have steamProduction for this week
                 if (weekData && weekData.steamProduction) {
                     const steamProduction = weekData.steamProduction;
-                    // targetPpm Migrated to Chemical Contract check
-                    const activeSupply = suppliesHistory
-                        .filter(s => s.startDate <= weekEndTime)
-                        .sort((a, b) => b.startDate - a.startDate)[0];
-                    const targetPpm = activeSupply?.targetPpm || 0;
-                    const price = activeSupply?.price || 0;
-
                     theoreticalTotal = (steamProduction * targetPpm) / 1000;
 
-                    if (metric === '$') {
-                        theoreticalTotal = theoreticalTotal * price;
+                    if (metric === '$' && calcPrice) {
+                        theoreticalTotal = theoreticalTotal * calcPrice;
                     }
                 }
                 // If no weekData with steamProduction, theoreticalTotal stays 0
@@ -3313,12 +3402,6 @@ const AnalysisView: React.FC<{
                 if (params && params.circulationRate && params.tempDiff) {
                     const { circulationRate, tempDiff, cwsHardness, makeupHardness, concentrationCycles } = params;
 
-                    // targetPpm 從藥劑合約取得
-                    const activeSupply = suppliesHistory
-                        .filter(s => s.startDate <= weekEndTime)
-                        .sort((a, b) => b.startDate - a.startDate)[0];
-                    const targetPpm = activeSupply?.targetPpm || 0;
-
                     const days = 7;
                     const E = (circulationRate * tempDiff * 1.8 * 24 * days) / 1000;
 
@@ -3332,26 +3415,30 @@ const AnalysisView: React.FC<{
                     const BW = C > 1 ? E / (C - 1) : 0;
                     theoreticalTotal = (BW * targetPpm) / 1000;
 
-                    if (metric === '$') {
-                        const activeSupply = suppliesHistory
-                            .filter(s => s.startDate <= weekEndTime)
-                            .sort((a, b) => b.startDate - a.startDate)[0];
-                        const price = activeSupply?.price || 0;
-                        theoreticalTotal = theoreticalTotal * price;
+                    if (metric === '$' && calcPrice) {
+                        theoreticalTotal = theoreticalTotal * calcPrice;
                     }
                 }
                 // If no weekData with production data, theoreticalTotal stays 0
             }
+
+            // 計算比重與單價結果
+            const sgArray = Array.from(sgSet);
+            const priceArray = Array.from(priceSet);
 
             return {
                 dateStr: week.dateStr,
                 date: week.date,
                 actual: week.usage,
                 theoretical: theoreticalTotal,
-                deviation: theoreticalTotal > 0 ? ((week.usage - theoreticalTotal) / theoreticalTotal) * 100 : 0
+                deviation: theoreticalTotal > 0 ? ((week.usage - theoreticalTotal) / theoreticalTotal) * 100 : 0,
+                specificGravity: sgArray.length === 1 ? sgArray[0] : undefined,
+                specificGravityMultiple: sgArray.length > 1 ? sgArray : undefined,
+                price: priceArray.length === 1 ? priceArray[0] : undefined,
+                priceMultiple: priceArray.length > 1 ? priceArray : undefined
             };
         }).sort((a, b) => a.date.getTime() - b.date.getTime());
-    }, [weeklyData, selectedTank, bwsParamsHistory, cwsParamsHistory]);
+    }, [weeklyData, selectedTank, bwsParamsHistory, cwsParamsHistory, suppliesHistory, metric]);
 
     const hasCalculation = selectedTank && selectedTank.calculationMethod && selectedTank.calculationMethod !== 'NONE';
 
@@ -3763,10 +3850,10 @@ const AnalysisView: React.FC<{
                             )}
                         </h3>
                     </div>
-                    <div className="p-6" style={{ height: '400px' }}>
+                    <div className="px-6 pt-4" style={{ height: '340px' }}>
                         {weeklyComparisonData.length > 0 ? (
-                            <ResponsiveContainer width="100%" height="100%" minHeight={300}>
-                                <ComposedChart data={weeklyComparisonData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
+                            <ResponsiveContainer width="100%" height="100%" minHeight={280}>
+                                <ComposedChart data={weeklyComparisonData} margin={{ top: 20, right: 30, left: 20, bottom: 50 }}>
                                     <CartesianGrid strokeDasharray="3 3" vertical={false} />
                                     <XAxis
                                         dataKey="dateStr"
@@ -3801,6 +3888,33 @@ const AnalysisView: React.FC<{
                             <div className="h-full flex items-center justify-center text-slate-400">此時間範圍內無足夠數據</div>
                         )}
                     </div>
+                    {/* 週用量詳細表格 - 對齊柱狀圖 */}
+                    {weeklyComparisonData.length > 0 && (
+                        <div className="px-6 pb-2" style={{ marginLeft: '40px', marginRight: '30px' }}>
+                            <div className="flex text-xs border-b border-slate-100">
+                                <div className="w-12 py-1 text-slate-500 flex-shrink-0">單價</div>
+                                <div className="flex-1 flex">
+                                    {weeklyComparisonData.map(w => (
+                                        <div key={w.dateStr} className="flex-1 text-center py-1 text-slate-700">
+                                            {w.price !== undefined ? `$${w.price}` :
+                                                w.priceMultiple ? <span className="text-amber-600 cursor-help" title={w.priceMultiple.map(p => `$${p}`).join(', ')}>多值*</span> : '-'}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                            <div className="flex text-xs">
+                                <div className="w-12 py-1 text-slate-500 flex-shrink-0">比重</div>
+                                <div className="flex-1 flex">
+                                    {weeklyComparisonData.map(w => (
+                                        <div key={w.dateStr} className="flex-1 text-center py-1 text-slate-700">
+                                            {w.specificGravity !== undefined ? w.specificGravity.toFixed(3) :
+                                                w.specificGravityMultiple ? <span className="text-amber-600 cursor-help" title={w.specificGravityMultiple.map(sg => sg.toFixed(3)).join(', ')}>多值*</span> : '-'}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
 
 
@@ -3809,17 +3923,15 @@ const AnalysisView: React.FC<{
                     <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
                         <h3 className="font-semibold text-slate-800 flex items-center gap-2">
                             {hasCalculation ? `月用量 vs 理論值 (${metric})` : `月用量趨勢 (${metric})`}
-                            {hasCalculation && (
-                                <button onClick={() => setHelpTopic('monthly')} className="text-slate-400 hover:text-brand-500 transition-colors">
-                                    <Icons.Help className="w-4 h-4" />
-                                </button>
-                            )}
+                            <button onClick={() => setHelpTopic('monthly')} className="text-slate-400 hover:text-brand-500 transition-colors">
+                                <Icons.Help className="w-4 h-4" />
+                            </button>
                         </h3>
                     </div>
-                    <div className="p-6" style={{ height: '400px' }}>
+                    <div className="px-6 pt-4" style={{ height: '340px' }}>
                         {monthlyComparisonData.length > 0 ? (
-                            <ResponsiveContainer width="100%" height="100%" minHeight={300}>
-                                <ComposedChart data={monthlyComparisonData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
+                            <ResponsiveContainer width="100%" height="100%" minHeight={280}>
+                                <ComposedChart data={monthlyComparisonData} margin={{ top: 20, right: 30, left: 20, bottom: 50 }}>
                                     <CartesianGrid strokeDasharray="3 3" vertical={false} />
                                     <XAxis
                                         dataKey="dateStr"
@@ -3856,6 +3968,31 @@ const AnalysisView: React.FC<{
                             </div>
                         )}
                     </div>
+                    {/* 月用量詳細表格 - 對齊柱狀圖 */}
+                    {monthlyComparisonData.length > 0 && (
+                        <div className="px-6 pb-2" style={{ marginLeft: '40px', marginRight: '30px' }}>
+                            <div className="flex text-xs border-b border-slate-100">
+                                <div className="w-12 py-1 text-slate-500 flex-shrink-0">單價</div>
+                                <div className="flex-1 flex">
+                                    {monthlyComparisonData.map(m => (
+                                        <div key={m.dateStr} className="flex-1 text-center py-1 text-slate-700">
+                                            {m.price !== undefined ? `$${m.price}` : '-'}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                            <div className="flex text-xs">
+                                <div className="w-12 py-1 text-slate-500 flex-shrink-0">比重</div>
+                                <div className="flex-1 flex">
+                                    {monthlyComparisonData.map(m => (
+                                        <div key={m.dateStr} className="flex-1 text-center py-1 text-slate-700">
+                                            {m.specificGravity !== undefined ? m.specificGravity.toFixed(3) : '-'}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -3888,23 +4025,49 @@ const AnalysisView: React.FC<{
                                         (當週蒸氣總產量 × 目標濃度(ppm)) / 1000
                                     </div>
                                     <p>直接依據流量計回傳的蒸氣總量計算。</p>
+
+                                    <h4 className="font-bold text-amber-700 mt-4">比重與單價說明</h4>
+                                    <ul className="list-disc pl-5 space-y-2">
+                                        <li>
+                                            <span className="font-semibold">顯示方式</span>：若該週內只有單一比重/單價，則直接顯示該值；若有多個不同的值（例如週中換約），則顯示 <span className="text-amber-600 font-bold">「多值*」</span>，將游標移至該文字可檢視所有數值。
+                                        </li>
+                                        <li>
+                                            計算金額時，系統會依據每日各自適用的合約單價逐日計算後加總。
+                                        </li>
+                                    </ul>
                                 </div>
                             ) : (
                                 <div className="space-y-4">
-                                    <h4 className="font-bold text-slate-800">計算原理</h4>
-                                    <p>月度理論值採用<span className="font-bold text-brand-600">「逐日加總」</span>方式計算：</p>
-                                    <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
-                                        月總量 = ∑ (每日理論用量)
-                                    </div>
-                                    <ul className="list-disc pl-5 space-y-2 mt-2">
+                                    {hasCalculation && (
+                                        <>
+                                            <h4 className="font-bold text-slate-800">理論值計算原理</h4>
+                                            <p>月度理論值採用<span className="font-bold text-brand-600">「逐日加總」</span>方式計算：</p>
+                                            <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                                月總量 = ∑ (每日理論用量)
+                                            </div>
+                                            <ul className="list-disc pl-5 space-y-2 mt-2">
+                                                <li>
+                                                    <span className="font-semibold">每日理論用量</span> = 對應週次的週理論用量 ÷ 7
+                                                </li>
+                                                <li>
+                                                    系統會自動找出每一天所屬的週次參數進行計算。
+                                                </li>
+                                                <li>
+                                                    此方式能精確處理由於月份天數不同 (28/30/31天) 以及週次跨月所導致的計算誤差，確保月度總和與實際天數完全吻合。
+                                                </li>
+                                            </ul>
+                                        </>
+                                    )}
+                                    <h4 className="font-bold text-amber-700 mt-4">比重與單價說明</h4>
+                                    <ul className="list-disc pl-5 space-y-2">
                                         <li>
-                                            <span className="font-semibold">每日理論用量</span> = 對應週次的週理論用量 ÷ 7
+                                            <span className="font-semibold">週次</span>：顯示該週最後生效的藥劑合約之比重與單價。
                                         </li>
                                         <li>
-                                            系統會自動找出每一天所屬的週次參數進行計算。
+                                            <span className="font-semibold">月份</span>：顯示該月最後一天生效的藥劑合約之比重與單價。
                                         </li>
                                         <li>
-                                            此方式能精確處理由於月份天數不同 (28/30/31天) 以及週次跨月所導致的計算誤差，確保月度總和與實際天數完全吻合。
+                                            計算金額時，系統會依據每日各自適用的合約單價逐日計算後加總。
                                         </li>
                                     </ul>
                                 </div>
@@ -4168,6 +4331,24 @@ const ImportantNotesView: React.FC = () => {
 
 const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void }> = ({ tanks, readings, onRefresh }) => {
     const [editingTank, setEditingTank] = useState<Tank | null>(null);
+    const [currentSG, setCurrentSG] = useState<{ sg: number; chemicalName: string } | null>(null);
+
+    // 當編輯儲槽變更時，載入該儲槽的當前藥劑比重
+    useEffect(() => {
+        const loadActiveSupply = async () => {
+            if (editingTank) {
+                const supply = await StorageService.getActiveSupply(editingTank.id, Date.now());
+                if (supply) {
+                    setCurrentSG({ sg: supply.specificGravity, chemicalName: supply.chemicalName });
+                } else {
+                    setCurrentSG(null);
+                }
+            } else {
+                setCurrentSG(null);
+            }
+        };
+        loadActiveSupply();
+    }, [editingTank?.id]);
 
     // Grouping logic similar to DashboardView
     const groups = useMemo(() => {
@@ -4568,6 +4749,44 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                                     className={inputClassName}
                                     placeholder="預設 30"
                                 />
+                                <p className="text-xs text-slate-500 mt-1">
+                                    換算約 {((editingTank.validationThreshold ?? 30) / 100 * editingTank.capacityLiters).toLocaleString(undefined, { maximumFractionDigits: 0 })} L ≈ {((editingTank.validationThreshold ?? 30) / 100 * editingTank.capacityLiters * (currentSG?.sg || 1.0)).toLocaleString(undefined, { maximumFractionDigits: 0 })} kg
+                                    {currentSG ? (
+                                        <span className="text-brand-600"> (以{currentSG.chemicalName}比重 {currentSG.sg} 計)</span>
+                                    ) : (
+                                        <span className="text-amber-600"> (尚無藥劑資料，以比重 1.0 計)</span>
+                                    )}
+                                </p>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">
+                                    合格比重下限
+                                    <span className="text-xs text-slate-400 ml-1">(藥劑合約輸入時檢查)</span>
+                                </label>
+                                <input
+                                    type="number"
+                                    min="0.1"
+                                    step="0.001"
+                                    value={editingTank.sgRangeMin ?? ''}
+                                    onChange={e => updateTankField('sgRangeMin', e.target.value ? Number(e.target.value) : undefined)}
+                                    className={inputClassName}
+                                    placeholder="例如: 1.80"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">
+                                    合格比重上限
+                                    <span className="text-xs text-slate-400 ml-1">(藥劑合約輸入時檢查)</span>
+                                </label>
+                                <input
+                                    type="number"
+                                    min="0.1"
+                                    step="0.001"
+                                    value={editingTank.sgRangeMax ?? ''}
+                                    onChange={e => updateTankField('sgRangeMax', e.target.value ? Number(e.target.value) : undefined)}
+                                    className={inputClassName}
+                                    placeholder="例如: 1.88"
+                                />
                             </div>
                             <div className="md:col-span-2">
                                 <label className="block text-sm font-medium text-slate-700 mb-1">描述</label>
@@ -4575,7 +4794,7 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                             </div>
 
                             <div className="md:col-span-2 mt-4 p-3 bg-slate-50 rounded border border-slate-200">
-                                <label className="block text-sm font-medium text-slate-700 mb-2">輸入單位 (Input Unit)</label>
+                                <label className="block text-sm font-medium text-slate-700 mb-2">液位輸入模式</label>
                                 <div className="flex gap-4">
                                     <label className="flex items-center gap-2 cursor-pointer">
                                         <input
@@ -4597,12 +4816,12 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                                             onChange={() => updateTankField('inputUnit', 'PERCENT')}
                                             className="text-brand-600 focus:ring-brand-500"
                                         />
-                                        <span>百分比 (%)</span>
+                                        <span>公尺 (×100)</span>
                                     </label>
                                 </div>
                                 {editingTank.inputUnit === 'PERCENT' && (
                                     <p className="text-xs text-amber-600 mt-1">
-                                        注意：選擇百分比模式時，系統將依據「直徑」或「最大液位」自動換算為公分 ( 100% = 最大液位 )。
+                                        注意：此模式適用於如 CT-1 硫酸桶槽等特殊情況，輸入值會乘以 100 換算為公分 (例如輸入 0.72 = 72 cm)。
                                     </p>
                                 )}
                             </div>
@@ -4863,7 +5082,14 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
 type ViewType = 'dashboard' | 'entry' | 'analysis' | 'settings' | 'notes' | 'annual' | 'pi-test' | 'import';
 
 const App: React.FC = () => {
-    const [currentView, setCurrentView] = useState<ViewType>('dashboard');
+    const [currentView, setCurrentView] = useState<ViewType>(() => {
+        // 從 URL hash 讀取初始頁面
+        const hash = window.location.hash.slice(1);
+        if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import'].includes(hash)) {
+            return hash as ViewType;
+        }
+        return 'dashboard';
+    });
     const [tanks, setTanks] = useState<Tank[]>([]);
     const [readings, setReadings] = useState<Reading[]>([]);
 
@@ -4872,6 +5098,41 @@ const App: React.FC = () => {
 
     // Persist UserName
     const [userName, setUserName] = useState(() => localStorage.getItem('appUserName') || 'OP');
+
+    // 導航函數 - 更新頁面並推入瀏覽器歷史
+    const navigateTo = useCallback((view: ViewType, replace = false) => {
+        if (view === currentView && !replace) return;
+
+        if (replace) {
+            window.history.replaceState({ view }, '', `#${view}`);
+        } else {
+            window.history.pushState({ view }, '', `#${view}`);
+        }
+        setCurrentView(view);
+    }, [currentView]);
+
+    // 監聽瀏覽器的上一頁/下一頁按鈕
+    useEffect(() => {
+        const handlePopState = (event: PopStateEvent) => {
+            if (event.state && event.state.view) {
+                setCurrentView(event.state.view as ViewType);
+            } else {
+                // 從 hash 讀取
+                const hash = window.location.hash.slice(1);
+                if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import'].includes(hash)) {
+                    setCurrentView(hash as ViewType);
+                } else {
+                    setCurrentView('dashboard');
+                }
+            }
+        };
+
+        // 初始化時設定 history state
+        window.history.replaceState({ view: currentView }, '', `#${currentView}`);
+
+        window.addEventListener('popstate', handlePopState);
+        return () => window.removeEventListener('popstate', handlePopState);
+    }, []); // 只在掛載時執行一次
 
     // Auto-detect user from server
     useEffect(() => {
@@ -4903,11 +5164,18 @@ const App: React.FC = () => {
 
 
     const handleNavigateToAnalysis = (tankId: string, month: number, year: number) => {
-        // month is 1-based (1-12)
-        const monthStr = `${year}-${String(month).padStart(2, '0')}`;
+        // month is 1-based (1-12), or 0 to indicate "use default (last month)"
+        let monthStr: string;
+        if (month === 0 || year === 0) {
+            // Use current month as default
+            const today = new Date();
+            monthStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+        } else {
+            monthStr = `${year}-${String(month).padStart(2, '0')}`;
+        }
         console.log('Navigating to Analysis:', { tankId, monthStr });
         setAnalysisInitialState({ tankId, monthStr });
-        setCurrentView('analysis');
+        navigateTo('analysis');
     };
 
     const refreshData = async () => {
@@ -4959,7 +5227,7 @@ const App: React.FC = () => {
 
     const NavItem = ({ view, icon: Icon, label }: { view: ViewType, icon: React.ElementType, label: string }) => (
         <button
-            onClick={() => setCurrentView(view)}
+            onClick={() => navigateTo(view)}
             className={`w-full flex items-center px-3 py-2 text-sm font-medium transition-colors
           ${currentView === view ? 'bg-brand-50 text-brand-700 border-r-4 border-brand-500' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'}`}
         >
