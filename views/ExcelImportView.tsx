@@ -102,22 +102,50 @@ interface ParsedData {
 
 // --- Component ---
 
-export const ExcelImportView: React.FC<{ tanks: Tank[], onComplete: () => void }> = ({ tanks, onComplete }) => {
+export const ExcelImportView: React.FC<{
+    tanks: Tank[], onComplete: () => void;
+    onLoading: (loading: boolean) => void;
+}> = ({ tanks, onComplete, onLoading }) => {
     const [selectedTemplateId, setSelectedTemplateId] = useState<string>(TEMPLATES[0].id);
+    const [file, setFile] = useState<File | null>(null);
     const [previewData, setPreviewData] = useState<ParsedData[]>([]);
     const [isProcessing, setIsProcessing] = useState(false);
     const [logs, setLogs] = useState<string[]>([]);
+    const [errorMsg, setErrorMsg] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0];
+    // Auto-trigger parseFile when file changes
+    React.useEffect(() => {
+        if (file) {
+            parseFile();
+        }
+    }, [file]);
+
+    const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (e.target.files && e.target.files.length > 0) {
+            setFile(e.target.files[0]);
+            setPreviewData([]);
+            setLogs([]);
+            setErrorMsg(null);
+        }
+    };
+
+    const parseFile = async () => {
         if (!file) return;
 
-        const template = TEMPLATES.find(t => t.id === selectedTemplateId);
-        if (!template) return;
-
+        setIsProcessing(true);
+        // onLoading(true); // Disabled per request
         setLogs([]);
         setPreviewData([]);
+        setErrorMsg(null);
+
+        const template = TEMPLATES.find(t => t.id === selectedTemplateId);
+        if (!template) {
+            setErrorMsg('未選擇有效的模板');
+            setIsProcessing(false);
+            // onLoading(false); // Disabled
+            return;
+        }
 
         try {
             const data = await file.arrayBuffer();
@@ -170,6 +198,8 @@ export const ExcelImportView: React.FC<{ tanks: Tank[], onComplete: () => void }
         } catch (err: any) {
             console.error(err);
             setLogs(prev => [...prev, `讀取失敗: ${err.message}`]);
+        } finally {
+            setIsProcessing(false);
         }
     };
 
@@ -198,57 +228,63 @@ export const ExcelImportView: React.FC<{ tanks: Tank[], onComplete: () => void }
                 const ct1Cycles = item.makeupHardness > 0 ? item.ct1CW / item.makeupHardness : 0;
                 const ct2Cycles = item.makeupHardness > 0 ? item.ct2CW / item.makeupHardness : 0;
 
+                // Helper for timeout
+                const withTimeout = <T,>(promise: Promise<T>, ms: number = 5000) => {
+                    return Promise.race([
+                        promise,
+                        new Promise<T>((_, reject) => setTimeout(() => reject(new Error("請求逾時")), ms))
+                    ]);
+                };
+
                 // Update CT-1 Tanks
                 for (const tank of ct1Tanks) {
-                    // Check if record exists specifically for this date to update, or create new
-                    // Using generateUUID fallback if needed, relying on StorageService (which calls API)
-                    // We need to fetch ID if we want to update precisely, but saveCWSParam usually handles logic.
-                    // However, we probably want to upsert based on date. Support is needed on API or we query first.
-                    // To keep it simple and consistent with "Batch Import" logic in App.tsx:
-                    // Query history -> Find match -> Update OR Create
-                    const history = await StorageService.getCWSParamsHistory(tank.id);
-                    const existing = history.find(h => h.date === dateTs);
+                    try {
+                        // setLogs(prev => [...prev, `處理 CT-1: ${tank.name} - ${logPrefix}`]); // Optional verbose log
+                        const history = await withTimeout(StorageService.getCWSParamsHistory(tank.id));
+                        const existing = history.find(h => h.date === dateTs);
 
-                    const record: CWSParameterRecord = {
-                        id: existing?.id, // undefined means new
-                        tankId: tank.id,
-                        date: dateTs,
-                        // Preserve existing flow/temp data if it exists? 
-                        // The User Requirement specifically mentions importing Hardness. 
-                        // If we overwrite, we might lose PI data (Temp/Flow).
-                        // Ideally we merge.
-                        circulationRate: existing?.circulationRate || 0,
-                        tempOutlet: existing?.tempOutlet,
-                        tempReturn: existing?.tempReturn,
-                        tempDiff: existing?.tempDiff || 0,
-
-                        // New Data
-                        makeupHardness: item.makeupHardness,
-                        cwsHardness: item.ct1CW,
-                        concentrationCycles: ct1Cycles
-                    };
-                    await StorageService.saveCWSParam(record);
+                        const record: CWSParameterRecord = {
+                            id: existing?.id,
+                            tankId: tank.id,
+                            date: dateTs,
+                            circulationRate: existing?.circulationRate || 0,
+                            tempOutlet: existing?.tempOutlet,
+                            tempReturn: existing?.tempReturn,
+                            tempDiff: existing?.tempDiff || 0,
+                            makeupHardness: item.makeupHardness,
+                            cwsHardness: item.ct1CW,
+                            concentrationCycles: ct1Cycles
+                        };
+                        await withTimeout(StorageService.saveCWSParam(record));
+                    } catch (e: any) {
+                        console.error(e);
+                        setLogs(prev => [...prev, `[錯誤] CT-1 ${tank.name} (${logPrefix}): ${e.message}`]);
+                    }
                 }
 
                 // Update CT-2 Tanks
                 for (const tank of ct2Tanks) {
-                    const history = await StorageService.getCWSParamsHistory(tank.id);
-                    const existing = history.find(h => h.date === dateTs);
+                    try {
+                        const history = await withTimeout(StorageService.getCWSParamsHistory(tank.id));
+                        const existing = history.find(h => h.date === dateTs);
 
-                    const record: CWSParameterRecord = {
-                        id: existing?.id,
-                        tankId: tank.id,
-                        date: dateTs,
-                        circulationRate: existing?.circulationRate || 0,
-                        tempOutlet: existing?.tempOutlet,
-                        tempReturn: existing?.tempReturn,
-                        tempDiff: existing?.tempDiff || 0,
-
-                        makeupHardness: item.makeupHardness,
-                        cwsHardness: item.ct2CW, // Use CT-2 Hardness
-                        concentrationCycles: ct2Cycles // Use CT-2 Cycles
-                    };
-                    await StorageService.saveCWSParam(record);
+                        const record: CWSParameterRecord = {
+                            id: existing?.id,
+                            tankId: tank.id,
+                            date: dateTs,
+                            circulationRate: existing?.circulationRate || 0,
+                            tempOutlet: existing?.tempOutlet,
+                            tempReturn: existing?.tempReturn,
+                            tempDiff: existing?.tempDiff || 0,
+                            makeupHardness: item.makeupHardness,
+                            cwsHardness: item.ct2CW,
+                            concentrationCycles: ct2Cycles
+                        };
+                        await withTimeout(StorageService.saveCWSParam(record));
+                    } catch (e: any) {
+                        console.error(e);
+                        setLogs(prev => [...prev, `[錯誤] CT-2 ${tank.name} (${logPrefix}): ${e.message}`]);
+                    }
                 }
                 count++;
             }
@@ -260,8 +296,10 @@ export const ExcelImportView: React.FC<{ tanks: Tank[], onComplete: () => void }
             setLogs(prev => [...prev, `匯入錯誤: ${err.message}`]);
         } finally {
             setIsProcessing(false);
+            // onLoading(false); // Disabled
         }
-    };
+    }
+
 
     return (
         <div className="space-y-6 animate-fade-in p-6">
@@ -281,20 +319,30 @@ export const ExcelImportView: React.FC<{ tanks: Tank[], onComplete: () => void }
             </div>
 
             <Card className="bg-slate-50 border-dashed border-2 border-slate-300">
-                <div className="flex flex-col items-center justify-center py-12 text-slate-500">
-                    <Icons.FileText className="w-12 h-12 mb-4 text-slate-400" />
-                    <p className="mb-4">拖放 Excel 檔案至此，或點擊上傳</p>
-                    <input
-                        type="file"
-                        ref={fileInputRef}
-                        onChange={handleFileUpload}
-                        accept=".xlsx, .xls"
-                        className="hidden"
-                    />
-                    <Button onClick={() => fileInputRef.current?.click()}>
-                        選擇檔案
-                    </Button>
-                </div>
+                {isProcessing ? (
+                    <div className="flex flex-col items-center justify-center py-12 text-slate-500 space-y-4">
+                        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-brand-600"></div>
+                        <p className="font-medium text-slate-700">正在處理檔案...</p>
+                        <div className="w-full max-w-md bg-slate-200 rounded-full h-2.5 dark:bg-slate-700">
+                            <div className="bg-brand-600 h-2.5 rounded-full animate-pulse" style={{ width: '100%' }}></div>
+                        </div>
+                    </div>
+                ) : (
+                    <div className="flex flex-col items-center justify-center py-12 text-slate-500">
+                        <Icons.FileText className="w-12 h-12 mb-4 text-slate-400" />
+                        <p className="mb-4">拖放 Excel 檔案至此，或點擊上傳</p>
+                        <input
+                            type="file"
+                            ref={fileInputRef}
+                            onChange={handleFileUpload}
+                            accept=".xlsx, .xls"
+                            className="hidden"
+                        />
+                        <Button onClick={() => fileInputRef.current?.click()}>
+                            選擇檔案
+                        </Button>
+                    </div>
+                )}
             </Card>
 
             {previewData.length > 0 && (

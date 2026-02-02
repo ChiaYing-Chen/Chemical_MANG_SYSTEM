@@ -3,6 +3,8 @@ import { StorageService } from './services/storageService';
 import { calculateTankVolume } from './utils/calculationUtils';
 import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType } from './types';
 import { Icons } from './components/Icons';
+import { LoadingOverlay } from './components/LoadingOverlay';
+import { ImportAnomalyModal, ImportAnomaly } from './components/ImportAnomalyModal';
 import * as XLSX from 'xlsx';
 import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
@@ -480,7 +482,7 @@ const DeliveryEstimationModal: React.FC<{
     );
 };
 
-const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onNavigate?: (tankId: string, month: number, year: number) => void }> = ({ tanks, readings, onRefresh, onNavigate }) => {
+const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onNavigate?: (tankId: string, month: number, year: number) => void, onLoading?: (loading: boolean) => void }> = ({ tanks, readings, onRefresh, onNavigate, onLoading }) => {
     const [deliveryModalTank, setDeliveryModalTank] = useState<any>(null);
 
     const tanksWithStatus = useMemo(() => {
@@ -786,7 +788,8 @@ const DataEntryView: React.FC<{
     onSave: (r: Reading) => void,
     onBatchSave: (rs: Reading[]) => void,
     onUpdateTank: (tank?: Tank) => void;
-}> = ({ tanks, readings, onSave, onBatchSave, onUpdateTank }) => {
+    onLoading: (loading: boolean) => void;
+}> = ({ tanks, readings, onSave, onBatchSave, onUpdateTank, onLoading }) => {
     const [selectedTankId, setSelectedTankId] = useState<string>('');
     const [date, setDate] = useState<string>(new Date().toISOString().split('T')[0]);
     const [levelCm, setLevelCm] = useState<string>('');
@@ -798,6 +801,47 @@ const DataEntryView: React.FC<{
     const [editingItem, setEditingItem] = useState<any>(null);
     const [editForm, setEditForm] = useState<any>({});
     const [isEditOpen, setIsEditOpen] = useState(false);
+
+    // Anomaly Modal State
+    const [importAnomalies, setImportAnomalies] = useState<ImportAnomaly[]>([]);
+    const [showAnomalyModal, setShowAnomalyModal] = useState(false);
+    const [anomalySource, setAnomalySource] = useState<'IMPORT' | 'MANUAL'>('IMPORT');
+    const [pendingReadings, setPendingReadings] = useState<Reading[]>([]);
+    const [convertedCountInfo, setConvertedCountInfo] = useState<number>(0);
+
+    const handleConfirmImport = async () => {
+        if (pendingReadings.length === 0) return;
+
+        onLoading(true);
+        try {
+            if (anomalySource === 'MANUAL') {
+                // Manual Entry Saving
+                if (pendingReadings.length === 1) {
+                    await onSave(pendingReadings[0]);
+                    setLevelCm('');
+                    setCustomSG('');
+                    alert('Table A: 液位紀錄已儲存');
+                }
+            } else {
+                // Import Saving
+                await onBatchSave(pendingReadings);
+                alert(`成功匯入 ${pendingReadings.length} 筆資料${convertedCountInfo > 0 ? ` (其中 ${convertedCountInfo} 筆已自動從百分比換算為公分)` : ''}。`);
+            }
+        } finally {
+            onLoading(false);
+            setShowAnomalyModal(false);
+            setPendingReadings([]);
+            setImportAnomalies([]);
+            onUpdateTank(); // Refresh data after successful import
+        }
+    };
+
+    const handleCancelImport = () => {
+        setShowAnomalyModal(false);
+        setPendingReadings([]);
+        setImportAnomalies([]);
+        // We might want to clear the file input too, but tricky from here without ref to ExcelImportView
+    };
 
     // History State
     const [historySupplies, setHistorySupplies] = useState<ChemicalSupply[]>([]);
@@ -859,6 +903,7 @@ const DataEntryView: React.FC<{
     const handleBatchImportBWS = async () => {
         if (!confirm(`確定要匯入「近 ${importWeeks} 週」的數據至資料庫嗎？\n這將寫入所有鍋爐儲槽的生產參數。`)) return;
         setImporting(true);
+        // onLoading(true); // Disabled as per user request
         setImportLogs([]);
         const addLog = (msg: string) => setImportLogs(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`]);
         try {
@@ -916,12 +961,15 @@ const DataEntryView: React.FC<{
             addLog(`錯誤: ${e.message}`);
         } finally {
             setImporting(false);
+            // onLoading(false); // Disabled as per user request
         }
     };
 
     const handleBatchImportCWS = async () => {
         if (!confirm(`確定要匯入「近 ${importWeeks} 週」的數據至資料庫嗎？\n這將寫入冷卻水系統的循環量與溫度參數。`)) return;
+
         setImporting(true);
+        // onLoading(true); // Disabled as per user request
         setImportLogs([]);
         const addLog = (msg: string) => setImportLogs(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`]);
         try {
@@ -1026,6 +1074,7 @@ const DataEntryView: React.FC<{
             addLog(`錯誤: ${e.message}`);
         } finally {
             setImporting(false);
+            // onLoading(false); // Disabled as per user request
         }
     };
 
@@ -1118,6 +1167,61 @@ const DataEntryView: React.FC<{
         }
     }, [activeType, selectedTankId, date, historyCWS]);
 
+    // Anomaly Detection Helper
+    const detectReadingAnomaly = (tank: Tank, newReading: Reading, existingReadings: Reading[]): ImportAnomaly | null => {
+        // Merge and sort
+        const allReadings = [...existingReadings, newReading].sort((a, b) => a.timestamp - b.timestamp);
+        const idx = allReadings.findIndex(r => r.id === newReading.id);
+        if (idx === -1) return null;
+
+        const prev = idx > 0 ? allReadings[idx - 1] : null;
+        const next = idx < allReadings.length - 1 ? allReadings[idx + 1] : null;
+
+        // Calculate Capacity
+        let tankCapacity = tank.capacityLiters > 0 ? tank.capacityLiters : 0;
+        if (tankCapacity === 0 && tank.dimensions?.height) {
+            tankCapacity = calculateTankVolume(tank, tank.dimensions.height);
+        }
+        if (tankCapacity === 0) tankCapacity = 10000;
+
+        const thresholdPercent = tank.validationThreshold ?? 30; // Default 30% if not set
+        const dailyThreshold = tankCapacity * (thresholdPercent / 100);
+
+        let anomalyReason = null;
+
+        if (prev) {
+            const daysDiff = (newReading.timestamp - prev.timestamp) / (1000 * 60 * 60 * 24);
+            if (daysDiff > 0) {
+                const addedAmount = newReading.addedAmountLiters || 0;
+                // Calculate consumption (positive means consumption, negative means level rose)
+                const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
+                const dailyChange = Math.abs(levelChange) / daysDiff;
+
+                // Check for abnormal consumption rate
+                if (dailyChange > dailyThreshold) {
+                    // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
+                    const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
+                    anomalyReason = `日均變動 ${dailyChange.toFixed(0)} L (超過閾值 ${dailyThreshold.toFixed(0)} L)`;
+
+                    return {
+                        id: newReading.id,
+                        tankId: tank.id,
+                        date: new Date(newReading.timestamp).toLocaleDateString(),
+                        tankName: tank.name,
+                        reason: anomalyReason,
+                        currentValue: newReading.calculatedVolume,
+                        prevDate: prev ? new Date(prev.timestamp).toLocaleDateString() : undefined,
+                        prevValue: prev ? prev.calculatedVolume : undefined,
+                        nextDate: next ? new Date(next.timestamp).toLocaleDateString() : undefined,
+                        nextValue: next ? next.calculatedVolume : undefined,
+                        isPossibleRefill
+                    };
+                }
+            }
+        }
+        return null;
+    };
+
     const handleSubmitReadings = (e: React.FormEvent) => {
         e.preventDefault();
         if (!selectedTank) return;
@@ -1154,10 +1258,37 @@ const DataEntryView: React.FC<{
             operatorName: operator
         };
 
-        onSave(newReading);
-        setLevelCm('');
-        setCustomSG('');
-        alert(`Table A: 液位紀錄已儲存 (輸入: ${levelCm}${selectedTank.inputUnit === 'PERCENT' ? '%' : 'cm'} => 轉換: ${finalLevelCm.toFixed(1)}cm)`);
+
+
+
+
+        // --- Anomaly Detection ---
+        const tankReadings = readings.filter(r => r.tankId === selectedTankId);
+        const anomaly = detectReadingAnomaly(selectedTank, newReading, tankReadings);
+
+        if (anomaly) {
+            setImportAnomalies([anomaly]);
+            setPendingReadings([newReading]);
+            setAnomalySource('MANUAL');
+            setShowAnomalyModal(true);
+            return; // Stop here, wait for modal confirmation
+        }
+
+        const saveAsync = async () => {
+            onLoading(true);
+            try {
+                await onSave(newReading);
+                setLevelCm('');
+                setCustomSG('');
+                alert(`Table A: 液位紀錄已儲存 (輸入: ${levelCm}${selectedTank.inputUnit === 'PERCENT' ? '%' : 'cm'} => 轉換: ${finalLevelCm.toFixed(1)}cm)`);
+            } catch (e) {
+                console.error(e);
+                alert('儲存失敗');
+            } finally {
+                onLoading(false);
+            }
+        };
+        saveAsync();
     };
 
     const handleSubmitContract = async (e: React.FormEvent) => {
@@ -1185,88 +1316,96 @@ const DataEntryView: React.FC<{
         }
 
         // Fetch all supplies for validation and inheritance
-        const allSupplies = await StorageService.getSupplies();
+        onLoading(true);
+        try {
+            const allSupplies = await StorageService.getSupplies();
 
-        // Check for inheritance if targetPpm is missing
-        let finalTargetPpm = newSupply.targetPpm ? Number(newSupply.targetPpm) : undefined;
-        if (finalTargetPpm === undefined) {
-            const tankSupplies = allSupplies
-                .filter(s => s.tankId === newSupply.tankId)
-                .sort((a, b) => b.startDate - a.startDate); // Latest first
+            // Check for inheritance if targetPpm is missing
+            let finalTargetPpm = newSupply.targetPpm ? Number(newSupply.targetPpm) : undefined;
+            if (finalTargetPpm === undefined) {
+                const tankSupplies = allSupplies
+                    .filter(s => s.tankId === newSupply.tankId)
+                    .sort((a, b) => b.startDate - a.startDate); // Latest first
 
-            if (tankSupplies.length > 0) {
-                finalTargetPpm = tankSupplies[0].targetPpm;
+                if (tankSupplies.length > 0) {
+                    finalTargetPpm = tankSupplies[0].targetPpm;
+                }
             }
-        }
 
-        // Check for existing supply on the same day to prevent duplicates
-        const sameDaySupply = allSupplies.find(s =>
-            s.tankId === newSupply.tankId &&
-            s.startDate === new Date(newSupply.startDate as any).getTime()
-        );
+            // Check for existing supply on the same day to prevent duplicates
+            const sameDaySupply = allSupplies.find(s =>
+                s.tankId === newSupply.tankId &&
+                s.startDate === new Date(newSupply.startDate as any).getTime()
+            );
 
-        let savedSupply: ChemicalSupply;
+            let savedSupply: ChemicalSupply;
 
-        if (sameDaySupply) {
-            if (!confirm(`該儲槽在 ${newSupply.startDate} 已有合約紀錄，確定要覆蓋嗎？`)) return;
+            if (sameDaySupply) {
+                if (!confirm(`該儲槽在 ${newSupply.startDate} 已有合約紀錄，確定要覆蓋嗎？`)) return;
 
-            savedSupply = {
-                ...sameDaySupply, // Keep ID
-                supplierName: newSupply.supplierName,
-                chemicalName: newSupply.chemicalName || '',
-                specificGravity: Number(newSupply.specificGravity),
-                price: newSupply.price ? Number(newSupply.price) : undefined,
-                notes: newSupply.notes,
-                targetPpm: finalTargetPpm
-            };
-            await StorageService.updateSupply(savedSupply);
-            alert(`已更新現有的合約紀錄`);
-        } else {
-            savedSupply = {
-                id: generateUUID(),
-                tankId: newSupply.tankId!,
-                supplierName: newSupply.supplierName,
-                chemicalName: newSupply.chemicalName || '',
-                specificGravity: Number(newSupply.specificGravity),
-                price: newSupply.price ? Number(newSupply.price) : undefined,
-                startDate: new Date(newSupply.startDate as any).getTime(),
-                notes: newSupply.notes,
-                targetPpm: finalTargetPpm
-            };
-            await StorageService.saveSupply(savedSupply);
-            alert(`已新增合約紀錄`);
-        }
+                savedSupply = {
+                    ...sameDaySupply, // Keep ID
+                    supplierName: newSupply.supplierName,
+                    chemicalName: newSupply.chemicalName || '',
+                    specificGravity: Number(newSupply.specificGravity),
+                    price: newSupply.price ? Number(newSupply.price) : undefined,
+                    notes: newSupply.notes,
+                    targetPpm: finalTargetPpm
+                };
+                await StorageService.updateSupply(savedSupply);
+                alert(`已更新現有的合約紀錄`);
+            } else {
+                savedSupply = {
+                    id: generateUUID(),
+                    tankId: newSupply.tankId!,
+                    supplierName: newSupply.supplierName,
+                    chemicalName: newSupply.chemicalName || '',
+                    specificGravity: Number(newSupply.specificGravity),
+                    price: newSupply.price ? Number(newSupply.price) : undefined,
+                    startDate: new Date(newSupply.startDate as any).getTime(),
+                    notes: newSupply.notes,
+                    targetPpm: finalTargetPpm
+                };
+                await StorageService.saveSupply(savedSupply);
+                alert(`已新增合約紀錄`);
+            }
 
-        // 自動重新計算該儲槽相關的液位紀錄比重
-        const supplyStartDate = savedSupply.startDate;
-        let sgUpdatedCount = 0;
-        for (const reading of readings) {
-            // 只處理同一儲槽且日期 >= 合約生效日的紀錄
-            if (reading.tankId === savedSupply.tankId && reading.timestamp >= supplyStartDate) {
-                const activeSupply = await StorageService.getActiveSupply(reading.tankId, reading.timestamp);
-                if (activeSupply && activeSupply.specificGravity !== reading.appliedSpecificGravity) {
-                    const tank = tanks.find(t => t.id === reading.tankId);
-                    if (tank) {
-                        const vol = calculateTankVolume(tank, reading.levelCm);
-                        await StorageService.updateReading({
-                            ...reading,
-                            appliedSpecificGravity: activeSupply.specificGravity,
-                            calculatedWeightKg: vol * activeSupply.specificGravity,
-                            supplyId: activeSupply.id
-                        });
-                        sgUpdatedCount++;
+            // 自動重新計算該儲槽相關的液位紀錄比重
+            const supplyStartDate = savedSupply.startDate;
+            let sgUpdatedCount = 0;
+            for (const reading of readings) {
+                // 只處理同一儲槽且日期 >= 合約生效日的紀錄
+                if (reading.tankId === savedSupply.tankId && reading.timestamp >= supplyStartDate) {
+                    const activeSupply = await StorageService.getActiveSupply(reading.tankId, reading.timestamp);
+                    if (activeSupply && activeSupply.specificGravity !== reading.appliedSpecificGravity) {
+                        const tank = tanks.find(t => t.id === reading.tankId);
+                        if (tank) {
+                            const vol = calculateTankVolume(tank, reading.levelCm);
+                            await StorageService.updateReading({
+                                ...reading,
+                                appliedSpecificGravity: activeSupply.specificGravity,
+                                calculatedWeightKg: vol * activeSupply.specificGravity,
+                                supplyId: activeSupply.id
+                            });
+                            sgUpdatedCount++;
+                        }
                     }
                 }
             }
-        }
 
-        if (sgUpdatedCount > 0) {
-            onUpdateTank(); // 觸發刷新
-        }
+            if (sgUpdatedCount > 0) {
+                onUpdateTank(); // 觸發刷新
+            }
 
-        setNewSupply({});
-        loadHistory();
-        alert(`Table B: 合約紀錄處理完成${sgUpdatedCount > 0 ? `，並更新 ${sgUpdatedCount} 筆液位紀錄的比重` : ''}`);
+            setNewSupply({});
+            loadHistory();
+            alert(`Table B: 合約紀錄處理完成${sgUpdatedCount > 0 ? `，並更新 ${sgUpdatedCount} 筆液位紀錄的比重` : ''}`);
+        } catch (e) {
+            console.error(e);
+            alert('儲存失敗');
+        } finally {
+            onLoading(false);
+        }
     }
 
     // Helper: Normalize date string "YYYY-MM-DD" or "YYYY/MM/DD" to timestamp at Local Midnight
@@ -1280,6 +1419,7 @@ const DataEntryView: React.FC<{
         if (!selectedAreaOrTank || !cwsInput.dateStr) return;
 
         try {
+            onLoading(true);
             const tempOutlet = Number(cwsInput.tempOutlet) || 0;
             const tempReturn = Number(cwsInput.tempReturn) || 0;
             const cwsHardness = Number(cwsInput.cwsHardness) || 0;
@@ -1330,6 +1470,8 @@ const DataEntryView: React.FC<{
         } catch (error) {
             console.error(error);
             alert('更新失敗');
+        } finally {
+            onLoading(false);
         }
     };
 
@@ -1339,6 +1481,7 @@ const DataEntryView: React.FC<{
         if (!bwsInput.tankId || !bwsInput.dateStr) return;
 
         try {
+            onLoading(true);
             await StorageService.saveBWSParam({
                 tankId: bwsInput.tankId,
                 steamProduction: Number(bwsInput.steamProduction) || 0,
@@ -1346,10 +1489,7 @@ const DataEntryView: React.FC<{
                 // We keep the field optional in type but don't save it from input
                 // Or better: The backend might still expect it? The type definition says optional?
                 // Let's assume we just don't send it or send undefined.
-                // However, existing type BWSParameterRecord might have it.
-                // We will send undefined/null if the backend supports it, or 0.
-                // Since we are migrating, let's just omit it from the UI.
-                // For safety, checks if the backend needs it. 
+                // For safety, checks if the backend needs it.
                 // Assuming backend update isn't needed immediately if we just stop sending it or send 0.
                 date: getNormalizedTimestamp(bwsInput.dateStr) || Date.now()
             });
@@ -1360,6 +1500,8 @@ const DataEntryView: React.FC<{
         } catch (error) {
             console.error(error);
             alert('更新失敗');
+        } finally {
+            onLoading(false);
         }
     };
 
@@ -1367,6 +1509,7 @@ const DataEntryView: React.FC<{
         if (!file) return;
 
         try {
+            onLoading(true);
             const rawJsonData = await readExcelFile(file);
             // 1. Normalize keys (Trim whitespace)
             const jsonData = rawJsonData.map((row: any) => {
@@ -1410,15 +1553,6 @@ const DataEntryView: React.FC<{
                             if (levelVal !== undefined && levelVal !== '' && !isNaN(Number(levelVal))) {
                                 // Important: Use normalized timestamp (Midnight)
                                 const timestamp = getNormalizedTimestamp(readingDate);
-
-                                // DEBUG: Check specifically for Sulfuric tanks (CT-1 / CT-2 硫酸)
-                                // We check this for every row until we alert once.
-                                if (targetTank.name.includes('硫酸')) {
-                                    if (!(window as any).hasAlertedDebug) {
-                                        alert(`偵錯檢查:\n儲槽: ${targetTank.name}\n設定單位: ${targetTank.inputUnit}\n直徑/高度: ${targetTank.dimensions?.height || targetTank.dimensions?.diameter}\n讀取數值範例: ${levelVal}`);
-                                        (window as any).hasAlertedDebug = true;
-                                    }
-                                }
 
                                 if (!timestamp) {
                                     console.warn(`[Skip] Row ${i + 1} Col ${key}: 無效日期`);
@@ -1480,7 +1614,7 @@ const DataEntryView: React.FC<{
 
                 if (newReadings.length > 0) {
                     // === 液位合理性檢查 ===
-                    const warnings: string[] = [];
+                    const anomalies: ImportAnomaly[] = [];
 
                     // Group by tank for validation
                     const tankGroups = new Map<string, Reading[]>();
@@ -1498,59 +1632,88 @@ const DataEntryView: React.FC<{
                             .filter(r => r.tankId === tankId)
                             .sort((a, b) => a.timestamp - b.timestamp);
 
-                        const allReadings = [...existingTankReadings, ...tankNewReadings]
+                        // Merge for analysis
+                        // Note: newReadings might overwrite existing ones on same day.
+                        // We need a consolidated list where same-day readings are replaced by new ones.
+                        const consolidatedMap = new Map<number, Reading>();
+                        existingTankReadings.forEach(r => consolidatedMap.set(r.timestamp, r));
+                        tankNewReadings.forEach(r => consolidatedMap.set(r.timestamp, r));
+
+                        const allReadings = Array.from(consolidatedMap.values())
                             .sort((a, b) => a.timestamp - b.timestamp);
 
                         // Calculate tank capacity for threshold (use volume if available)
-                        const tankCapacity = tank.dimensions?.height
-                            ? calculateTankVolume(tank, tank.dimensions.height)
-                            : 10000; // Default 10000L if unknown
+                        // Priority: 1. Defined Capacity -> 2. Calculated from Height -> 3. Default
+                        let tankCapacity = tank.capacityLiters > 0 ? tank.capacityLiters : 0;
+                        if (tankCapacity === 0 && tank.dimensions?.height) {
+                            tankCapacity = calculateTankVolume(tank, tank.dimensions.height);
+                        }
+                        if (tankCapacity === 0) tankCapacity = 10000; // Default 10000L if unknown
                         const thresholdPercent = tank.validationThreshold ?? 30; // Use tank setting or default 30%
                         const dailyThreshold = tankCapacity * (thresholdPercent / 100);
 
-                        // Check each new reading against its predecessor
+                        // Check each new reading against its predecessor/successor
                         for (const newReading of tankNewReadings) {
                             const idx = allReadings.findIndex(r => r.id === newReading.id);
-                            if (idx <= 0) continue; // No predecessor
+                            if (idx === -1) continue;
 
-                            const prev = allReadings[idx - 1];
-                            const curr = newReading;
+                            let anomalyReason = null;
+                            const prev = idx > 0 ? allReadings[idx - 1] : null;
+                            const next = idx < allReadings.length - 1 ? allReadings[idx + 1] : null;
 
-                            const daysDiff = (curr.timestamp - prev.timestamp) / (1000 * 60 * 60 * 24);
-                            if (daysDiff <= 0) continue;
+                            // 1. Check vs Prev
+                            if (prev) {
+                                const daysDiff = (newReading.timestamp - prev.timestamp) / (1000 * 60 * 60 * 24);
+                                if (daysDiff > 0) {
+                                    const addedAmount = newReading.addedAmountLiters || 0;
+                                    const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
+                                    const dailyChange = Math.abs(levelChange) / daysDiff;
 
-                            // Calculate level change (considering refill)
-                            const addedAmount = curr.addedAmountLiters || 0;
-                            const levelChange = (prev.calculatedVolume + addedAmount) - curr.calculatedVolume;
-                            const dailyChange = Math.abs(levelChange) / daysDiff;
+                                    if (dailyChange > dailyThreshold) {
+                                        // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
+                                        const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
+                                        anomalyReason = `日均變動 ${dailyChange.toFixed(0)} L (超過閾值 ${dailyThreshold.toFixed(0)} L)`;
 
-                            // Check for abnormal change
-                            if (dailyChange > dailyThreshold) {
-                                const dateStr = new Date(curr.timestamp).toLocaleDateString();
-                                warnings.push(`[${dateStr}] ${tank.name}: 日均變動 ${dailyChange.toFixed(0)} L (閾值 ${dailyThreshold.toFixed(0)} L)`);
-                            }
-
-                            // Check for negative usage (level increased without refill record)
-                            if (levelChange < -100 && addedAmount === 0) { // Allow small tolerance
-                                const dateStr = new Date(curr.timestamp).toLocaleDateString();
-                                warnings.push(`[${dateStr}] ${tank.name}: 液位異常上升 ${Math.abs(levelChange).toFixed(0)} L (無補藥記錄)`);
+                                        anomalies.push({
+                                            id: newReading.id,
+                                            tankId: tank.id,
+                                            date: new Date(newReading.timestamp).toLocaleDateString(),
+                                            tankName: tank.name,
+                                            reason: anomalyReason,
+                                            currentValue: newReading.calculatedVolume,
+                                            prevDate: prev ? new Date(prev.timestamp).toLocaleDateString() : undefined,
+                                            prevValue: prev ? prev.calculatedVolume : undefined,
+                                            nextDate: next ? new Date(next.timestamp).toLocaleDateString() : undefined,
+                                            nextValue: next ? next.calculatedVolume : undefined,
+                                            isPossibleRefill
+                                        });
+                                    }
+                                }
                             }
                         }
                     });
 
-                    // Show warning if any issues found
-                    if (warnings.length > 0) {
-                        const warningMsg = `發現 ${warnings.length} 筆可能異常的液位記錄:\n\n${warnings.slice(0, 10).join('\n')}${warnings.length > 10 ? `\n... 及另外 ${warnings.length - 10} 筆` : ''}\n\n這些數據可能是輸入錯誤。確定要繼續匯入嗎?`;
-                        if (!confirm(warningMsg)) {
-                            alert('已取消匯入，請核對資料後再試。');
-                            setFile(null);
-                            return;
-                        }
+                    // Show warning modal if any issues found
+                    if (anomalies.length > 0) {
+                        // 排序異常列表：先按日期，再按儲槽名稱
+                        anomalies.sort((a, b) => {
+                            // 先按日期排序
+                            const dateA = new Date(a.date.replace(/\//g, '-')).getTime();
+                            const dateB = new Date(b.date.replace(/\//g, '-')).getTime();
+                            if (dateA !== dateB) return dateA - dateB;
+                            // 日期相同則按儲槽名稱排序
+                            return a.tankName.localeCompare(b.tankName, 'zh-TW');
+                        });
+                        setImportAnomalies(anomalies);
+                        setPendingReadings(newReadings);
+                        setConvertedCountInfo(convertedCount);
+                        setShowAnomalyModal(true);
+                        onLoading(false); // Stop loading to show modal
+                        return; // Stop here, wait for user confirmation
                     }
 
                     await onBatchSave(newReadings);
-                    (window as any).hasAlertedDebug = false; // Reset debug flag
-                    alert(`成功匯入 ${newReadings.length} 筆資料 (其中 ${convertedCount} 筆已自動從百分比換算為公分)。`);
+                    alert(`成功匯入 ${newReadings.length} 筆資料${convertedCount > 0 ? ` (其中 ${convertedCount} 筆已自動從百分比換算為公分)` : ''}。`);
                 }
             } else if (activeType === 'B') {
                 const newSupplies: ChemicalSupply[] = [];
@@ -1883,6 +2046,9 @@ const DataEntryView: React.FC<{
             const errorMsg = e?.message || String(e);
             alert(`檔案讀取失敗，請確認格式。\n\n錯誤詳情: ${errorMsg}`);
         }
+        finally {
+            onLoading(false);
+        }
     };
 
     // 批次重新計算比重 - 根據 Table B 的合約資料重新計算 Table A 的比重
@@ -1890,6 +2056,7 @@ const DataEntryView: React.FC<{
     const recalculateSG = async (silent = false): Promise<number> => {
         if (!silent && !confirm('此操作將根據藥劑合約 (Table B) 重新計算所有液位紀錄的比重，確定要繼續嗎？')) return 0;
 
+        onLoading(true);
         try {
             let updatedCount = 0;
             const updatedReadings: Reading[] = [];
@@ -1933,7 +2100,8 @@ const DataEntryView: React.FC<{
             if (!silent) {
                 alert(`重新計算失敗: ${e?.message || e}`);
             }
-            return 0;
+        } finally {
+            onLoading(false);
         }
     };
 
@@ -1954,6 +2122,40 @@ const DataEntryView: React.FC<{
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, "Readings");
         XLSX.writeFile(wb, "PowerChem_Readings.xlsx");
+        XLSX.writeFile(wb, "PowerChem_Readings.xlsx");
+    };
+
+    const handleAddNote = async (anomaly: ImportAnomaly, noteContent: string) => {
+        try {
+            onLoading(true);
+            const tank = tanks.find(t => t.id === anomaly.tankId);
+            const area = tank ? tank.system : 'Unknown';
+
+            // Try to format date to YYYY-MM-DD
+            let dateStr = anomaly.date.replace(/\//g, '-');
+            const parts = dateStr.split('-');
+            if (parts.length === 3) {
+                // Ensure padding
+                dateStr = `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+            }
+
+            const note: ImportantNote = {
+                id: generateUUID(),
+                dateStr: dateStr,
+                area: area,
+                chemicalName: tank ? tank.name : anomaly.tankName,
+                note: noteContent,
+                createdAt: new Date().toISOString()
+            };
+
+            await StorageService.saveNote(note);
+            alert('重要紀事已新增');
+        } catch (e) {
+            console.error('Failed to add note:', e);
+            alert('新增失敗');
+        } finally {
+            onLoading(false);
+        }
     };
 
     return (
@@ -2173,7 +2375,7 @@ const DataEntryView: React.FC<{
                                     // Refresh logic handled by parent or effect?
                                     // Hack: Force effect to reload by touching activeType or similar?
                                     // Or just call filter directly?
-                                    // Let's assume onUpdateTank or effect dependency handles it. 
+                                    // Let's assume onUpdateTank or effect dependency handles it.
                                     // Adding a toggle for refresh would be cleaner but let's see.
                                 } else if (activeType === 'C') {
                                     await StorageService.updateCWSParamRecord({
@@ -2202,7 +2404,7 @@ const DataEntryView: React.FC<{
                                 alert('更新成功');
                                 // Trigger history reload hack for B/C/D if needed (since they depend on separate endpoint)
                                 // We can depend on onUpdateTank triggering re-render?
-                                // Actually, historyEffect depends on selectedTankId. 
+                                // Actually, historyEffect depends on selectedTankId.
                                 // We might need to manually trigger reload.
                             } catch (e) {
                                 console.error(e);
@@ -2934,6 +3136,14 @@ const DataEntryView: React.FC<{
             <div className="flex justify-between pt-4 border-t border-slate-200">
                 {/* Buttons moved specifically to Type A and Type B sections */}
             </div>
+            {/* Anomaly Modal */}
+            <ImportAnomalyModal
+                isOpen={showAnomalyModal}
+                anomalies={importAnomalies}
+                onConfirm={handleConfirmImport}
+                onCancel={handleCancelImport}
+                onAddNote={handleAddNote}
+            />
         </div>
     );
 };
@@ -3039,7 +3249,7 @@ const AnalysisView: React.FC<{
         if (val) {
             const [year, month] = val.split('-').map(Number);
             const startDate = new Date(year, month - 1, 1);
-            const endDate = new Date(year, month, 0); // Last day of month
+            const endDate = new Date(year, month, 0);
 
             // Adjust to local timezone string YYYY-MM-DD
             const startStr = startDate.toLocaleDateString('zh-CA'); // YYYY-MM-DD
@@ -3999,87 +4209,89 @@ const AnalysisView: React.FC<{
             <TheoreticalUsageCard tank={selectedTank} weeklyData={weeklyData} />
 
             {/* Help Modal */}
-            {helpTopic && (
-                <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4" onClick={() => setHelpTopic(null)}>
-                    <div className="bg-white rounded-lg shadow-xl w-full max-w-lg animate-in fade-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
-                        <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-lg">
-                            <h3 className="text-lg font-bold text-slate-800 flex items-center">
-                                <Icons.Help className="w-5 h-5 mr-2 text-brand-500" />
-                                {helpTopic === 'weekly' ? '週理論用量計算說明' : '月理論用量計算說明'}
-                            </h3>
-                            <button onClick={() => setHelpTopic(null)} className="text-slate-400 hover:text-slate-600">
-                                <Icons.X className="w-5 h-5" />
-                            </button>
-                        </div>
-                        <div className="p-6 space-y-4 text-slate-700 text-sm">
-                            {helpTopic === 'weekly' ? (
-                                <div className="space-y-4">
-                                    <h4 className="font-bold text-brand-700">冷卻水系統 (CWS)</h4>
-                                    <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
-                                        (循環水量 × 溫差 × 1.8 × 24hr × 7天) / 1000 / (濃縮倍數 - 1) × 目標濃度(ppm) / 1000
-                                    </div>
-                                    <p>依據當週的平均操作參數計算。</p>
+            {
+                helpTopic && (
+                    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4" onClick={() => setHelpTopic(null)}>
+                        <div className="bg-white rounded-lg shadow-xl w-full max-w-lg animate-in fade-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
+                            <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-lg">
+                                <h3 className="text-lg font-bold text-slate-800 flex items-center">
+                                    <Icons.Help className="w-5 h-5 mr-2 text-brand-500" />
+                                    {helpTopic === 'weekly' ? '週理論用量計算說明' : '月理論用量計算說明'}
+                                </h3>
+                                <button onClick={() => setHelpTopic(null)} className="text-slate-400 hover:text-slate-600">
+                                    <Icons.X className="w-5 h-5" />
+                                </button>
+                            </div>
+                            <div className="p-6 space-y-4 text-slate-700 text-sm">
+                                {helpTopic === 'weekly' ? (
+                                    <div className="space-y-4">
+                                        <h4 className="font-bold text-brand-700">冷卻水系統 (CWS)</h4>
+                                        <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                            (循環水量 × 溫差 × 1.8 × 24hr × 7天) / 1000 / (濃縮倍數 - 1) × 目標濃度(ppm) / 1000
+                                        </div>
+                                        <p>依據當週的平均操作參數計算。</p>
 
-                                    <h4 className="font-bold text-orange-700 mt-4">鍋爐系統 (BWS)</h4>
-                                    <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
-                                        (當週蒸氣總產量 × 目標濃度(ppm)) / 1000
-                                    </div>
-                                    <p>直接依據流量計回傳的蒸氣總量計算。</p>
+                                        <h4 className="font-bold text-orange-700 mt-4">鍋爐系統 (BWS)</h4>
+                                        <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                            (當週蒸氣總產量 × 目標濃度(ppm)) / 1000
+                                        </div>
+                                        <p>直接依據流量計回傳的蒸氣總量計算。</p>
 
-                                    <h4 className="font-bold text-amber-700 mt-4">比重與單價說明</h4>
-                                    <ul className="list-disc pl-5 space-y-2">
-                                        <li>
-                                            <span className="font-semibold">顯示方式</span>：若該週內只有單一比重/單價，則直接顯示該值；若有多個不同的值（例如週中換約），則顯示 <span className="text-amber-600 font-bold">「多值*」</span>，將游標移至該文字可檢視所有數值。
-                                        </li>
-                                        <li>
-                                            計算金額時，系統會依據每日各自適用的合約單價逐日計算後加總。
-                                        </li>
-                                    </ul>
-                                </div>
-                            ) : (
-                                <div className="space-y-4">
-                                    {hasCalculation && (
-                                        <>
-                                            <h4 className="font-bold text-slate-800">理論值計算原理</h4>
-                                            <p>月度理論值採用<span className="font-bold text-brand-600">「逐日加總」</span>方式計算：</p>
-                                            <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
-                                                月總量 = ∑ (每日理論用量)
-                                            </div>
-                                            <ul className="list-disc pl-5 space-y-2 mt-2">
-                                                <li>
-                                                    <span className="font-semibold">每日理論用量</span> = 對應週次的週理論用量 ÷ 7
-                                                </li>
-                                                <li>
-                                                    系統會自動找出每一天所屬的週次參數進行計算。
-                                                </li>
-                                                <li>
-                                                    此方式能精確處理由於月份天數不同 (28/30/31天) 以及週次跨月所導致的計算誤差，確保月度總和與實際天數完全吻合。
-                                                </li>
-                                            </ul>
-                                        </>
-                                    )}
-                                    <h4 className="font-bold text-amber-700 mt-4">比重與單價說明</h4>
-                                    <ul className="list-disc pl-5 space-y-2">
-                                        <li>
-                                            <span className="font-semibold">週次</span>：顯示該週最後生效的藥劑合約之比重與單價。
-                                        </li>
-                                        <li>
-                                            <span className="font-semibold">月份</span>：顯示該月最後一天生效的藥劑合約之比重與單價。
-                                        </li>
-                                        <li>
-                                            計算金額時，系統會依據每日各自適用的合約單價逐日計算後加總。
-                                        </li>
-                                    </ul>
-                                </div>
-                            )}
-                        </div>
-                        <div className="px-6 py-4 bg-slate-50 rounded-b-lg flex justify-end">
-                            <Button onClick={() => setHelpTopic(null)}>關閉</Button>
+                                        <h4 className="font-bold text-amber-700 mt-4">比重與單價說明</h4>
+                                        <ul className="list-disc pl-5 space-y-2">
+                                            <li>
+                                                <span className="font-semibold">顯示方式</span>：若該週內只有單一比重/單價，則直接顯示該值；若有多個不同的值（例如週中換約），則顯示 <span className="text-amber-600 font-bold">「多值*」</span>，將游標移至該文字可檢視所有數值。
+                                            </li>
+                                            <li>
+                                                計算金額時，系統會依據每日各自適用的合約單價逐日計算後加總。
+                                            </li>
+                                        </ul>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-4">
+                                        {hasCalculation && (
+                                            <>
+                                                <h4 className="font-bold text-slate-800">理論值計算原理</h4>
+                                                <p>月度理論值採用<span className="font-bold text-brand-600">「逐日加總」</span>方式計算：</p>
+                                                <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                                    月總量 = ∑ (每日理論用量)
+                                                </div>
+                                                <ul className="list-disc pl-5 space-y-2 mt-2">
+                                                    <li>
+                                                        <span className="font-semibold">每日理論用量</span> = 對應週次的週理論用量 ÷ 7
+                                                    </li>
+                                                    <li>
+                                                        系統會自動找出每一天所屬的週次參數進行計算。
+                                                    </li>
+                                                    <li>
+                                                        此方式能精確處理由於月份天數不同 (28/30/31天) 以及週次跨月所導致的計算誤差，確保月度總和與實際天數完全吻合。
+                                                    </li>
+                                                </ul>
+                                            </>
+                                        )}
+                                        <h4 className="font-bold text-amber-700 mt-4">比重與單價說明</h4>
+                                        <ul className="list-disc pl-5 space-y-2">
+                                            <li>
+                                                <span className="font-semibold">週次</span>：顯示該週最後生效的藥劑合約之比重與單價。
+                                            </li>
+                                            <li>
+                                                <span className="font-semibold">月份</span>：顯示該月最後一天生效的藥劑合約之比重與單價。
+                                            </li>
+                                            <li>
+                                                計算金額時，系統會依據每日各自適用的合約單價逐日計算後加總。
+                                            </li>
+                                        </ul>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="px-6 py-4 bg-slate-50 rounded-b-lg flex justify-end">
+                                <Button onClick={() => setHelpTopic(null)}>關閉</Button>
+                            </div>
                         </div>
                     </div>
-                </div>
-            )}
-        </div>
+                )
+            }
+        </div >
     );
 };
 
@@ -4329,7 +4541,7 @@ const ImportantNotesView: React.FC = () => {
     );
 };
 
-const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void }> = ({ tanks, readings, onRefresh }) => {
+const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onLoading: (loading: boolean) => void }> = ({ tanks, readings, onRefresh, onLoading }) => {
     const [editingTank, setEditingTank] = useState<Tank | null>(null);
     const [currentSG, setCurrentSG] = useState<{ sg: number; chemicalName: string } | null>(null);
 
@@ -4470,14 +4682,21 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
         } catch (error) {
             console.error(error);
             alert('匯入失敗，請檢查檔案格式');
+        } finally {
+            onLoading(false);
         }
         e.target.value = '';
     };
 
     const handleDelete = async (id: string) => {
         if (confirm('確定要刪除此儲槽及其所有相關設定嗎? (液位紀錄將保留)')) {
-            await StorageService.deleteTank(id);
-            await onRefresh();
+            onLoading(true);
+            try {
+                await StorageService.deleteTank(id);
+                await onRefresh();
+            } finally {
+                onLoading(false);
+            }
         }
     }
 
@@ -4517,27 +4736,35 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
         e.preventDefault();
         if (!editingTank) return;
 
-        // Update modification timestamps if params exist
-        const tankToSave = { ...editingTank };
-        if (tankToSave.cwsParams) {
-            tankToSave.cwsParams.date = Date.now();
-        }
-        if (tankToSave.bwsParams) {
-            tankToSave.bwsParams.date = Date.now();
-        }
+        onLoading(true);
+        try {
+            // Update modification timestamps if params exist
+            const tankToSave = { ...editingTank };
+            if (tankToSave.cwsParams) {
+                tankToSave.cwsParams.date = Date.now();
+            }
+            if (tankToSave.bwsParams) {
+                tankToSave.bwsParams.date = Date.now();
+            }
 
-        await StorageService.saveTank(tankToSave);
+            await StorageService.saveTank(tankToSave);
 
-        // Ask for recalculation if dimensions might have changed
-        if (confirm('儲槽設定已更新。是否要根據新的設定重新計算此儲槽的所有歷史用量數據？\n(若您剛變更了形狀或尺寸，建議執行此操作)')) {
-            const count = await recalculateTankHistory(tankToSave.id);
-            alert(`已重新計算 ${count} 筆歷史資料`);
-        } else {
-            alert('儲槽設定已更新');
+            // Ask for recalculation if dimensions might have changed
+            if (confirm('儲槽設定已更新。是否要根據新的設定重新計算此儲槽的所有歷史用量數據？\n(若您剛變更了形狀或尺寸，建議執行此操作)')) {
+                const count = await recalculateTankHistory(tankToSave.id);
+                alert(`已重新計算 ${count} 筆歷史資料`);
+            } else {
+                alert('儲槽設定已更新');
+            }
+
+            await onRefresh();
+            setEditingTank(null);
+        } catch (e: any) {
+            console.error(e);
+            alert('儲存失敗');
+        } finally {
+            onLoading(false);
         }
-
-        await onRefresh();
-        setEditingTank(null);
     };
 
     const updateTankField = (field: keyof Tank, value: any) => {
@@ -5096,6 +5323,9 @@ const App: React.FC = () => {
     // Navigation State for jumping to Analysis
     const [analysisInitialState, setAnalysisInitialState] = useState<{ tankId: string, monthStr: string } | null>(null);
 
+    // Global Loading State
+    const [isLoading, setIsLoading] = useState(false);
+
     // Persist UserName
     const [userName, setUserName] = useState(() => localStorage.getItem('appUserName') || 'OP');
 
@@ -5207,8 +5437,8 @@ const App: React.FC = () => {
 
     const renderContent = () => {
         switch (currentView) {
-            case 'dashboard': return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} onNavigate={handleNavigateToAnalysis} />;
-            case 'entry': return <DataEntryView tanks={tanks} readings={readings} onSave={handleSaveReading} onBatchSave={handleBatchSaveReadings} onUpdateTank={() => refreshData()} />;
+            case 'dashboard': return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} onNavigate={handleNavigateToAnalysis} onLoading={setIsLoading} />;
+            case 'entry': return <DataEntryView tanks={tanks} readings={readings} onSave={handleSaveReading} onBatchSave={handleBatchSaveReadings} onUpdateTank={() => refreshData()} onLoading={setIsLoading} />;
             case 'analysis': return (
                 <AnalysisView
                     tanks={tanks}
@@ -5217,10 +5447,10 @@ const App: React.FC = () => {
                     onStateConsumed={() => setAnalysisInitialState(null)}
                 />
             );
-            case 'settings': return <SettingsView tanks={tanks} readings={readings} onRefresh={refreshData} />;
+            case 'settings': return <SettingsView tanks={tanks} readings={readings} onRefresh={refreshData} onLoading={setIsLoading} />;
             case 'notes': return <ImportantNotesView />;
             case 'annual': return <AnnualDataView tanks={tanks} readings={readings} onNavigate={handleNavigateToAnalysis} />;
-            case 'import': return <ExcelImportView tanks={tanks} onComplete={refreshData} />;
+            case 'import': return <ExcelImportView tanks={tanks} onComplete={refreshData} onLoading={setIsLoading} />;
             default: return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} />;
         }
     };
@@ -5237,7 +5467,8 @@ const App: React.FC = () => {
     );
 
     return (
-        <div className="flex h-screen bg-slate-50 overflow-hidden">
+        <div className="flex h-screen bg-slate-50 overflow-hidden relative">
+            <LoadingOverlay isOpen={isLoading} />
             {/* Sidebar */}
             <aside className="bg-white border-r border-slate-200 flex-shrink-0 w-48 flex flex-col">
                 <div className="h-16 flex items-center px-4 border-b border-slate-100">

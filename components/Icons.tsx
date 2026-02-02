@@ -26,7 +26,8 @@ import {
   Import,
   Calendar,
   FileText,
-  HelpCircle
+  HelpCircle,
+  Check
 } from 'lucide-react';
 
 export const Icons = {
@@ -58,5 +59,6 @@ export const Icons = {
   Calculator: Calculator,
   Calendar: Calendar,
   FileText: FileText,
-  Help: HelpCircle
+  Help: HelpCircle,
+  Check: Check
 };
