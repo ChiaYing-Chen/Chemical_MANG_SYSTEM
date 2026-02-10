@@ -623,6 +623,64 @@ app.get('/api/whoami', (req, res) => {
     res.json({ username });
 });
 
+// ==================== Weekly CWS Import API ====================
+app.post('/api/import/cws-weekly', async (req, res) => {
+    const { date, makeupHardness, ct1Hardness, ct2Hardness } = req.body;
+    const logPrefix = `[API Import ${new Date(date).toLocaleDateString()}]`;
+    const logs = [];
+
+    if (!date || makeupHardness === undefined) {
+        return res.status(400).json({ success: false, message: 'Missing required fields' });
+    }
+
+    try {
+        logs.push(`${logPrefix} Starting import...`);
+
+        // 1. Get Cooling Tanks
+        const cwsTanksRes = await pool.query("SELECT * FROM tanks WHERE system_type = '冷卻水系統'");
+        const cwsTanks = cwsTanksRes.rows;
+
+        // 2. Split CT-1 / CT-2 (Logic matches App.tsx)
+        const ct1Tanks = cwsTanks.filter(t => t.name.includes('CWS-1') || t.name.includes('CT-1') || (t.description || '').includes('一階'));
+        const ct2Tanks = cwsTanks.filter(t => !ct1Tanks.find(ct1 => ct1.id === t.id));
+
+        // 3. Helper to Upsert
+        const upsertTank = async (tank, hardnessValue) => {
+            const cycles = makeupHardness > 0 ? hardnessValue / makeupHardness : 0;
+
+            // Check existing record
+            const existingRes = await pool.query("SELECT * FROM cws_parameters WHERE tank_id = $1 AND date = $2", [tank.id, date]);
+            const existing = existingRes.rows[0];
+
+            if (existing) {
+                // Update only hardness/cycles, keep others
+                await pool.query(
+                    "UPDATE cws_parameters SET cws_hardness=$1, makeup_hardness=$2, concentration_cycles=$3, updated_at=NOW() WHERE id=$4",
+                    [hardnessValue, makeupHardness, cycles, existing.id]
+                );
+                logs.push(`Updated ${tank.name}`);
+            } else {
+                // Insert new with 0 for others
+                await pool.query(
+                    "INSERT INTO cws_parameters (id, tank_id, date, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles) VALUES ($1,$2,$3,0,0,0,0,$4,$5,$6)",
+                    [crypto.randomUUID(), tank.id, date, hardnessValue, makeupHardness, cycles]
+                );
+                logs.push(`Inserted ${tank.name}`);
+            }
+        };
+
+        // 4. Process
+        for (const tank of ct1Tanks) await upsertTank(tank, ct1Hardness);
+        for (const tank of ct2Tanks) await upsertTank(tank, ct2Hardness);
+
+        res.json({ success: true, message: `Imported successfully for ${cwsTanks.length} tanks`, logs });
+
+    } catch (error) {
+        console.error('Import API Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 // ==================== Tank APIs ====================
 
 // 取得所有儲槽
@@ -1075,6 +1133,38 @@ const migrateDatabase = async () => {
         await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS sg_range_min NUMERIC');
         await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS sg_range_max NUMERIC');
 
+        // 5. Fluctuation Alerts table
+        console.log('Ensuring fluctuation_alerts table...');
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS fluctuation_alerts (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                tank_id TEXT REFERENCES tanks(id) ON DELETE CASCADE,
+                tank_name TEXT,
+                date_str TEXT,
+                reason TEXT,
+                current_value NUMERIC,
+                prev_value NUMERIC,
+                next_value NUMERIC,
+                is_possible_refill BOOLEAN DEFAULT false,
+                source TEXT DEFAULT 'MANUAL',
+                note TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // 6. Important Notes table
+        console.log('Ensuring important_notes table...');
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS important_notes (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                date_str TEXT,
+                area TEXT,
+                chemical_name TEXT,
+                note TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
         await client.query('COMMIT');
         console.log('Database migration completed.');
     } catch (err) {
@@ -1443,101 +1533,6 @@ app.get('/mcp-connect/:token', async (req, res) => {
         return originalWrite.apply(res, [strChunk, ...args]);
     };
 
-    // ==================== Important Notes APIs ====================
-
-    // 取得所有重要紀事
-    app.get('/api/notes', async (req, res) => {
-        try {
-            const query = 'SELECT * FROM important_notes ORDER BY date_str DESC, created_at DESC';
-            const result = await pool.query(query);
-            res.json(result.rows);
-        } catch (err) {
-            console.error(err);
-            res.status(500).json({ error: '取得重要紀事失敗' });
-        }
-    });
-
-    // 新增重要紀事
-    app.post('/api/notes', async (req, res) => {
-        try {
-            const { date_str, area, chemical_name, note } = req.body;
-            const result = await pool.query(
-                `INSERT INTO important_notes (date_str, area, chemical_name, note)
-             VALUES ($1, $2, $3, $4) RETURNING *`,
-                [date_str, area, chemical_name, note]
-            );
-            res.status(201).json(result.rows[0]);
-        } catch (err) {
-            console.error(err);
-            res.status(500).json({ error: '新增重要紀事失敗' });
-        }
-    });
-
-    // 更新重要紀事
-    app.put('/api/notes/:id', async (req, res) => {
-        try {
-            const { id } = req.params;
-            const { date_str, area, chemical_name, note } = req.body;
-            const result = await pool.query(
-                `UPDATE important_notes 
-             SET date_str = $1, area = $2, chemical_name = $3, note = $4
-             WHERE id = $5 RETURNING *`,
-                [date_str, area, chemical_name, note, id]
-            );
-            if (result.rowCount === 0) {
-                return res.status(404).json({ error: '找不到該紀事' });
-            }
-            res.json(result.rows[0]);
-        } catch (err) {
-            console.error(err);
-            res.status(500).json({ error: '更新重要紀事失敗' });
-        }
-    });
-
-    // 刪除重要紀事
-    app.delete('/api/notes/:id', async (req, res) => {
-        try {
-            const { id } = req.params;
-            const result = await pool.query('DELETE FROM important_notes WHERE id = $1 RETURNING *', [id]);
-            if (result.rowCount === 0) {
-                return res.status(404).json({ error: '找不到該紀事' });
-            }
-            res.json({ message: '已刪除', deleted: result.rows[0] });
-        } catch (err) {
-            console.error(err);
-            res.status(500).json({ error: '刪除重要紀事失敗' });
-        }
-    });
-
-    // 批次新增重要紀事 (用於匯入)
-    app.post('/api/notes/batch', async (req, res) => {
-        const client = await pool.connect();
-        try {
-            const { notes } = req.body;
-            await client.query('BEGIN');
-
-            const results = [];
-            for (const record of notes) {
-                const { date_str, area, chemical_name, note } = record;
-                const result = await client.query(
-                    `INSERT INTO important_notes (date_str, area, chemical_name, note)
-                 VALUES ($1, $2, $3, $4) RETURNING *`,
-                    [date_str, area, chemical_name, note]
-                );
-                results.push(result.rows[0]);
-            }
-
-            await client.query('COMMIT');
-            res.status(201).json({ count: results.length, data: results });
-        } catch (err) {
-            await client.query('ROLLBACK');
-            console.error(err);
-            res.status(500).json({ error: '批次新增重要紀事失敗' });
-        } finally {
-            client.release();
-        }
-    });
-
     // 5. 創建 Transport
     const messageEndpoint = `/messages/${token}`;
     const transport = new SSEServerTransport(messageEndpoint, res);
@@ -1845,6 +1840,117 @@ app.post('/messages/:token', async (req, res) => {
     } catch (e) {
         console.error('[MCP] Message handling error:', e);
         res.status(500).json({ error: e.message });
+    }
+});
+
+// ==================== Fluctuation Alerts APIs ====================
+
+// 取得所有警報
+app.get('/api/alerts', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM fluctuation_alerts ORDER BY date_str DESC, created_at DESC');
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/alerts error:', err);
+        if (err.code === '42P01') {
+            res.json([]);
+        } else {
+            res.status(500).json({ error: '取得警報失敗', details: err.message });
+        }
+    }
+});
+
+// 新增警報
+app.post('/api/alerts', async (req, res) => {
+    try {
+        const { id, tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill, source, note } = req.body;
+        const result = await pool.query(
+            `INSERT INTO fluctuation_alerts (id, tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill, source, note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+            [id || crypto.randomUUID(), tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill || false, source || 'MANUAL', note]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/alerts error:', err);
+        res.status(500).json({ error: '新增警報失敗', details: err.message });
+    }
+});
+
+// 批次新增警報
+app.post('/api/alerts/batch', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { alerts } = req.body;
+        await client.query('BEGIN');
+
+        const results = [];
+        for (const alert of alerts) {
+            const { id, tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill, source, note } = alert;
+            const result = await client.query(
+                `INSERT INTO fluctuation_alerts (id, tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill, source, note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+                [id || crypto.randomUUID(), tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill || false, source || 'MANUAL', note]
+            );
+            results.push(result.rows[0]);
+        }
+
+        await client.query('COMMIT');
+        res.status(201).json({ count: results.length, data: results });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/alerts/batch error:', err);
+        res.status(500).json({ error: '批次新增警報失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 更新警報備註
+app.put('/api/alerts/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { note } = req.body;
+        const result = await pool.query(
+            'UPDATE fluctuation_alerts SET note = $1 WHERE id = $2 RETURNING *',
+            [note, id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: '找不到該警報' });
+        }
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error(`PUT /api/alerts/${req.params.id} error:`, err);
+        res.status(500).json({ error: '更新警報失敗', details: err.message });
+    }
+});
+
+// 刪除單筆警報
+app.delete('/api/alerts/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('DELETE FROM fluctuation_alerts WHERE id = $1 RETURNING id', [id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: '找不到該警報' });
+        }
+        res.json({ success: true, id });
+    } catch (err) {
+        console.error(`DELETE /api/alerts/${req.params.id} error:`, err);
+        res.status(500).json({ error: '刪除警報失敗', details: err.message });
+    }
+});
+
+// 批次刪除警報
+app.post('/api/alerts/batch-delete', async (req, res) => {
+    try {
+        const { ids } = req.body;
+        if (!ids || !Array.isArray(ids) || ids.length === 0) {
+            return res.status(400).json({ error: '無效的 ids' });
+        }
+        await pool.query('DELETE FROM fluctuation_alerts WHERE id = ANY($1)', [ids]);
+        res.json({ success: true, count: ids.length });
+    } catch (err) {
+        console.error('POST /api/alerts/batch-delete error:', err);
+        res.status(500).json({ error: '批次刪除警報失敗', details: err.message });
     }
 });
 
