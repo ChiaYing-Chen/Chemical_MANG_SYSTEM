@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { StorageService } from './services/storageService';
 import { calculateTankVolume } from './utils/calculationUtils';
-import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType } from './types';
+import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType, FluctuationAlert } from './types';
 import { Icons } from './components/Icons';
 import { LoadingOverlay } from './components/LoadingOverlay';
 import { ImportAnomalyModal, ImportAnomaly } from './components/ImportAnomalyModal';
@@ -12,6 +12,8 @@ import {
 } from 'recharts';
 import AnnualDataView from './views/AnnualDataView';
 import { ExcelImportView } from './views/ExcelImportView';
+import { FluctuationAlertsView } from './components/FluctuationAlertsView';
+import { formatAnomalyMessage } from './utils/textUtils';
 
 // --- Helper Components ---
 
@@ -220,8 +222,9 @@ const TankStatusCard: React.FC<{
     tank: any,
     dragProps?: any,
     onNavigate?: (tankId: string) => void,
-    onDeliveryClick?: (tank: any) => void
-}> = ({ tank, dragProps, onNavigate, onDeliveryClick }) => {
+    onDeliveryClick?: (tank: any) => void,
+    lowLevelWarningText?: string
+}> = ({ tank, dragProps, onNavigate, onDeliveryClick, lowLevelWarningText = '存量偏低，請叫藥' }) => {
 
     const handleCardClick = () => {
         if (onNavigate) {
@@ -274,6 +277,11 @@ const TankStatusCard: React.FC<{
                             style={{ width: `${Math.min(100, Math.max(0, tank.currentLevel))}%` }}
                         ></div>
                     </div>
+                    {tank.isLow && (
+                        <div className="text-yellow-600 text-xs font-medium mt-1 animate-pulse">
+                            ⚠️ {lowLevelWarningText}
+                        </div>
+                    )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 text-xs border-t border-slate-50 pt-2">
@@ -482,11 +490,11 @@ const DeliveryEstimationModal: React.FC<{
     );
 };
 
-const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onNavigate?: (tankId: string, month: number, year: number) => void, onLoading?: (loading: boolean) => void }> = ({ tanks, readings, onRefresh, onNavigate, onLoading }) => {
+const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onNavigate?: (tankId: string, month: number, year: number) => void, onLoading?: (loading: boolean) => void, usageCalcWeeks?: number, lowLevelWarningText?: string }> = ({ tanks, readings, onRefresh, onNavigate, onLoading, usageCalcWeeks = 8, lowLevelWarningText = '存量偏低，請叫藥' }) => {
     const [deliveryModalTank, setDeliveryModalTank] = useState<any>(null);
 
     const tanksWithStatus = useMemo(() => {
-        const fourWeeksAgo = Date.now() - 28 * 24 * 60 * 60 * 1000;
+        const weeksAgo = Date.now() - usageCalcWeeks * 7 * 24 * 60 * 60 * 1000;
 
         return tanks.map(tank => {
             const tankReadings = readings.filter(r => r.tankId === tank.id).sort((a, b) => b.timestamp - a.timestamp);
@@ -494,10 +502,12 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
             const currentVolume = lastReading?.calculatedVolume || 0;
             const currentWeightKg = lastReading?.calculatedWeightKg || 0;
             const currentLevel = lastReading ? (currentVolume / tank.capacityLiters) * 100 : 0;
-            const isLow = currentLevel < tank.safeMinLevel;
+            // Compare actual level with safeMinLevel (safeMinLevel is now in level units, not %)
+            const safeMinLevelCm = tank.inputUnit === 'PERCENT' ? tank.safeMinLevel * 100 : tank.safeMinLevel;
+            const isLow = lastReading ? (lastReading.levelCm < safeMinLevelCm) : false;
 
-            // Calculate average daily usage from past 4 weeks
-            const recentReadings = tankReadings.filter(r => r.timestamp >= fourWeeksAgo).sort((a, b) => a.timestamp - b.timestamp);
+            // Calculate average daily usage from past N weeks (configurable)
+            const recentReadings = tankReadings.filter(r => r.timestamp >= weeksAgo).sort((a, b) => a.timestamp - b.timestamp);
             let avgDailyUsageLiters = 0;
             let avgDailyUsageKg = 0;
 
@@ -686,6 +696,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                     tank={t}
                                     onNavigate={handleNavigate}
                                     onDeliveryClick={setDeliveryModalTank}
+                                    lowLevelWarningText={lowLevelWarningText}
                                     dragProps={{
                                         draggable: true,
                                         onDragStart: (e: React.DragEvent) => handleDragStart(e, t.id, 'coolingArea1'),
@@ -708,6 +719,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                     tank={t}
                                     onNavigate={handleNavigate}
                                     onDeliveryClick={setDeliveryModalTank}
+                                    lowLevelWarningText={lowLevelWarningText}
                                     dragProps={{
                                         draggable: true,
                                         onDragStart: (e: React.DragEvent) => handleDragStart(e, t.id, 'coolingArea2'),
@@ -734,7 +746,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} />)}
+                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -751,7 +763,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 gap-4">
-                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} />)}
+                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -765,7 +777,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} />)}
+                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -789,11 +801,12 @@ const DataEntryView: React.FC<{
     onBatchSave: (rs: Reading[]) => void,
     onUpdateTank: (tank?: Tank) => void;
     onLoading: (loading: boolean) => void;
-}> = ({ tanks, readings, onSave, onBatchSave, onUpdateTank, onLoading }) => {
+    appSettings: any;
+}> = ({ tanks, readings, onSave, onBatchSave, onUpdateTank, onLoading, appSettings }) => {
     const [selectedTankId, setSelectedTankId] = useState<string>('');
     const [date, setDate] = useState<string>(new Date().toISOString().split('T')[0]);
-    const [levelCm, setLevelCm] = useState<string>('');
-    const [customSG, setCustomSG] = useState<string>('');
+    // Batch Levels for Type A
+    const [batchLevels, setBatchLevels] = useState<{ [key: string]: string }>({});
     const [activeType, setActiveType] = useState<'A' | 'B' | 'C' | 'D'>('A');
 
     // State for editing history items
@@ -814,12 +827,32 @@ const DataEntryView: React.FC<{
 
         onLoading(true);
         try {
+            // Save Anomalies as Alerts
+            if (importAnomalies.length > 0) {
+                const alertsToSave: Partial<FluctuationAlert>[] = importAnomalies.map(anomaly => {
+                    // Find tank ID
+                    const tank = tanks.find(t => t.name === anomaly.tankName);
+                    return {
+                        tankId: tank?.id || 'UNKNOWN',
+                        tankName: anomaly.tankName,
+                        dateStr: anomaly.date.replace(/\//g, '-'), // Ensure YYYY-MM-DD
+                        reason: anomaly.reason,
+                        currentValue: anomaly.currentValue,
+                        prevValue: anomaly.prevValue,
+                        nextValue: anomaly.nextValue,
+                        isPossibleRefill: anomaly.isPossibleRefill,
+                        source: anomalySource,
+                        note: '' // Initial note is empty
+                    };
+                });
+                await StorageService.saveAlertsBatch(alertsToSave);
+            }
+
             if (anomalySource === 'MANUAL') {
                 // Manual Entry Saving
                 if (pendingReadings.length === 1) {
                     await onSave(pendingReadings[0]);
-                    setLevelCm('');
-                    setCustomSG('');
+
                     alert('Table A: 液位紀錄已儲存');
                 }
             } else {
@@ -827,6 +860,9 @@ const DataEntryView: React.FC<{
                 await onBatchSave(pendingReadings);
                 alert(`成功匯入 ${pendingReadings.length} 筆資料${convertedCountInfo > 0 ? ` (其中 ${convertedCountInfo} 筆已自動從百分比換算為公分)` : ''}。`);
             }
+        } catch (error) {
+            console.error(error);
+            alert('儲存失敗 (警報或數據)');
         } finally {
             onLoading(false);
             setShowAnomalyModal(false);
@@ -1197,12 +1233,38 @@ const DataEntryView: React.FC<{
                 const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
                 const dailyChange = Math.abs(levelChange) / daysDiff;
 
+                // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
+                const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
+
                 // Check for abnormal consumption rate
                 if (dailyChange > dailyThreshold) {
-                    // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
-                    const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
-                    anomalyReason = `日均變動 ${dailyChange.toFixed(0)} L (超過閾值 ${dailyThreshold.toFixed(0)} L)`;
+                    if (isPossibleRefill) {
+                        const warnText = appSettings?.possibleRefillText || '可能為補藥紀錄';
+                        // Refill warning usually doesn't have format variables in current logic, but we can support if user asks. Current logic just appends label.
+                        // Wait, user asked for "可能為補藥警告" to ALSO be a template.
+                        // The user's example: "液位異常上升超過閾值數倍，判斷可能為入藥"
+                        // If they want variables, we should pass them.
+                        // Let's pass diff if applicable? Refill condition: levelChange < 0 (meaning 'added' in current logic? No, check calc mechanism).
+                        // In `detectReadingAnomaly`: levelChange = prevLevel - currentLevel. If negative, implies current > prev (Refill).
+                        // dailyChange is absolute.
 
+                        // Actually, for Refill, the user might just want text.
+                        // But to be consistent, let's allow formatting if they put {diff} etc.
+                        anomalyReason = formatAnomalyMessage(warnText, {
+                            text: '可能為補藥紀錄',
+                            diff: dailyChange.toFixed(0),
+                            limit: dailyThreshold.toFixed(0),
+                            unit: 'L'
+                        });
+                    } else {
+                        const warnText = appSettings?.thresholdWarningText || '液位變化異常，請確認 ({diff} {unit} > {limit} {unit})';
+                        anomalyReason = formatAnomalyMessage(warnText, {
+                            text: '液位變化異常，請確認',
+                            diff: dailyChange.toFixed(0),
+                            limit: dailyThreshold.toFixed(0),
+                            unit: 'L'
+                        });
+                    }
                     return {
                         id: newReading.id,
                         tankId: tank.id,
@@ -1222,73 +1284,68 @@ const DataEntryView: React.FC<{
         return null;
     };
 
-    const handleSubmitReadings = (e: React.FormEvent) => {
+    const handleSubmitReadings = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!selectedTank) return;
 
-        let finalSG = 1.0;
-        if (customSG && parseFloat(customSG) > 0) finalSG = parseFloat(customSG);
-        else if (lastReadingSG) finalSG = lastReadingSG;
-        else if (activeSupply) finalSG = activeSupply.specificGravity;
-
-        // --- Handle Input Unit Conversion ---
-        let finalLevelCm = parseFloat(levelCm);
-        const inputVal = parseFloat(levelCm); // Keep original input for reference if needed
-
-        if (selectedTank.inputUnit === 'PERCENT') {
-            // Interpret "PERCENT" mode as "Meters Input" based on user requirement (e.g., 1.3 meters -> 130 cm)
-            // So we simply multiply by 100.
-            finalLevelCm = inputVal * 100;
-        }
-        // ------------------------------------
-
-        const vol = calculateTankVolume(selectedTank, finalLevelCm);
-        const weight = vol * finalSG;
-
-        const newReading: Reading = {
-            id: Date.now().toString(),
-            tankId: selectedTankId,
-            timestamp: new Date(date).getTime(),
-            levelCm: finalLevelCm,
-            calculatedVolume: vol,
-            calculatedWeightKg: weight,
-            appliedSpecificGravity: finalSG,
-            supplyId: activeSupply?.id,
-            addedAmountLiters: 0,
-            operatorName: operator
-        };
-
-
-
-
-
-        // --- Anomaly Detection ---
-        const tankReadings = readings.filter(r => r.tankId === selectedTankId);
-        const anomaly = detectReadingAnomaly(selectedTank, newReading, tankReadings);
-
-        if (anomaly) {
-            setImportAnomalies([anomaly]);
-            setPendingReadings([newReading]);
-            setAnomalySource('MANUAL');
-            setShowAnomalyModal(true);
-            return; // Stop here, wait for modal confirmation
+        const entries = Object.entries(batchLevels);
+        if (entries.length === 0) {
+            alert('請至少輸入一個液位數值');
+            return;
         }
 
-        const saveAsync = async () => {
-            onLoading(true);
-            try {
+        onLoading(true);
+        try {
+            let savedCount = 0;
+            // Pre-fetch supplies map could be optimizing, but sequentially is safer/easier for now
+            const timestamp = new Date(date).getTime();
+
+            for (const [tId, valStr] of entries) {
+                if (!valStr) continue;
+
+                const tank = tanks.find(t => t.id === tId);
+                if (!tank) continue;
+
+                // Get Active Supply for SG
+                const activeSup = await StorageService.getActiveSupply(tId, timestamp);
+                // Prioritize active supply SG, else 1.0. (Ignoring last reading SG to keep batch logic simple/consistent)
+                const finalSG = activeSup?.specificGravity || 1.0;
+
+                let finalLevelCm = parseFloat(valStr as string);
+
+                // Unit Conversion
+                if (tank.inputUnit === 'PERCENT') {
+                    // Meters Input -> cm
+                    finalLevelCm = finalLevelCm * 100;
+                }
+
+                const vol = calculateTankVolume(tank, finalLevelCm);
+                const weight = vol * finalSG;
+
+                const newReading: Reading = {
+                    id: generateUUID(),
+                    tankId: tId,
+                    timestamp: timestamp,
+                    levelCm: finalLevelCm,
+                    calculatedVolume: vol,
+                    calculatedWeightKg: weight,
+                    appliedSpecificGravity: finalSG,
+                    supplyId: activeSup?.id,
+                    addedAmountLiters: 0, // No refill calc in batch manual
+                    operatorName: operator
+                };
+
                 await onSave(newReading);
-                setLevelCm('');
-                setCustomSG('');
-                alert(`Table A: 液位紀錄已儲存 (輸入: ${levelCm}${selectedTank.inputUnit === 'PERCENT' ? '%' : 'cm'} => 轉換: ${finalLevelCm.toFixed(1)}cm)`);
-            } catch (e) {
-                console.error(e);
-                alert('儲存失敗');
-            } finally {
-                onLoading(false);
+                savedCount++;
             }
-        };
-        saveAsync();
+
+            setBatchLevels({}); // Clear inputs
+            alert(`已成功儲存 ${savedCount} 筆液位紀錄`);
+        } catch (e) {
+            console.error(e);
+            alert('批次儲存部分或全部失敗');
+        } finally {
+            onLoading(false);
+        }
     };
 
     const handleSubmitContract = async (e: React.FormEvent) => {
@@ -1672,7 +1729,36 @@ const DataEntryView: React.FC<{
                                     if (dailyChange > dailyThreshold) {
                                         // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
                                         const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
-                                        anomalyReason = `日均變動 ${dailyChange.toFixed(0)} L (超過閾值 ${dailyThreshold.toFixed(0)} L)`;
+                                        // Use SG from the reading to display Kg
+                                        const sg = newReading.appliedSpecificGravity || 1.0;
+                                        const dailyChangeKg = dailyChange * sg;
+                                        const dailyThresholdKg = dailyThreshold * sg;
+
+                                        console.log('[AnomalyCheck]', {
+                                            tank: tank.name,
+                                            isPossibleRefill,
+                                            settings: appSettings,
+                                            refillText: appSettings?.possibleRefillText,
+                                            warnText: appSettings?.thresholdWarningText
+                                        });
+
+                                        if (isPossibleRefill) {
+                                            const warnText = appSettings?.possibleRefillText || '可能為補藥紀錄';
+                                            anomalyReason = formatAnomalyMessage(warnText, {
+                                                text: '可能為補藥紀錄',
+                                                diff: dailyChangeKg.toFixed(0),
+                                                limit: dailyThresholdKg.toFixed(0),
+                                                unit: 'kg'
+                                            });
+                                        } else {
+                                            const warnText = appSettings?.thresholdWarningText || '液位變化異常，請確認 ({diff} {unit} > {limit} {unit})';
+                                            anomalyReason = formatAnomalyMessage(warnText, {
+                                                text: '液位變化異常，請確認',
+                                                diff: dailyChangeKg.toFixed(0),
+                                                limit: dailyThresholdKg.toFixed(0),
+                                                unit: 'kg'
+                                            });
+                                        }
 
                                         anomalies.push({
                                             id: newReading.id,
@@ -2195,62 +2281,108 @@ const DataEntryView: React.FC<{
                 </button>
             </div>
 
-            <div className={`grid grid-cols-1 gap-8 ${['C', 'D'].includes(activeType) ? 'lg:grid-cols-3' : 'lg:grid-cols-2'}`}>
+            <div className={`grid grid-cols-1 gap-8 ${['A', 'C', 'D'].includes(activeType) ? 'lg:grid-cols-3' : 'lg:grid-cols-2'}`}>
                 <Card
                     title={
-                        activeType === 'A' ? "手動輸入 - 液位紀錄" :
+                        activeType === 'A' ? "手動輸入 - 液位紀錄 (批次)" :
                             activeType === 'B' ? "手動輸入 - 合約資料" :
                                 activeType === 'C' ? "手動輸入 - 冷卻水參數" : "手動輸入 - 鍋爐水參數"
                     }
-                    className={`border-t-4 ${activeType === 'A' ? 'border-t-blue-500' :
+                    className={`border-t-4 ${activeType === 'A' ? 'border-t-blue-500 lg:col-span-2' : // A type takes 2 cols
                         activeType === 'B' ? 'border-t-purple-500' :
-                            activeType === 'C' ? 'border-t-sky-500' : 'border-t-orange-500'
+                            activeType === 'C' ? 'border-t-sky-500 lg:col-span-2' : 'border-t-orange-500 lg:col-span-2'
                         }`}
                 >
                     {activeType === 'A' && (
-                        <form onSubmit={handleSubmitReadings} className="space-y-4">
-                            <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">1. 選擇儲槽</label>
-                                <select value={selectedTankId} onChange={e => setSelectedTankId(e.target.value)} className={inputClassName} required>
-                                    {tanks.map(t => <option key={t.id} value={t.id}>{t.name} ({t.system})</option>)}
-                                </select>
-                            </div>
-                            <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">2. 抄表日期</label>
-                                <input type="date" value={date} onClick={(e) => e.currentTarget.showPicker()} onChange={e => setDate(e.target.value)} className={inputClassName} required />
-                            </div>
-                            <div className="p-3 bg-blue-50 rounded border border-blue-100 text-sm text-blue-900">
-                                <div className="flex justify-between">
-                                    <span>當期合約: {activeSupply?.supplierName || '無'}</span>
-                                    <span className="font-bold">比重: {lastReadingSG || activeSupply?.specificGravity || 1.0}</span>
+                        <form onSubmit={handleSubmitReadings} className="space-y-6">
+                            <div className="flex items-center justify-between bg-blue-50 p-3 rounded-lg border border-blue-100 mb-4">
+                                <div className="flex items-center gap-4">
+                                    <div>
+                                        <label className="block text-sm font-medium text-blue-900">抄表日期</label>
+                                        <input
+                                            type="date"
+                                            value={date}
+                                            onClick={(e) => e.currentTarget.showPicker()}
+                                            onChange={e => setDate(e.target.value)}
+                                            className="mt-1 block w-full rounded-md border-blue-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+                                            required
+                                        />
+                                    </div>
+                                    <div className="text-sm text-blue-700 pt-5">
+                                        <span className="bg-blue-200 px-2 py-1 rounded text-xs mr-2">提示</span>
+                                        若儲槽設定為 <span className="font-bold">PERCENT</span>，單位為「公尺」，系統自動換算 x100 為公分。
+                                    </div>
                                 </div>
                             </div>
-                            <div className="grid grid-cols-2 gap-4">
-                                <div>
-                                    <label className="block text-sm font-medium text-slate-700 mb-1">液位高度 (cm)</label>
-                                    <input type="number" step="0.1" value={levelCm} onChange={e => setLevelCm(e.target.value)} className={inputClassName} placeholder="H" required />
-                                </div>
-                                <div>
-                                    <label className="block text-sm font-medium text-slate-700 mb-1">自訂比重 (選填)</label>
-                                    <input type="number" step="0.001" value={customSG} onChange={e => setCustomSG(e.target.value)} className={inputClassName} placeholder="SG" />
-                                </div>
-                            </div>
-                            <div className="pt-2">
-                                <Button type="submit" className="w-full justify-center">儲存液位紀錄</Button>
+
+                            {/* Grouped Tank Inputs */}
+                            {(() => {
+                                const groups = {
+                                    'CT-1 (一階)': tanks.filter(t => t.system === SystemType.COOLING && (t.name.includes('CT-1') || t.description?.includes('一階'))),
+                                    'CT-2 (二階)': tanks.filter(t => t.system === SystemType.COOLING && (t.name.includes('CT-2') || t.description?.includes('二階') || (!t.name.includes('CT-1') && !t.description?.includes('一階')))),
+                                    '鍋爐藥劑': tanks.filter(t => t.system === SystemType.BOILER),
+                                    '氨水 (脫硝)': tanks.filter(t => t.system === SystemType.DENOX),
+                                    '其他': tanks.filter(t => t.system !== SystemType.COOLING && t.system !== SystemType.BOILER && t.system !== SystemType.DENOX)
+                                };
+
+                                return Object.entries(groups).map(([groupName, groupTanks]) => {
+                                    if (groupTanks.length === 0) return null;
+
+                                    return (
+                                        <div key={groupName} className="border border-slate-200 rounded-lg overflow-hidden">
+                                            <div className="bg-slate-50 px-4 py-2 border-b border-slate-200 font-bold text-slate-700 text-sm">
+                                                {groupName}
+                                            </div>
+                                            <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                {groupTanks.map(tank => {
+                                                    const isMeters = tank.inputUnit === 'PERCENT';
+                                                    const unitLabel = isMeters ? '公尺' : '公分';
+                                                    const placeholder = isMeters ? 'M' : 'cm';
+
+                                                    return (
+                                                        <div key={tank.id} className="flex items-center gap-3">
+                                                            <div className="w-1/3 text-right">
+                                                                <div className="text-sm font-medium text-slate-700 truncate" title={tank.name}>{tank.name}</div>
+                                                                <div className="text-[10px] text-slate-400">{tank.system}</div>
+                                                            </div>
+                                                            <div className="w-2/3 relative">
+                                                                <input
+                                                                    type="number"
+                                                                    step={isMeters ? "0.01" : "0.1"}
+                                                                    placeholder={placeholder}
+                                                                    value={batchLevels[tank.id] || ''}
+                                                                    onChange={(e) => setBatchLevels(prev => ({ ...prev, [tank.id]: e.target.value }))}
+                                                                    className={`${inputClassName} pr-12`}
+                                                                />
+                                                                <div className="absolute right-3 top-2.5 text-xs text-slate-400 font-bold pointer-events-none">
+                                                                    {unitLabel}
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                    );
+                                });
+                            })()}
+
+                            <div className="pt-4 sticky bottom-0 bg-white border-t border-slate-100 p-4 -mx-6 -mb-6 shadow-up z-10">
+                                <Button type="submit" className="w-full justify-center text-lg py-3 shadow-lg">
+                                    <Icons.Save className="w-5 h-5 mr-2" />
+                                    批次儲存所有輸入
+                                </Button>
                             </div>
                         </form>
                     )}
 
-                    {/* 歷史數據列表 - 僅在 Type A 且已選擇儲槽時顯示 */}
-                    {activeType === 'A' && selectedTankId && (() => {
-                        const historyLimit = showMoreHistory ? 60 : 10;
-
+                    {/* 近期歷史紀錄列表 (全域) */}
+                    {activeType === 'A' && (() => {
+                        const historyLimit = 20;
                         const historyReadings = readings
-                            .filter(r => r.tankId === selectedTankId)
                             .sort((a, b) => b.timestamp - a.timestamp)
                             .slice(0, historyLimit);
 
-                        // 定義編輯處理函數
                         const handleHistoryEdit = (item: Reading) => {
                             setEditingItem(item);
                             setEditForm({
@@ -2264,7 +2396,7 @@ const DataEntryView: React.FC<{
                             if (!confirm('確定要刪除此紀錄嗎？')) return;
                             try {
                                 await StorageService.deleteReading(id);
-                                onUpdateTank(); // 觸發刷新
+                                onUpdateTank();
                                 alert('刪除成功');
                             } catch (e) {
                                 console.error(e);
@@ -2276,56 +2408,45 @@ const DataEntryView: React.FC<{
 
                         return (
                             <div className="mt-8 border-t border-slate-200 pt-6">
-                                <div className="flex justify-between items-center mb-4">
-                                    <h4 className="font-bold text-slate-800 flex items-center">
-                                        <Icons.ClipboardPen className="w-4 h-4 mr-2" />
-                                        歷史紀錄 (最近{historyLimit}筆 - 可編輯)
-                                    </h4>
-                                    <button
-                                        onClick={() => setShowMoreHistory(!showMoreHistory)}
-                                        className="text-sm text-brand-600 hover:text-brand-800 underline"
-                                    >
-                                        {showMoreHistory ? '顯示較少' : '顯示更多歷史紀錄'}
-                                    </button>
-                                </div>
+                                <h4 className="font-bold text-slate-800 flex items-center mb-4">
+                                    <Icons.ClipboardPen className="w-4 h-4 mr-2" />
+                                    近期歷史紀錄 (Top {historyLimit})
+                                </h4>
                                 <div className="overflow-x-auto border border-slate-200 rounded-lg max-h-[500px] overflow-y-auto">
                                     <table className="min-w-full divide-y divide-slate-200">
                                         <thead className="bg-slate-50 sticky top-0 z-10 shadow-sm">
                                             <tr>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">日期</th>
-                                                <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">液位 (cm)</th>
+                                                <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">儲槽</th>
+                                                <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">液位</th>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">存量 (L)</th>
                                                 <th className="px-3 py-2 text-right text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">操作</th>
                                             </tr>
                                         </thead>
                                         <tbody className="bg-white divide-y divide-slate-200">
-                                            {historyReadings.map(r => (
-                                                <tr key={r.id} className="hover:bg-slate-50">
-                                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
-                                                        {new Date(r.timestamp).toLocaleDateString()}
-                                                    </td>
-                                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
-                                                        {r.levelCm}
-                                                    </td>
-                                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
-                                                        {Math.round(r.calculatedVolume)}
-                                                    </td>
-                                                    <td className="px-3 py-2 whitespace-nowrap text-right text-sm">
-                                                        <button
-                                                            onClick={() => handleHistoryEdit(r)}
-                                                            className="text-blue-600 hover:text-blue-900 mr-3"
-                                                        >
-                                                            編輯
-                                                        </button>
-                                                        <button
-                                                            onClick={() => handleHistoryDelete(r.id)}
-                                                            className="text-red-600 hover:text-red-900"
-                                                        >
-                                                            刪除
-                                                        </button>
-                                                    </td>
-                                                </tr>
-                                            ))}
+                                            {historyReadings.map(r => {
+                                                const tankName = tanks.find(t => t.id === r.tankId)?.name || r.tankId;
+                                                return (
+                                                    <tr key={r.id} className="hover:bg-slate-50">
+                                                        <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
+                                                            {new Date(r.timestamp).toLocaleDateString()}
+                                                        </td>
+                                                        <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900 font-medium">
+                                                            {tankName}
+                                                        </td>
+                                                        <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
+                                                            {r.levelCm} cm
+                                                        </td>
+                                                        <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
+                                                            {Math.round(r.calculatedVolume)}
+                                                        </td>
+                                                        <td className="px-3 py-2 whitespace-nowrap text-right text-sm">
+                                                            <button onClick={() => handleHistoryEdit(r)} className="text-blue-600 hover:text-blue-900 mr-3">編輯</button>
+                                                            <button onClick={() => handleHistoryDelete(r.id)} className="text-red-600 hover:text-red-900">刪除</button>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
                                         </tbody>
                                     </table>
                                 </div>
@@ -3319,8 +3440,25 @@ const AnalysisView: React.FC<{
         const startTs = getNormalizedTimestamp(extStart);
         const endTs = getNormalizedTimestamp(extEnd) + (24 * 60 * 60 * 1000 - 1);
 
-        const tankReadings = readings
-            .filter(r => r.tankId === selectedTankId && r.timestamp >= startTs && r.timestamp <= endTs)
+        // Get readings within range
+        const readingsInRange = readings
+            .filter(r => r.tankId === selectedTankId && r.timestamp >= startTs && r.timestamp <= endTs);
+
+        // Find ONE reading just before startTs
+        const prevReading = readings
+            .filter(r => r.tankId === selectedTankId && r.timestamp < startTs)
+            .sort((a, b) => b.timestamp - a.timestamp)[0]; // Latest one before startTs
+
+        // Find ONE reading just after endTs to allow calculating the last interval crossing the end date
+        // This fixes the issue where usage for the end of the month is missing if the interval extends beyond endTs
+        const nextReading = readings
+            .filter(r => r.tankId === selectedTankId && r.timestamp > endTs)
+            .sort((a, b) => a.timestamp - b.timestamp)[0]; // Earliest one after endTs
+
+        const tankReadings = [prevReading, ...readingsInRange, nextReading]
+            .filter(Boolean)
+            // Deduplicate (in case range overlaps perfectly with prev/next finding logic, though filter >/< should prevent this)
+            .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
             .sort((a, b) => a.timestamp - b.timestamp);
 
         if (tankReadings.length < 1) return [];
@@ -3356,7 +3494,11 @@ const AnalysisView: React.FC<{
 
             let iterDate = new Date(curr.timestamp);
             while (iterDate < new Date(next.timestamp)) {
-                const dateKey = iterDate.toISOString().split('T')[0];
+                // 使用 Local Time 建構日期 Key，與 AnnualDataView 一致，避免時區錯位
+                const Y = iterDate.getFullYear();
+                const M = String(iterDate.getMonth() + 1).padStart(2, '0');
+                const D = String(iterDate.getDate()).padStart(2, '0');
+                const dateKey = `${Y}-${M}-${D}`;
                 if (!dailyMap.has(dateKey)) {
                     let finalValue = dailyUsage;
 
@@ -3445,6 +3587,10 @@ const AnalysisView: React.FC<{
             priceSet: Set<number>
         }>();
 
+        // Initialize Monthly Map with ALL months in range (or at least cover the days found)
+        // Better: Iterate through the time range day by day to build a complete picture
+        // BUT, simplified: Iterate through filteredDaily to get months, THEN fill missing days for theoretical.
+
         filteredDaily.forEach(day => {
             const mKey = `${day.date.getFullYear()}-${String(day.date.getMonth() + 1).padStart(2, '0')}`;
             if (!monthlyMap.has(mKey)) {
@@ -3456,75 +3602,124 @@ const AnalysisView: React.FC<{
                     days: 0,
                     sgSet: new Set(),
                     priceSet: new Set()
-                });
+                }); // Will calculate theoretical for the WHOLE month later
             }
             const m = monthlyMap.get(mKey)!;
             m.actual += day.usage;
             m.days++;
 
-            // --- Daily Theoretical Calculation ---
-            let dailyTheoretical = 0;
+            // Track SG/Price used
             const dayTime = day.date.getTime();
-
-            // 1. Find effective Supply
             const activeSupply = suppliesHistory.find(s => s.startDate <= dayTime);
-            const targetPpm = activeSupply?.targetPpm || 0;
-            const price = activeSupply?.price || 0; // Get price for cost calc
+            const price = activeSupply?.price || 0;
             const sg = activeSupply?.specificGravity;
 
-            // 追蹤該月用到的比重與單價 (使用固定精度避免浮點數比對問題)
             if (sg !== undefined) m.sgSet.add(Math.round(sg * 10000) / 10000);
             if (price) m.priceSet.add(Math.round(price * 100) / 100);
+        });
 
-            const calcMethod = selectedTank.calculationMethod || 'NONE';
+        // Loop through each month to calculate FULL Monthly Theoretical Usage
+        // This ensures even if we only have data for 1/5-1/31, we calculate theoretical for 1/1-1/31
+        monthlyMap.forEach(m => {
+            const year = m.date.getFullYear();
+            const month = m.date.getMonth(); // 0-indexed
+            const daysInMonth = new Date(year, month + 1, 0).getDate();
+            const today = new Date();
+            today.setHours(23, 59, 59, 999);
+            const todayTime = today.getTime();
 
-            if (calcMethod === 'CWS_BLOWDOWN') {
-                // Find parameters that COVER this day (Week Logic: Monday to Sunday)
-                // Assuming cwsParamsHistory stores date as Monday of the week
-                // We need to find a record where: record.date (Monday) <= dayTime < record.date + 7 days
-                const cwsParam = cwsParamsHistory.find(p => {
-                    const pDate = p.date || 0;
-                    const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
-                    return dayTime >= pDate && dayTime < pEnd;
-                }) || selectedTank.cwsParams;
+            let monthTheory = 0;
 
-                if (cwsParam) {
-                    const { circulationRate, tempDiff, cwsHardness, makeupHardness, concentrationCycles } = cwsParam;
-                    const R = circulationRate || 0;
-                    const dT = tempDiff || 0;
-                    let C = 1;
-                    if (cwsHardness && makeupHardness && makeupHardness > 0) {
-                        C = cwsHardness / makeupHardness;
-                    } else if (concentrationCycles && concentrationCycles > 1) {
-                        C = concentrationCycles;
+            for (let d = 1; d <= daysInMonth; d++) {
+                const dayDate = new Date(year, month, d);
+                const dayTime = dayDate.getTime();
+
+                // Skip future dates
+                if (dayTime > todayTime) continue;
+
+                // 1. Find effective Supply for this specific day
+                const activeSupply = suppliesHistory.find(s => s.startDate <= dayTime);
+                const targetPpm = activeSupply?.targetPpm || 0;
+                const price = activeSupply?.price || 0;
+
+                if (!targetPpm) continue;
+
+                let dailyTheoretical = 0;
+                const calcMethod = selectedTank.calculationMethod || 'NONE';
+
+                if (calcMethod === 'CWS_BLOWDOWN') {
+                    // Find parameters that COVER this day
+                    const cwsParam = cwsParamsHistory.find(p => {
+                        const pDate = p.date || 0;
+                        const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                        return dayTime >= pDate && dayTime < pEnd;
+                    }) || selectedTank.cwsParams; // Fallback only if tank.cwsParams exists (legacy), but ideally restrict like AnnualDataView
+
+                    // Strict sync with AnnualDataView: AnnualDataView logic does NOT use fallback if logic was updated to match implementation plan
+                    // The implementation plan for AnnualDataView removed fallback. 
+                    // Let's check if we should be strict here too.
+                    // The recent change to AnnualDataView REMOVED the fallback to tank.cwsParams if looking for weekly data fails to find one?
+                    // Actually, AnnualDataView implementation: 
+                    // const cwsParam = tankCwsHistory.find(...) || tank.cwsParams;
+                    // It STILL has fallback in the code I inserted? 
+                    // Wait, looking at Step 134 diff:
+                    // const cwsParam = tankCwsHistory.find(...) || tank.cwsParams; <-- REMOVED fallback? No, the diff showed:
+                    // - }) || tank.cwsParams;
+                    // + });
+                    // So YES, AnnualDataView REMOVED fallback. We should do the same here for consistency.
+
+                    // Re-finding strictly without fallback to match AnnualDataView's latest logic
+                    const strictCwsParam = cwsParamsHistory.find(p => {
+                        const pDate = p.date || 0;
+                        const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                        return dayTime >= pDate && dayTime < pEnd;
+                    });
+
+                    if (strictCwsParam) {
+                        const { circulationRate, tempDiff, cwsHardness, makeupHardness, concentrationCycles } = strictCwsParam;
+                        const R = circulationRate || 0;
+                        const dT = tempDiff || 0;
+                        let C = 1;
+                        if (cwsHardness && makeupHardness && makeupHardness > 0) {
+                            C = cwsHardness / makeupHardness;
+                        } else if (concentrationCycles && concentrationCycles > 1) {
+                            C = concentrationCycles;
+                        }
+                        const E = (R * dT * 1.8 * 24) / 1000;
+                        const B = C > 1 ? E / (C - 1) : 0;
+                        dailyTheoretical = (B * targetPpm) / 1000;
                     }
-                    const E = (R * dT * 1.8 * 24) / 1000;
-                    const B = C > 1 ? E / (C - 1) : 0;
-                    dailyTheoretical = (B * targetPpm) / 1000;
-                }
-            } else if (calcMethod === 'BWS_STEAM') {
-                // Find parameters that COVER this day (Week Logic)
-                const bwsParam = bwsParamsHistory.find(p => {
-                    const pDate = p.date || 0;
-                    const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
-                    return dayTime >= pDate && dayTime < pEnd;
-                }) || selectedTank.bwsParams;
 
-                if (bwsParam && bwsParam.steamProduction) {
-                    const weeklySteam = bwsParam.steamProduction;
-                    const dailySteam = weeklySteam / 7;
-                    // targetPpm Migrated to Chemical Contract (already found as targetPpm variables above line 2266)
-                    const effectivePpm = targetPpm || 0;
-                    dailyTheoretical = (dailySteam * effectivePpm) / 1000;
+                } else if (calcMethod === 'BWS_STEAM') {
+                    const bwsParam = bwsParamsHistory.find(p => {
+                        const pDate = p.date || 0;
+                        const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                        return dayTime >= pDate && dayTime < pEnd;
+                    }) || selectedTank.bwsParams; // AnnualDataView removed fallback here too? Yes.
+
+                    // Strict find
+                    const strictBwsParam = bwsParamsHistory.find(p => {
+                        const pDate = p.date || 0;
+                        const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                        return dayTime >= pDate && dayTime < pEnd;
+                    });
+
+                    if (strictBwsParam && strictBwsParam.steamProduction) {
+                        const weeklySteam = strictBwsParam.steamProduction;
+                        const dailySteam = weeklySteam / 7;
+                        dailyTheoretical = (dailySteam * targetPpm) / 1000;
+                    }
                 }
+
+                // Convert to Cost if needed
+                if (metric === '$') {
+                    dailyTheoretical = dailyTheoretical * price;
+                }
+
+                monthTheory += dailyTheoretical;
             }
 
-            // Convert Theoretical KG to Cost if metric is '$'
-            if (metric === '$') {
-                dailyTheoretical = dailyTheoretical * price;
-            }
-
-            m.theoretical += dailyTheoretical;
+            m.theoretical = monthTheory;
         });
 
         return Array.from(monthlyMap.values()).map(m => {
@@ -3989,60 +4184,121 @@ const AnalysisView: React.FC<{
 
     if (!selectedTank) return <div>請先設定儲槽</div>;
 
+    // Sort tanks by region: CT-1, CT-2, Boiler, Ammonia, Others
+    const sortedTanks = useMemo(() => {
+        const regionOrder: Record<string, number> = {
+            'CT-1': 1,
+            'CT-2': 2,
+            '鍋爐': 3,
+            '氨水': 4
+        };
+        return [...tanks].sort((a, b) => {
+            const getRegionOrder = (name: string) => {
+                if (name.startsWith('CT-1')) return 1;
+                if (name.startsWith('CT-2')) return 2;
+                if (name.includes('鍋爐') || name.includes('中和胺') || name.includes('清罐劑') || name.includes('脫氧劑')) return 3;
+                if (name.includes('氨水')) return 4;
+                return 5;
+            };
+            return getRegionOrder(a.name) - getRegionOrder(b.name);
+        });
+    }, [tanks]);
+
+    // Group tanks for optgroup display
+    const tankGroups = useMemo(() => {
+        const groups: Record<string, typeof tanks> = {
+            'CT-1 冷卻水': [],
+            'CT-2 冷卻水': [],
+            '鍋爐藥劑': [],
+            '脫硝系統': [],
+            '其他': []
+        };
+        sortedTanks.forEach(t => {
+            if (t.name.startsWith('CT-1')) groups['CT-1 冷卻水'].push(t);
+            else if (t.name.startsWith('CT-2')) groups['CT-2 冷卻水'].push(t);
+            else if (t.name.includes('中和胺') || t.name.includes('清罐劑') || t.name.includes('脫氧劑')) groups['鍋爐藥劑'].push(t);
+            else if (t.name.includes('氨水')) groups['脫硝系統'].push(t);
+            else groups['其他'].push(t);
+        });
+        return groups;
+    }, [sortedTanks]);
+
     return (
         <div className="space-y-6">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-                <div className="w-full sm:w-auto flex gap-4">
-                    <select
-                        value={selectedTankId}
-                        onChange={e => setSelectedTankId(e.target.value)}
-                        className={`${inputClassName} w-48`}
-                    >
-                        {tanks.map(t => (
-                            <option key={t.id} value={t.id}>{t.name}</option>
-                        ))}
-                    </select>
-
+            {/* Compact Filter Bar */}
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
+                <div className="flex flex-wrap items-center gap-4">
+                    {/* Tank Selector - Compact */}
                     <div className="flex items-center gap-2">
+                        <span className="text-sm text-slate-500">藥劑</span>
+                        <select
+                            value={selectedTankId}
+                            onChange={e => setSelectedTankId(e.target.value)}
+                            className={`${inputClassName} w-44 text-sm`}
+                        >
+                            {Object.entries(tankGroups).map(([group, groupTanks]) => (
+                                (groupTanks as any[]).length > 0 && (
+                                    <optgroup key={group} label={group}>
+                                        {(groupTanks as any[]).map(t => (
+                                            <option key={t.id} value={t.id}>{t.name.split(' ').pop()}</option>
+                                        ))}
+                                    </optgroup>
+                                )
+                            ))}
+                        </select>
+                    </div>
+
+                    <span className="text-slate-200">|</span>
+
+                    {/* Month Picker */}
+                    <div className="flex items-center gap-2">
+                        <span className="text-sm text-slate-500">月份</span>
                         <input
                             type="month"
                             value={selectedMonth}
                             onChange={handleMonthChange}
-                            className={`${inputClassName} w-40`}
+                            className={`${inputClassName} w-36 text-sm`}
                             onClick={(e) => e.currentTarget.showPicker()}
                         />
-                        <span className="text-slate-300">|</span>
+                    </div>
+
+                    <span className="text-slate-200">|</span>
+
+                    {/* Custom Date Range */}
+                    <div className="flex items-center gap-2">
+                        <span className="text-sm text-slate-500">範圍</span>
                         <input
                             type="date"
                             value={tempDateRange.start}
                             onClick={(e) => e.currentTarget.showPicker()}
                             onChange={e => setTempDateRange(prev => ({ ...prev, start: e.target.value }))}
-                            className={inputClassName}
+                            className={`${inputClassName} w-32 text-sm`}
                         />
-                        <span className="text-slate-500">至</span>
+                        <span className="text-slate-400">~</span>
                         <input
                             type="date"
                             value={tempDateRange.end}
                             onClick={(e) => e.currentTarget.showPicker()}
                             onChange={e => setTempDateRange(prev => ({ ...prev, end: e.target.value }))}
-                            className={inputClassName}
+                            className={`${inputClassName} w-32 text-sm`}
                         />
                         <Button
                             onClick={() => {
                                 setAppliedDateRange(tempDateRange);
-                                setSelectedMonth(''); // Clear month selection if custom range applied
+                                setSelectedMonth('');
                             }}
-                            className="bg-brand-600 hover:bg-brand-700 text-white ml-2"
+                            className="bg-brand-600 hover:bg-brand-700 text-white text-sm px-3 py-1.5"
                         >
-                            查 用
+                            套用
                         </Button>
                     </div>
-                </div>
-                <div className="flex gap-2">
-                    <div className="bg-white border rounded-lg p-1 flex">
-                        <button onClick={() => setMetric('KG')} className={`px-3 py-1 rounded text-sm ${metric === 'KG' ? 'bg-brand-500 text-white' : 'text-slate-600'}`}>KG</button>
-                        <button onClick={() => setMetric('L')} className={`px-3 py-1 rounded text-sm ${metric === 'L' ? 'bg-brand-500 text-white' : 'text-slate-600'}`}>L</button>
-                        <button onClick={() => setMetric('$')} className={`px-3 py-1 rounded text-sm ${metric === '$' ? 'bg-brand-500 text-white' : 'text-slate-600'}`}>$</button>
+
+                    <div className="ml-auto flex gap-1">
+                        <div className="bg-slate-100 border rounded-lg p-0.5 flex">
+                            <button onClick={() => setMetric('KG')} className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${metric === 'KG' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'}`}>KG</button>
+                            <button onClick={() => setMetric('L')} className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${metric === 'L' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'}`}>L</button>
+                            <button onClick={() => setMetric('$')} className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${metric === '$' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'}`}>$</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -4295,7 +4551,7 @@ const AnalysisView: React.FC<{
     );
 };
 
-const ImportantNotesView: React.FC = () => {
+const ImportantNotesView: React.FC<{ thresholdWarningText?: string }> = ({ thresholdWarningText }) => {
     const [notes, setNotes] = useState<ImportantNote[]>([]);
     const [loading, setLoading] = useState(false);
     const [isEditOpen, setIsEditOpen] = useState(false);
@@ -4345,7 +4601,6 @@ const ImportantNotesView: React.FC = () => {
             alert('刪除失敗');
         }
     };
-
     const handleSave = async (e: React.FormEvent) => {
         e.preventDefault();
         try {
@@ -4411,127 +4666,226 @@ const ImportantNotesView: React.FC = () => {
         XLSX.writeFile(wb, `ImportantNotes_${formatDateForInput(new Date())}.xlsx`);
     };
 
+
+
+    // --- Tab Logic ---
+    const [activeTab, setActiveTab] = useState<'notes' | 'alerts'>('notes');
+    const [alerts, setAlerts] = useState<FluctuationAlert[]>([]);
+
+    // Pagination State
+    const [currentPage, setCurrentPage] = useState(1);
+    const [itemsPerPage, setItemsPerPage] = useState(10);
+
+    const loadAlerts = async () => {
+        setLoading(true);
+        try {
+            const data = await StorageService.getAlerts();
+            setAlerts(data);
+        } catch (error) {
+            console.error(error);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        if (activeTab === 'alerts') {
+            loadAlerts();
+        } else {
+            loadNotes();
+        }
+    }, [activeTab]);
+
+    const handleAddNoteFromAlert = async (alertItem: FluctuationAlert, noteContent: string) => {
+        try {
+            await StorageService.updateAlertNote(alertItem.id, noteContent);
+            const newNote: Partial<ImportantNote> = {
+                dateStr: alertItem.dateStr,
+                area: alertItem.tankName,
+                chemicalName: '異常警報',
+                note: noteContent
+            };
+            await StorageService.saveNote(newNote as ImportantNote);
+            loadAlerts();
+            alert('已加入重要紀事');
+        } catch (e) {
+            console.error(e);
+            alert('操作失敗');
+        }
+    };
+
     return (
-        <div className="space-y-6">
-            <div className="flex justify-between items-center">
-                <h2 className="text-2xl font-bold text-slate-800">重要紀事</h2>
-                <div className="flex space-x-2">
-                    <div className="relative">
-                        <input
-                            type="file"
-                            accept=".xlsx, .xls"
-                            onChange={handleImport}
-                            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                        />
-                        <Button variant="secondary" className="flex items-center gap-2">
-                            <Icons.Import className="w-4 h-4" /> 匯入 Excel
-                        </Button>
+        <div className="h-full flex flex-col bg-slate-50">
+            {/* Header with Tabs */}
+            <div className="bg-white border-b border-slate-200 px-6 pt-4 flex-shrink-0">
+                <div className="flex justify-between items-center mb-4">
+                    <div className="flex items-center gap-3">
+                        <div className="p-2 bg-slate-100 rounded-lg text-slate-600">
+                            <Icons.Notes className="w-6 h-6" />
+                        </div>
+                        <h2 className="text-xl font-bold text-slate-800">
+                            {activeTab === 'notes' ? '重要紀事' : '液位變動警報'}
+                        </h2>
                     </div>
-                    <Button variant="secondary" onClick={handleExport} className="flex items-center gap-2">
-                        <Icons.Download className="w-4 h-4" /> 匯出 Excel
-                    </Button>
-                    <Button onClick={() => { setEditingNote(null); setFormData({ dateStr: formatDateForInput(new Date()), area: '', chemicalName: '', note: '' }); setIsEditOpen(true); }} className="flex items-center gap-2">
-                        <Icons.Plus className="w-4 h-4" /> 新增紀事
-                    </Button>
+                </div>
+
+                <div className="flex gap-6 -mb-px">
+                    <button
+                        onClick={() => setActiveTab('notes')}
+                        className={`pb-3 px-1 text-sm font-medium border-b-2 transition-colors ${activeTab === 'notes' ? 'border-brand-500 text-brand-600' : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'}`}
+                    >
+                        重要紀事
+                    </button>
+                    <button
+                        onClick={() => setActiveTab('alerts')}
+                        className={`pb-3 px-1 text-sm font-medium border-b-2 transition-colors ${activeTab === 'alerts' ? 'border-brand-500 text-brand-600' : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'}`}
+                    >
+                        液位變動警報
+                    </button>
                 </div>
             </div>
 
-            <Card>
-                <div className="overflow-x-auto">
-                    <table className="w-full text-sm text-left text-slate-600">
-                        <thead className="text-xs text-slate-700 uppercase bg-slate-50 border-b">
-                            <tr>
-                                <th className="px-6 py-3">日期</th>
-                                <th className="px-6 py-3">區域</th>
-                                <th className="px-6 py-3">藥品名稱</th>
-                                <th className="px-6 py-3">重要紀事</th>
-                                <th className="px-6 py-3 w-24">操作</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {notes.map(note => (
-                                <tr key={note.id} className="bg-white border-b hover:bg-slate-50">
-                                    <td className="px-6 py-4 font-medium text-slate-900 whitespace-nowrap">{note.dateStr}</td>
-                                    <td className="px-6 py-4">{note.area}</td>
-                                    <td className="px-6 py-4">{note.chemicalName}</td>
-                                    <td className="px-6 py-4 max-w-md truncate" title={note.note}>{note.note}</td>
-                                    <td className="px-6 py-4">
-                                        <div className="flex items-center space-x-2">
-                                            <button onClick={() => handleEdit(note)} className="text-blue-600 hover:text-blue-800 p-1 rounded-full hover:bg-blue-50 transition-colors" title="編輯">
-                                                <Icons.FilePenLine className="w-4 h-4" />
-                                            </button>
-                                            <button onClick={() => handleDelete(note.id)} className="text-red-600 hover:text-red-800 p-1 rounded-full hover:bg-red-50 transition-colors" title="刪除">
-                                                <Icons.Trash2 className="w-4 h-4" />
-                                            </button>
-                                        </div>
-                                    </td>
-                                </tr>
-                            ))}
-                            {notes.length === 0 && (
-                                <tr>
-                                    <td colSpan={5} className="px-6 py-8 text-center text-slate-400 italic">尚無資料</td>
-                                </tr>
-                            )}
-                        </tbody>
-                    </table>
-                </div>
-            </Card>
-
-            {isEditOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-                    <div className="bg-white rounded-lg shadow-xl w-full max-w-md animate-in fade-in zoom-in duration-200">
-                        <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center">
-                            <h3 className="text-lg font-semibold text-slate-900">{editingNote ? '編輯紀事' : '新增紀事'}</h3>
-                            <button onClick={() => setIsEditOpen(false)} className="text-slate-400 hover:text-slate-600 p-1 rounded-full hover:bg-slate-100 transition-colors">
-                                <Icons.X className="w-5 h-5" />
-                            </button>
+            <div className="p-6">
+                {activeTab === 'notes' ? (
+                    <Card className="flex flex-col">
+                        <div className="flex justify-between items-center mb-4">
+                            <div className="flex space-x-2">
+                                <div className="relative">
+                                    <input
+                                        type="file"
+                                        accept=".xlsx, .xls"
+                                        onChange={handleImport}
+                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                                    />
+                                    <Button variant="secondary" className="flex items-center gap-2">
+                                        <Icons.Import className="w-4 h-4" /> 匯入 Excel
+                                    </Button>
+                                </div>
+                                <Button variant="secondary" onClick={handleExport} className="flex items-center gap-2">
+                                    <Icons.Download className="w-4 h-4" /> 匯出 Excel
+                                </Button>
+                            </div>
+                            <Button onClick={() => { setEditingNote(null); setFormData({ dateStr: formatDateForInput(new Date()), area: '', chemicalName: '', note: '' }); setIsEditOpen(true); }} className="flex items-center gap-2">
+                                <Icons.Plus className="w-4 h-4" /> 新增紀事
+                            </Button>
                         </div>
-                        <form onSubmit={handleSave} className="p-6 space-y-4">
+
+                        <div className="-mx-6 overflow-x-auto">
+                            <table className="min-w-full divide-y divide-slate-200">
+                                <thead className="bg-slate-50">
+                                    <tr>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">日期</th>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">區域/儲槽</th>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">藥劑名稱</th>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">紀事內容</th>
+                                        <th className="px-6 py-3 text-right text-xs font-medium text-slate-500 uppercase tracking-wider">操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="bg-white divide-y divide-slate-200">
+                                    {loading ? (
+                                        <tr><td colSpan={5} className="text-center py-8 text-slate-500">載入中...</td></tr>
+                                    ) : notes.length === 0 ? (
+                                        <tr><td colSpan={5} className="text-center py-8 text-slate-500">尚無資料</td></tr>
+                                    ) : (
+                                        notes
+                                            .slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage)
+                                            .map(note => ( // Pagination Slice
+                                                <tr key={note.id} className="hover:bg-slate-50">
+                                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-900 font-medium">{note.dateStr}</td>
+                                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-600">{note.area}</td>
+                                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-600">{note.chemicalName}</td>
+                                                    <td className="px-6 py-4 text-sm text-slate-600 max-w-md break-words">{note.note}</td>
+                                                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                                        <button onClick={() => handleEdit(note)} className="text-brand-600 hover:text-brand-900 mr-3">編輯</button>
+                                                        <button onClick={() => handleDelete(note.id)} className="text-red-600 hover:text-red-900">刪除</button>
+                                                    </td>
+                                                </tr>
+                                            ))
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+
+                        {/* Pagination Controls */}
+                        {!loading && notes.length > 0 && (
+                            <div className="flex items-center justify-between border-t border-slate-200 px-6 py-3">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-sm text-slate-500">
+                                        顯示 {((currentPage - 1) * itemsPerPage) + 1} 至 {Math.min(currentPage * itemsPerPage, notes.length)} 筆，共 {notes.length} 筆
+                                    </span>
+                                    <select
+                                        value={itemsPerPage}
+                                        onChange={e => {
+                                            setItemsPerPage(Number(e.target.value));
+                                            setCurrentPage(1); // Reset to first page
+                                        }}
+                                        className="ml-2 text-sm border-slate-300 rounded-md shadow-sm focus:border-brand-500 focus:ring-brand-500"
+                                    >
+                                        <option value={10}>10 筆/頁</option>
+                                        <option value={20}>20 筆/頁</option>
+                                        <option value={50}>50 筆/頁</option>
+                                    </select>
+                                </div>
+                                <div className="flex gap-2">
+                                    <Button
+                                        variant="secondary"
+                                        onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                                        disabled={currentPage === 1}
+                                        className="px-3 py-1 text-sm"
+                                    >
+                                        上一頁
+                                    </Button>
+                                    <span className="flex items-center text-sm font-medium text-slate-700">
+                                        第 {currentPage} 頁 / 共 {Math.ceil(notes.length / itemsPerPage)} 頁
+                                    </span>
+                                    <Button
+                                        variant="secondary"
+                                        onClick={() => setCurrentPage(p => Math.min(Math.ceil(notes.length / itemsPerPage), p + 1))}
+                                        disabled={currentPage >= Math.ceil(notes.length / itemsPerPage)}
+                                        className="px-3 py-1 text-sm"
+                                    >
+                                        下一頁
+                                    </Button>
+                                </div>
+                            </div>
+                        )}
+                    </Card>
+                ) : (
+                    <Card className="flex flex-col p-0">
+                        {loading ? (
+                            <div className="flex-1 flex items-center justify-center text-slate-500">載入中...</div>
+                        ) : (
+                            <FluctuationAlertsView alerts={alerts} onAddNote={handleAddNoteFromAlert} onDelete={loadAlerts} thresholdWarningText={thresholdWarningText} />
+                        )}
+                    </Card>
+                )}
+            </div>
+
+            {/* Edit Modal (Only for Notes) */}
+            {isEditOpen && (activeTab === 'notes') && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+                    <div className="bg-white rounded-lg p-6 w-full max-w-md">
+                        <h3 className="text-lg font-bold mb-4">{editingNote ? '編輯重要紀事' : '新增重要紀事'}</h3>
+                        <form onSubmit={handleSave} className="space-y-4">
                             <div>
                                 <label className="block text-sm font-medium text-slate-700 mb-1">日期</label>
-                                <input
-                                    type="date"
-                                    value={formData.dateStr}
-                                    onChange={e => setFormData({ ...formData, dateStr: e.target.value })}
-                                    className={inputClassName}
-                                    required
-                                />
+                                <input type="date" value={formData.dateStr} onChange={e => setFormData({ ...formData, dateStr: e.target.value })} className={inputClassName} required />
                             </div>
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">區域</label>
-                                <input
-                                    type="text"
-                                    value={formData.area}
-                                    onChange={e => setFormData({ ...formData, area: e.target.value })}
-                                    className={inputClassName}
-                                    required
-                                    placeholder="例如: CT-1, BLR"
-                                />
+                                <label className="block text-sm font-medium text-slate-700 mb-1">區域/儲槽</label>
+                                <input type="text" value={formData.area} onChange={e => setFormData({ ...formData, area: e.target.value })} className={inputClassName} required />
                             </div>
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">藥品名稱</label>
-                                <input
-                                    type="text"
-                                    value={formData.chemicalName}
-                                    onChange={e => setFormData({ ...formData, chemicalName: e.target.value })}
-                                    className={inputClassName}
-                                    required
-                                    placeholder="例如: 硫酸, 氨水"
-                                />
+                                <label className="block text-sm font-medium text-slate-700 mb-1">藥劑名稱</label>
+                                <input type="text" value={formData.chemicalName} onChange={e => setFormData({ ...formData, chemicalName: e.target.value })} className={inputClassName} required />
                             </div>
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">重要紀事</label>
-                                <textarea
-                                    value={formData.note}
-                                    onChange={e => setFormData({ ...formData, note: e.target.value })}
-                                    className={`${inputClassName} min-h-[100px] resize-none`}
-                                    required
-                                    placeholder="輸入說明..."
-                                />
+                                <label className="block text-sm font-medium text-slate-700 mb-1">紀事內容</label>
+                                <textarea value={formData.note} onChange={e => setFormData({ ...formData, note: e.target.value })} className={inputClassName} rows={3} required />
                             </div>
-                            <div className="pt-4 flex space-x-3">
-                                <Button type="button" variant="secondary" onClick={() => setIsEditOpen(false)} className="flex-1 justify-center">取消</Button>
-                                <Button type="submit" className="flex-1 justify-center">儲存</Button>
+                            <div className="flex justify-end gap-2 pt-2">
+                                <Button type="button" variant="ghost" onClick={() => { setIsEditOpen(false); setEditingNote(null); }}>取消</Button>
+                                <Button type="submit">儲存</Button>
                             </div>
                         </form>
                     </div>
@@ -4958,8 +5312,26 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                                 <input type="number" value={editingTank.capacityLiters} onChange={e => updateTankField('capacityLiters', Number(e.target.value))} className={inputClassName} />
                             </div>
                             <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">安全低液位警戒 (%)</label>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">
+                                    安全低液位警戒 ({editingTank.inputUnit === 'PERCENT' ? '公尺' : '公分'})
+                                </label>
                                 <input type="number" value={editingTank.safeMinLevel} onChange={e => updateTankField('safeMinLevel', Number(e.target.value))} className={inputClassName} />
+                                <p className="text-xs text-slate-500 mt-1">
+                                    {(() => {
+                                        const levelCm = editingTank.inputUnit === 'PERCENT'
+                                            ? editingTank.safeMinLevel * 100
+                                            : editingTank.safeMinLevel;
+                                        const volumeL = calculateTankVolume(editingTank, levelCm);
+                                        const sg = currentSG?.sg || 1.0;
+                                        const weightKg = volumeL * sg;
+                                        return `${editingTank.safeMinLevel}${editingTank.inputUnit === 'PERCENT' ? '公尺' : '公分'} ≈ ${volumeL.toLocaleString(undefined, { maximumFractionDigits: 0 })} L ≈ ${weightKg.toLocaleString(undefined, { maximumFractionDigits: 0 })} kg`;
+                                    })()}
+                                    {currentSG ? (
+                                        <span className="text-brand-600"> (以{currentSG.chemicalName}比重 {currentSG.sg} 計)</span>
+                                    ) : (
+                                        <span className="text-amber-600"> (尚無藥劑資料，以比重 1.0 計)</span>
+                                    )}
+                                </p>
                             </div>
                             <div>
                                 <label className="block text-sm font-medium text-slate-700 mb-1">
@@ -5071,44 +5443,6 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                         </select>
                     </div>
 
-                    {/* Param Forms */}
-                    {editingTank.calculationMethod === 'CWS_BLOWDOWN' && (
-                        <div className="bg-sky-50 p-4 rounded-lg border border-sky-100 space-y-4">
-                            <h4 className="font-bold text-sky-900 flex items-center gap-2">
-                                <Icons.Cooling className="w-4 h-4" /> 冷卻水理論參數設定
-                            </h4>
-                            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-                                <div>
-                                    <label className="block text-xs font-medium text-sky-700 mb-1">循環水量 R (m³/hr)</label>
-                                    <input type="number" value={editingTank.cwsParams?.circulationRate || 0} onChange={e => updateCWSParam('circulationRate', Number(e.target.value))} className={inputClassName} />
-                                </div>
-                                <div>
-                                    <label className="block text-xs font-medium text-sky-700 mb-1">溫差 ΔT (°C)</label>
-                                    <input type="number" step="0.1" value={editingTank.cwsParams?.tempDiff || 0} onChange={e => updateCWSParam('tempDiff', Number(e.target.value))} className={inputClassName} />
-                                </div>
-                                <div>
-                                    <label className="block text-xs font-medium text-sky-700 mb-1">濃縮倍數 N</label>
-                                    <input type="number" step="0.1" value={editingTank.cwsParams?.concentrationCycles || 0} onChange={e => updateCWSParam('concentrationCycles', Number(e.target.value))} className={inputClassName} />
-                                </div>
-                            </div>
-                        </div>
-                    )}
-
-                    {editingTank.calculationMethod === 'BWS_STEAM' && (
-                        <div className="bg-orange-50 p-4 rounded-lg border border-orange-100 space-y-4">
-                            <h4 className="font-bold text-orange-900 flex items-center gap-2">
-                                <Icons.Boiler className="w-4 h-4" /> 鍋爐水理論參數設定
-                            </h4>
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                                <div>
-                                    <label className="block text-xs font-medium text-orange-700 mb-1">每週蒸汽總產量 (Tons/Week)</label>
-                                    <input type="number" value={editingTank.bwsParams?.steamProduction || 0} onChange={e => updateBWSParam('steamProduction', Number(e.target.value))} className={inputClassName} />
-                                </div>
-
-                            </div>
-                        </div>
-                    )}
-
                     <div className="flex justify-end gap-3 pt-4">
                         <Button type="button" variant="ghost" onClick={() => setEditingTank(null)}>取消</Button>
                         <Button type="submit">儲存變更</Button>
@@ -5145,7 +5479,7 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                     </div>
                     <div className="flex justify-between border-b border-slate-50 pb-1">
                         <span className="text-slate-400">液位警戒</span>
-                        <span className="font-mono font-medium">{tank.safeMinLevel}%</span>
+                        <span className="font-mono font-medium">{tank.safeMinLevel} {tank.inputUnit === 'PERCENT' ? '公尺' : 'cm'}</span>
                     </div>
                     {tank.calculationMethod && tank.calculationMethod !== 'NONE' && (
                         <div className="pt-1">
@@ -5306,13 +5640,143 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
     )
 }
 
-type ViewType = 'dashboard' | 'entry' | 'analysis' | 'settings' | 'notes' | 'annual' | 'pi-test' | 'import';
+// === PARAMS SETTINGS VIEW ===
+const ParamsSettingsView: React.FC<{
+    appSettings: {
+        usageCalcWeeks: number;
+        lowLevelWarningText: string;
+        thresholdWarningText: string;
+        possibleRefillText: string;
+    };
+    setAppSettings: React.Dispatch<React.SetStateAction<any>>;
+}> = ({ appSettings, setAppSettings }) => {
+    const [localSettings, setLocalSettings] = useState(appSettings);
+    const [saved, setSaved] = useState(false);
+
+    // Sync local state when prop updates (e.g. from DB load)
+    useEffect(() => {
+        setLocalSettings(appSettings);
+    }, [appSettings]);
+
+    const handleSave = async () => {
+        try {
+            await StorageService.saveAppSettings(localSettings);
+            setAppSettings(localSettings);
+            setSaved(true);
+            setTimeout(() => setSaved(false), 2000);
+        } catch (error) {
+            console.error('Failed to save settings:', error);
+            alert('儲存設定失敗，請檢查網路連線或稍後再試。');
+        }
+    };
+
+    const inputClassName = "w-full px-4 py-2.5 rounded-lg border border-slate-300 bg-slate-800 text-white focus:border-brand-500 focus:ring-2 focus:ring-brand-200 outline-none transition-all";
+
+    return (
+        <div className="p-8 max-w-2xl mx-auto">
+            <h1 className="text-2xl font-bold text-slate-800 mb-6 flex items-center gap-3">
+                <Icons.Settings className="w-7 h-7 text-brand-500" />
+                參數設定
+            </h1>
+
+            <Card>
+                <div className="p-6 space-y-6">
+                    {/* 日用量計算週數 */}
+                    <div>
+                        <label className="block text-sm font-medium text-slate-700 mb-2">
+                            日用量計算週數（總覽看板）
+                        </label>
+                        <div className="flex items-center gap-3">
+                            <input
+                                type="number"
+                                min="1"
+                                max="52"
+                                value={localSettings.usageCalcWeeks}
+                                onChange={e => setLocalSettings(prev => ({ ...prev, usageCalcWeeks: Math.max(1, Math.min(52, Number(e.target.value))) }))}
+                                className={`${inputClassName} w-32`}
+                            />
+                            <span className="text-slate-500">週</span>
+                        </div>
+                        <p className="text-xs text-slate-400 mt-1">用於計算每個儲槽的平均日用量（建議 4-12 週）</p>
+                    </div>
+
+                    <hr className="border-slate-200" />
+
+                    <h3 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">
+                        <Icons.Alert className="w-5 h-5 text-brand-600" />
+                        液位檢查警告文字
+                        <div className="group relative ml-1">
+                            <Icons.Info className="w-4 h-4 text-slate-400 cursor-help" />
+                            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 p-3 bg-slate-800 text-white text-xs rounded shadow-lg w-64 hidden group-hover:block z-50 pointer-events-none">
+                                <p className="font-bold mb-1">格式範本可用變數:</p>
+                                <ul className="list-disc pl-4 space-y-1">
+                                    <li><code className="bg-slate-700 px-1 rounded">{'{diff}'}</code> 日均變動量</li>
+                                    <li><code className="bg-slate-700 px-1 rounded">{'{limit}'}</code> 閾值</li>
+                                    <li><code className="bg-slate-700 px-1 rounded">{'{unit}'}</code> 單位</li>
+                                </ul>
+                                <p className="mt-2 text-slate-400 border-t border-slate-700 pt-2">
+                                    適用於「液位變化超標」與「可能為補藥」警告
+                                </p>
+                            </div>
+                        </div>
+                    </h3>
+
+                    <div className="space-y-4">
+                        <div>
+                            <label className="block text-sm text-slate-600 mb-1">低液位警告</label>
+                            <input
+                                type="text"
+                                value={localSettings.lowLevelWarningText}
+                                onChange={e => setLocalSettings(prev => ({ ...prev, lowLevelWarningText: e.target.value }))}
+                                className={inputClassName}
+                                placeholder="存量偏低，請叫藥"
+                            />
+                        </div>
+
+                        <div>
+                            <label className="block text-sm text-slate-600 mb-1">液位變化超標警告 (格式範本)</label>
+                            <input
+                                type="text"
+                                value={localSettings.thresholdWarningText}
+                                onChange={e => setLocalSettings(prev => ({ ...prev, thresholdWarningText: e.target.value }))}
+                                className={inputClassName}
+                                placeholder="範例: 液位變化異常 ({diff} {unit} > {limit} {unit})"
+                            />
+                        </div>
+
+                        <div>
+                            <label className="block text-sm text-slate-600 mb-1">可能為補藥警告 (格式範本)</label>
+                            <input
+                                type="text"
+                                value={localSettings.possibleRefillText}
+                                onChange={e => setLocalSettings(prev => ({ ...prev, possibleRefillText: e.target.value }))}
+                                className={inputClassName}
+                                placeholder="可能為補藥紀錄"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="flex justify-end gap-3 pt-4">
+                        <Button
+                            onClick={handleSave}
+                            className="bg-brand-600 hover:bg-brand-700 text-white"
+                        >
+                            {saved ? '✓ 已儲存' : '儲存設定'}
+                        </Button>
+                    </div>
+                </div>
+            </Card>
+        </div>
+    );
+};
+
+type ViewType = 'dashboard' | 'entry' | 'analysis' | 'settings' | 'notes' | 'annual' | 'pi-test' | 'import' | 'params';
 
 const App: React.FC = () => {
     const [currentView, setCurrentView] = useState<ViewType>(() => {
         // 從 URL hash 讀取初始頁面
         const hash = window.location.hash.slice(1);
-        if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import'].includes(hash)) {
+        if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import', 'params'].includes(hash)) {
             return hash as ViewType;
         }
         return 'dashboard';
@@ -5328,6 +5792,29 @@ const App: React.FC = () => {
 
     // Persist UserName
     const [userName, setUserName] = useState(() => localStorage.getItem('appUserName') || 'OP');
+
+    // App Settings
+    const [appSettings, setAppSettings] = useState({
+        usageCalcWeeks: 8,
+        lowLevelWarningText: '存量偏低，請叫藥',
+        thresholdWarningText: '液位變化異常，請確認',
+        possibleRefillText: '可能為補藥紀錄'
+    });
+
+    // Load appSettings from API on startup
+    useEffect(() => {
+        const loadSettings = async () => {
+            try {
+                const settingsFromDb = await StorageService.getAppSettings();
+                if (settingsFromDb && Object.keys(settingsFromDb).length > 0) {
+                    setAppSettings(prev => ({ ...prev, ...settingsFromDb }));
+                }
+            } catch (error) {
+                console.error('Failed to load app settings:', error);
+            }
+        };
+        loadSettings();
+    }, []);
 
     // 導航函數 - 更新頁面並推入瀏覽器歷史
     const navigateTo = useCallback((view: ViewType, replace = false) => {
@@ -5349,7 +5836,7 @@ const App: React.FC = () => {
             } else {
                 // 從 hash 讀取
                 const hash = window.location.hash.slice(1);
-                if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import'].includes(hash)) {
+                if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import', 'params'].includes(hash)) {
                     setCurrentView(hash as ViewType);
                 } else {
                     setCurrentView('dashboard');
@@ -5438,7 +5925,7 @@ const App: React.FC = () => {
     const renderContent = () => {
         switch (currentView) {
             case 'dashboard': return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} onNavigate={handleNavigateToAnalysis} onLoading={setIsLoading} />;
-            case 'entry': return <DataEntryView tanks={tanks} readings={readings} onSave={handleSaveReading} onBatchSave={handleBatchSaveReadings} onUpdateTank={() => refreshData()} onLoading={setIsLoading} />;
+            case 'entry': return <DataEntryView tanks={tanks} readings={readings} onSave={handleSaveReading} onBatchSave={handleBatchSaveReadings} onUpdateTank={() => refreshData()} onLoading={setIsLoading} appSettings={appSettings} />;
             case 'analysis': return (
                 <AnalysisView
                     tanks={tanks}
@@ -5448,10 +5935,11 @@ const App: React.FC = () => {
                 />
             );
             case 'settings': return <SettingsView tanks={tanks} readings={readings} onRefresh={refreshData} onLoading={setIsLoading} />;
-            case 'notes': return <ImportantNotesView />;
+            case 'notes': return <ImportantNotesView thresholdWarningText={appSettings.thresholdWarningText} />;
             case 'annual': return <AnnualDataView tanks={tanks} readings={readings} onNavigate={handleNavigateToAnalysis} />;
             case 'import': return <ExcelImportView tanks={tanks} onComplete={refreshData} onLoading={setIsLoading} />;
-            default: return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} />;
+            case 'params': return <ParamsSettingsView appSettings={appSettings} setAppSettings={setAppSettings} />;
+            default: return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} usageCalcWeeks={appSettings.usageCalcWeeks} lowLevelWarningText={appSettings.lowLevelWarningText} />;
         }
     };
 
@@ -5483,32 +5971,16 @@ const App: React.FC = () => {
                     <NavItem view="notes" icon={Icons.Notes} label="重要紀事" />
                     <NavItem view="entry" icon={Icons.Entry} label="數據輸入" />
                     <NavItem view="import" icon={Icons.FileText} label="辨識匯入" />
-                    <NavItem view="settings" icon={Icons.Settings} label="儲槽設定" />
+                    <NavItem view="settings" icon={Icons.Cylinder} label="儲槽設定" />
+                    <NavItem view="params" icon={Icons.Settings} label="參數設定" />
                 </nav>
+
+                {/* User Info & Date at Bottom */}
+
             </aside>
 
             {/* Main Content */}
             <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-                <header className="h-16 bg-white border-b border-slate-200 flex items-center justify-between px-8 flex-shrink-0">
-                    <h1 className="text-xl font-bold text-slate-800">
-                        {currentView === 'dashboard' && '總覽看板'}
-                        {currentView === 'entry' && '數據輸入'}
-                        {currentView === 'analysis' && '用量趨勢分析'}
-                        {currentView === 'settings' && '儲槽設定'}
-                    </h1>
-                    <div className="flex items-center gap-4">
-                        <div className="text-sm text-slate-500">
-                            {new Date().toLocaleDateString()}
-                        </div>
-                        <div
-                            onClick={handleNameChange}
-                            className="w-8 h-8 rounded-full bg-slate-200 hover:bg-slate-300 cursor-pointer flex items-center justify-center text-slate-600 font-bold text-xs transition-colors"
-                            title="點擊修改名稱"
-                        >
-                            {userName.substring(0, 2).toUpperCase()}
-                        </div>
-                    </div>
-                </header>
                 <div className="flex-1 overflow-auto p-8">
                     {renderContent()}
                 </div>

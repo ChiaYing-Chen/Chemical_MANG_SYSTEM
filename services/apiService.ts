@@ -7,6 +7,40 @@ const isDev = window.location.hostname === 'localhost' && window.location.port !
 // Use relative path for both Dev (via Proxy) and Prod
 const API_BASE_URL = '/WTCA/api';
 
+// ==================== App Settings ====================
+
+export const fetchAppSettings = async (): Promise<any> => {
+    try {
+        const response = await fetch(`${API_BASE_URL}/settings`);
+        if (!response.ok) {
+            throw new Error('Failed to fetch app settings');
+        }
+        return await response.json();
+    } catch (error) {
+        console.error('API fetchAppSettings error:', error);
+        throw error;
+    }
+};
+
+export const saveAppSettings = async (settings: any): Promise<any> => {
+    try {
+        const response = await fetch(`${API_BASE_URL}/settings`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(settings),
+        });
+        if (!response.ok) {
+            throw new Error('Failed to save app settings');
+        }
+        return await response.json();
+    } catch (error) {
+        console.error('API saveAppSettings error:', error);
+        throw error;
+    }
+};
+
 // ==================== Tanks ====================
 
 export const fetchTanks = async (): Promise<any[]> => {
@@ -303,6 +337,60 @@ export const createNotesBatch = async (notes: any[]): Promise<any> => {
     });
     if (!response.ok) throw new Error('Failed to create notes batch');
     return await response.json();
+};
+
+// ==================== Fluctuation Alerts ====================
+
+export const fetchAlerts = async (): Promise<any[]> => {
+    const response = await fetch(`${API_BASE_URL}/alerts`);
+    if (!response.ok) throw new Error('Failed to fetch alerts');
+    return await response.json();
+};
+
+export const createAlert = async (alert: any): Promise<any> => {
+    const response = await fetch(`${API_BASE_URL}/alerts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(alert)
+    });
+    if (!response.ok) throw new Error('Failed to create alert');
+    return await response.json();
+};
+
+export const createAlertsBatch = async (alerts: any[]): Promise<any> => {
+    const response = await fetch(`${API_BASE_URL}/alerts/batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alerts })
+    });
+    if (!response.ok) throw new Error('Failed to create alerts batch');
+    return await response.json();
+};
+
+export const updateAlert = async (id: string, note: string): Promise<any> => {
+    const response = await fetch(`${API_BASE_URL}/alerts/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note })
+    });
+    if (!response.ok) throw new Error('Failed to update alert');
+    return await response.json();
+};
+
+export const deleteAlert = async (id: string): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/alerts/${id}`, {
+        method: 'DELETE'
+    });
+    if (!response.ok) throw new Error('Failed to delete alert');
+};
+
+export const deleteAlertsBatch = async (ids: string[]): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/alerts/batch-delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids })
+    });
+    if (!response.ok) throw new Error('Failed to batch delete alerts');
 };
 
 // ==================== Helper Functions ====================

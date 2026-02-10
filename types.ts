@@ -64,7 +64,7 @@ export interface Tank {
   capacityLiters: number;
   factor: number; // Geometric Factor: Liters per CM
   description?: string;
-  safeMinLevel: number; // %
+  safeMinLevel: number; // cm (or based on inputUnit)
   targetDailyUsage?: number;
 
   // Configuration
@@ -135,5 +135,36 @@ export interface ImportantNote {
   area: string;
   chemicalName: string;
   note: string;
+  createdAt?: string;
+}
+
+export interface FluctuationAlert {
+  id: string;
+  tankId: string;
+  tankName: string;
+  dateStr: string;
+  reason: string;
+  currentValue?: number;
+  prevValue?: number;
+  nextValue?: number;
+  isPossibleRefill: boolean;
+  source: 'IMPORT' | 'MANUAL';
+  note?: string;
+  createdAt?: string;
+}
+
+// Fluctuation Alerts
+export interface FluctuationAlert {
+  id: string;
+  tankId: string;
+  tankName: string;
+  dateStr: string;
+  reason: string;
+  currentValue?: number;
+  prevValue?: number;
+  nextValue?: number;
+  isPossibleRefill: boolean;
+  source: 'IMPORT' | 'MANUAL';
+  note?: string;
   createdAt?: string;
 }

@@ -1,8 +1,11 @@
 import React, { useState, useMemo, useEffect } from 'react';
+import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts';
 import { Tank, Reading, ChemicalSupply, SystemType, CWSParameterRecord, BWSParameterRecord, ImportantNote } from '../types';
 import { StorageService } from '../services/storageService';
 import { calculateCWSUsage } from '../utils/calculationUtils';
 import { Icons } from '../components/Icons';
+
+const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#82ca9d', '#a4de6c', '#d0ed57', '#ffc658'];
 
 interface AnnualDataViewProps {
     tanks: Tank[];
@@ -121,38 +124,74 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
             tankMap.set(tank.id, { tank, months });
         });
 
-        // 1. Fill Actual Usage
-        // Simplified Usage Calculation:
-        // Sort readings by time for each tank.
+        // 1. Fill Actual Usage (採用逐日分攤計算，與 AnalysisView 一致)
         tanks.forEach(tank => {
             const tData = tankMap.get(tank.id);
             if (!tData) return;
 
-            // Get all readings for this tank (forever) to ensure we have continuity at boundaries
+            // Get all readings for this tank (forever)
             const tankReadings = readings
                 .filter(r => r.tankId === tank.id)
+                // 1. 去重 (Deduplication): 避免相同 ID 的讀數重複計算 (與 AnalysisView 一致)
+                .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
                 .sort((a, b) => a.timestamp - b.timestamp);
+
+            // 建立每日用量 Map (YYYY-MM-DD -> KG)
+            const dailyActualMap = new Map<string, number>();
 
             for (let i = 1; i < tankReadings.length; i++) {
                 const curr = tankReadings[i];
                 const prev = tankReadings[i - 1];
 
-                // If curr is in this year
-                if (curr.timestamp < yearStart) continue;
-                if (curr.timestamp >= yearEnd) break;
+                const diffMs = curr.timestamp - prev.timestamp;
+                const diffDays = diffMs / (1000 * 60 * 60 * 24);
 
-                // Calculate usage for this interval
-                const usage = (prev.calculatedVolume - curr.calculatedVolume) + (curr.addedAmountLiters || 0);
-                // What if usage < 0 (Level increased without record)? 
-                // Ignore or Treat as 0.
+                if (diffDays <= 0) continue;
 
-                const mIdx = new Date(curr.timestamp).getMonth(); // Attribute usage to the month of the "Current" reading (end of interval)
-                // Or attribute by time proportion? Simple: Attribute to recording date.
+                // 計算區間總用量 (KG) - 與 AnalysisView 完全一致
+                // 補充量記錄在「補充後」的那筆讀數(curr)上
+                // 公式：(前重量 + 本次補充量) - 後重量 = 區間用量
+                // 2. 嚴格計算 (Strict Calculation): 移除預設值，避免髒資料導致虛增 (與 AnalysisView 一致)
+                // 若 SG 為 undefined，則整個 addedKg 為 NaN -> totalUsageKg 為 NaN -> 下方 Math.max(0, NaN) = 0 (忽略此筆)
+                const addedKg = (curr.addedAmountLiters) * (curr.appliedSpecificGravity);
+                const totalUsageKg = (prev.calculatedWeightKg + addedKg) - curr.calculatedWeightKg;
 
-                if (usage > 0) {
-                    tData.months[mIdx].actualUsage += usage;
+                // 使用 Math.max(0, ...) 與 AnalysisView 一致
+                const dailyUsage = Math.max(0, totalUsageKg / diffDays);
+
+                let iterDate = new Date(prev.timestamp);
+                const endDate = new Date(curr.timestamp);
+
+                // 從 prev 開始迭代到 curr (與 AnalysisView 一致)
+                while (iterDate < endDate) {
+                    // 使用本地時間手動建構 Key (YYYY-MM-DD)，確保與 lookup key 絕對一致且無 Locale 依賴
+                    const Y = iterDate.getFullYear();
+                    const M = String(iterDate.getMonth() + 1).padStart(2, '0');
+                    const D = String(iterDate.getDate()).padStart(2, '0');
+                    const dateKey = `${Y}-${M}-${D}`;
+
+                    // 只設定一次，不累加 (與 AnalysisView 一致)
+                    if (!dailyActualMap.has(dateKey)) {
+                        dailyActualMap.set(dateKey, dailyUsage);
+                    }
+
+                    // 加一天
+                    iterDate.setDate(iterDate.getDate() + 1);
                 }
             }
+
+            // 將每日用量匯總到對應月份
+            tData.months.forEach(m => {
+                const daysInMonth = new Date(year, m.month, 0).getDate();
+                for (let d = 1; d <= daysInMonth; d++) {
+                    // 使用 ISO 格式的日期 key (YYYY-MM-DD)
+                    const dateKey = `${year}-${String(m.month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+                    const dailyVal = dailyActualMap.get(dateKey);
+                    if (dailyVal) {
+                        m.actualUsage += dailyVal;
+                    }
+                }
+            });
         });
 
         // 2. Fill Theoretical & Price/SG
@@ -209,43 +248,82 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                     return nDate.getFullYear() === year && nDate.getMonth() + 1 === m.month;
                 });
 
-                // --- Theoretical ---
-                if (tank.calculationMethod === 'CWS_BLOWDOWN') {
+                // --- Theoretical （採用逐日計算，與 AnalysisView 一致）---
+                if (tank.calculationMethod === 'CWS_BLOWDOWN' || tank.calculationMethod === 'BWS_STEAM') {
                     m.hasTheory = true;
                     const tankCwsHistory = cwsHistory.filter(p => p.tankId === tank.id);
-                    // Calculate for the month
-                    // Need 'targetPpm'. Use latest supply.
-                    if (effectiveSupplies.length > 0) {
-                        const activeS = effectiveSupplies[effectiveSupplies.length - 1]; // Use latest
-                        if (activeS.targetPpm) {
-                            // Find CWS Params
-                            // Use average or latest?
-                            // Standard: Latest relative to month?
-                            // Reuse utility with single param?
-                            // Find param active in month
-                            let param = tankCwsHistory.find(p => (p.date || 0) >= m.monthStart.getTime() && (p.date || 0) < m.monthEnd.getTime());
-                            if (!param) {
-                                // fallback to most recent before month
-                                const sorted = tankCwsHistory.filter(p => (p.date || 0) < m.monthStart.getTime()).sort((a, b) => (b.date || 0) - (a.date || 0));
-                                param = sorted[0];
-                            }
-                            // fallback to tank current
-                            if (!param && tank.cwsParams) param = tank.cwsParams;
+                    const tankBwsHistory = bwsHistory.filter(p => p.tankId === tank.id);
 
-                            if (param) {
-                                const days = new Date(year, m.month, 0).getDate(); // Days in month
-                                m.theoryUsage = calculateCWSUsage(
-                                    param.circulationRate || 0,
-                                    param.tempDiff || 0,
-                                    param.concentrationCycles || 1,
-                                    activeS.targetPpm,
-                                    days
-                                );
+                    // 遍歷月份中的每一天進行計算
+                    const daysInMonth = new Date(year, m.month, 0).getDate();
+                    const today = new Date();
+                    today.setHours(23, 59, 59, 999); // 設定為今天結束
+                    const todayTime = today.getTime();
+
+                    let monthTheory = 0;
+                    let hasAnyParam = false; // 追蹤是否有任何有效參數
+
+                    for (let day = 1; day <= daysInMonth; day++) {
+                        const dayTime = new Date(year, m.month - 1, day).getTime();
+
+                        // 跳過未來日期
+                        if (dayTime > todayTime) continue;
+
+                        // 取得該日有效的藥劑合約
+                        const activeSupply = tankSupplies.find(s => s.startDate <= dayTime);
+                        const targetPpm = activeSupply?.targetPpm || 0;
+
+                        if (!targetPpm) continue; // 無 PPM 設定則跳過
+
+                        let dailyTheory = 0;
+
+                        if (tank.calculationMethod === 'CWS_BLOWDOWN') {
+                            // 查找覆蓋該日的週參數 (record.date <= dayTime < record.date + 7天)
+                            // 不使用 fallback，確保只有真正有參數的日期才計算
+                            const cwsParam = tankCwsHistory.find(p => {
+                                const pDate = p.date || 0;
+                                const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                                return dayTime >= pDate && dayTime < pEnd;
+                            });
+
+                            if (cwsParam) {
+                                hasAnyParam = true;
+                                const R = cwsParam.circulationRate || 0;
+                                const dT = cwsParam.tempDiff || 0;
+                                let C = cwsParam.concentrationCycles || 1;
+                                if (cwsParam.cwsHardness && cwsParam.makeupHardness && cwsParam.makeupHardness > 0) {
+                                    C = cwsParam.cwsHardness / cwsParam.makeupHardness;
+                                }
+                                // 每日蒸發量
+                                const E = (R * dT * 1.8 * 24) / 1000;
+                                // 每日排放量
+                                const B = C > 1 ? E / (C - 1) : 0;
+                                // 每日理論用量 (KG)
+                                dailyTheory = (B * targetPpm) / 1000;
+                            }
+                        } else if (tank.calculationMethod === 'BWS_STEAM') {
+                            // 查找覆蓋該日的週參數
+                            const bwsParam = tankBwsHistory.find(p => {
+                                const pDate = p.date || 0;
+                                const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                                return dayTime >= pDate && dayTime < pEnd;
+                            });
+
+                            if (bwsParam?.steamProduction) {
+                                hasAnyParam = true;
+                                // 週蒸汽量除以 7 得到每日蒸汽量
+                                const dailySteam = bwsParam.steamProduction / 7;
+                                // 每日理論用量 (KG)
+                                dailyTheory = (dailySteam * targetPpm) / 1000;
                             }
                         }
+
+                        monthTheory += dailyTheory;
                     }
+
+                    // 只有當有實際參數資料時才顯示理論值
+                    m.theoryUsage = (monthTheory > 0 && hasAnyParam) ? monthTheory : null;
                 }
-                // TODO: BWS Logic if needed
             });
         });
 
@@ -316,8 +394,18 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                     const coolingGroup2 = aggregatedData.filter(d => d.tank.system === SystemType.COOLING && !(d.tank.name.includes('CT-1') || d.tank.name.includes('CWS-1') || d.tank.description?.includes('一階')));
                     const others = aggregatedData.filter(d => d.tank.system !== SystemType.COOLING);
 
+                    // 計算單個藥劑全年總金額
+                    const calcTankYearlyTotal = (months: any[]) =>
+                        months.reduce((sum, m) => sum + (m.actualUsage > 0 && m.price ? m.actualUsage * m.price : 0), 0);
+
+                    // 計算群組總金額
+                    const calcGroupTotal = (group: typeof aggregatedData) =>
+                        group.reduce((sum, d) => sum + calcTankYearlyTotal(d.months), 0);
+
+
+
                     const renderTankCard = ({ tank, months }: { tank: Tank, months: any[] }) => (
-                        <div key={tank.id} className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden break-inside-avoid mb-8">
+                        <div key={tank.id} id={`tank-${tank.id}`} className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden break-inside-avoid mb-8 scroll-mt-32">
                             <div className="bg-slate-50 px-6 py-3 border-b border-slate-200 flex justify-between items-center">
                                 <div className="flex items-center gap-2">
                                     <span className="font-bold text-slate-700">{tank.name}</span>
@@ -375,7 +463,7 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                                                     {/* Theoretical (Conditional) */}
                                                     {tank.calculationMethod !== 'NONE' && (
                                                         <td className="px-3 py-2 text-right font-mono text-slate-600 text-xs">
-                                                            {m.theoryUsage ? m.theoryUsage.toFixed(0) : '-'}
+                                                            {m.theoryUsage ? m.theoryUsage.toLocaleString('zh-TW', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) : '-'}
                                                         </td>
                                                     )}
 
@@ -385,7 +473,7 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                                                         onClick={() => onNavigate?.(tank.id, m.month, year)}
                                                         title="點擊查看詳細分析"
                                                     >
-                                                        {m.actualUsage > 0 ? m.actualUsage.toFixed(0) : '-'}
+                                                        {m.actualUsage > 0 ? m.actualUsage.toLocaleString('zh-TW', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) : '-'}
                                                     </td>
 
                                                     {/* Diff (Conditional) */}
@@ -428,19 +516,210 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                                                 </tr>
                                             );
                                         })}
+                                        {/* 全年合計列 */}
+                                        <tr className="bg-gradient-to-r from-blue-50 to-blue-100 font-bold border-t-2 border-blue-200">
+                                            <td className="px-3 py-3 text-blue-700">全年合計</td>
+                                            {tank.calculationMethod !== 'NONE' && <td className="px-3 py-3"></td>}
+                                            <td className="px-3 py-3 text-right text-blue-700 font-mono">
+                                                {months.reduce((s: number, m: any) => s + m.actualUsage, 0).toLocaleString('zh-TW', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}
+                                            </td>
+                                            {tank.calculationMethod !== 'NONE' && <td className="px-3 py-3"></td>}
+                                            <td className="px-3 py-3"></td>
+                                            <td className="px-3 py-3 text-right text-blue-700 font-mono text-base">
+                                                ${calcTankYearlyTotal(months).toLocaleString('zh-TW', { maximumFractionDigits: 0 })}
+                                            </td>
+                                            <td className="px-3 py-3"></td>
+                                        </tr>
                                     </tbody>
                                 </table>
                             </div>
                         </div>
                     );
 
+                    const renderSystemSummaryCard = (title: string, groupData: typeof aggregatedData, colorTheme: 'blue' | 'emerald' | 'amber') => {
+                        const totalAmount = calcGroupTotal(groupData);
+
+                        // Prepare Chart Data
+                        const chartData = groupData.map(d => ({
+                            name: d.tank.name,
+                            value: calcTankYearlyTotal(d.months),
+                            id: d.tank.id
+                        })).filter(d => d.value > 0);
+
+                        // Theme classes
+                        const theme = {
+                            blue: { bg: 'from-blue-50 to-blue-100', border: 'border-blue-200', textTitle: 'text-blue-600', textAmount: 'text-blue-800' },
+                            emerald: { bg: 'from-emerald-50 to-emerald-100', border: 'border-emerald-200', textTitle: 'text-emerald-600', textAmount: 'text-emerald-800' },
+                            amber: { bg: 'from-amber-50 to-amber-100', border: 'border-amber-200', textTitle: 'text-amber-600', textAmount: 'text-amber-800' }
+                        }[colorTheme];
+
+                        const handlePieClick = (data: any) => {
+                            // Recharts event data structure can be tricky.
+                            // data.payload usually contains the original data object { name, value, id }
+                            // Sometimes 'data' itself is the object if passed directly.
+                            const id = data?.payload?.id || data?.id;
+
+                            if (id) {
+                                const targetId = `tank-${id}`;
+                                const element = document.getElementById(targetId);
+                                if (element) {
+                                    // 'center' align usually works best to bring it into view comfortably
+                                    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+                                    // Optional: Add a temporary highlight effect
+                                    element.classList.add('ring-2', 'ring-blue-500');
+                                    setTimeout(() => element.classList.remove('ring-2', 'ring-blue-500'), 2000);
+                                } else {
+                                    console.warn(`Element with id ${targetId} not found`);
+                                }
+                            }
+                        };
+
+                        const RADIAN = Math.PI / 180;
+                        const renderCustomizedLabel = (props: any) => {
+                            const { cx, cy, midAngle, innerRadius, outerRadius, startAngle, endAngle, fill, payload, percent, value } = props;
+                            const sin = Math.sin(-midAngle * RADIAN);
+                            const cos = Math.cos(-midAngle * RADIAN);
+                            const sx = cx + (outerRadius + 0) * cos;
+                            const sy = cy + (outerRadius + 0) * sin;
+                            const mx = cx + (outerRadius + 30) * cos;
+                            const my = cy + (outerRadius + 30) * sin;
+                            const ex = mx + (cos >= 0 ? 1 : -1) * 22;
+                            const ey = my;
+                            const textAnchor = cos >= 0 ? 'start' : 'end';
+
+                            const handleClick = (e: any) => {
+                                e.stopPropagation();
+                                handlePieClick({ payload });
+                            };
+
+                            return (
+                                <g>
+                                    <path d={`M${sx},${sy}L${mx},${my}L${ex},${ey}`} stroke={fill} fill="none" />
+                                    <circle cx={ex} cy={ey} r={2} fill={fill} stroke="none" />
+                                    <text
+                                        x={ex + (cos >= 0 ? 1 : -1) * 8}
+                                        y={ey}
+                                        textAnchor={textAnchor}
+                                        fill="#333"
+                                        fontSize={11}
+                                        fontWeight="500"
+                                        dy={4}
+                                        style={{ cursor: 'pointer' }}
+                                        onClick={handleClick}
+                                    >
+                                        {`${payload.name} (${(percent * 100).toFixed(0)}%)`}
+                                    </text>
+                                </g>
+                            );
+                        };
+
+                        // For single-chemical systems, show monthly line chart instead of pie
+                        const isSingleChemical = groupData.length === 1;
+                        const monthlyLineData = isSingleChemical ? Array.from({ length: 12 }, (_, i) => {
+                            const monthData = groupData[0].months[i];
+                            const monthAmount = monthData && monthData.actualUsage > 0 && monthData.price
+                                ? monthData.actualUsage * monthData.price
+                                : 0;
+                            return {
+                                month: `${i + 1}月`,
+                                amount: monthAmount
+                            };
+                        }) : [];
+
+                        return (
+                            <div className={`bg-gradient-to-r ${theme.bg} rounded-xl p-6 border ${theme.border} shadow-sm relative overflow-visible`}>
+                                <div className="flex flex-col items-center justify-center">
+                                    {/* Moved Title to Top */}
+                                    <div className={`text-lg font-bold ${theme.textTitle} mb-2`}>{title}</div>
+
+                                    <div className="w-full flex justify-center items-center relative" style={{ height: isSingleChemical ? 250 : 350 }}>
+                                        {/* Center Text Overlay - Only for Pie Chart */}
+                                        {!isSingleChemical && (
+                                            <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-center pointer-events-none z-0">
+                                                <div className={`text-xl font-bold ${theme.textAmount}`}>
+                                                    ${totalAmount.toLocaleString('zh-TW', { maximumFractionDigits: 0 })}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {isSingleChemical ? (
+                                            /* Single Chemical: Show Line Chart */
+                                            <ResponsiveContainer width="100%" height="100%">
+                                                <LineChart data={monthlyLineData} margin={{ top: 20, right: 30, left: 20, bottom: 5 }}>
+                                                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                                                    <XAxis dataKey="month" tick={{ fontSize: 11 }} />
+                                                    <YAxis
+                                                        tickFormatter={(value) => `$${(value / 1000).toFixed(0)}k`}
+                                                        tick={{ fontSize: 11 }}
+                                                    />
+                                                    <RechartsTooltip
+                                                        formatter={(value: number) => [`$${value.toLocaleString('zh-TW', { maximumFractionDigits: 0 })}`, '金額']}
+                                                    />
+                                                    <Line
+                                                        type="monotone"
+                                                        dataKey="amount"
+                                                        stroke={theme.textAmount.includes('blue') ? '#2563EB' : theme.textAmount.includes('emerald') ? '#10B981' : '#F59E0B'}
+                                                        strokeWidth={2}
+                                                        dot={{ r: 4 }}
+                                                        activeDot={{ r: 6 }}
+                                                    />
+                                                </LineChart>
+                                            </ResponsiveContainer>
+                                        ) : (
+                                            /* Multiple Chemicals: Show Pie Chart */
+                                            chartData.length > 0 && (
+                                                <ResponsiveContainer width="100%" height="100%">
+                                                    <PieChart>
+                                                        <Pie
+                                                            data={chartData}
+                                                            cx="50%"
+                                                            cy="50%"
+                                                            innerRadius={60}
+                                                            outerRadius={80}
+                                                            fill="#8884d8"
+                                                            paddingAngle={2}
+                                                            dataKey="value"
+                                                            onClick={handlePieClick}
+                                                            cursor="pointer"
+                                                            label={renderCustomizedLabel}
+                                                            labelLine={false}
+                                                        >
+                                                            {chartData.map((entry, index) => (
+                                                                <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                                                            ))}
+                                                        </Pie>
+                                                        <RechartsTooltip
+                                                            formatter={(value: number) => `$${value.toLocaleString('zh-TW', { maximumFractionDigits: 0 })}`}
+                                                        />
+                                                    </PieChart>
+                                                </ResponsiveContainer>
+                                            )
+                                        )}
+                                    </div>
+
+                                    {/* Show total amount below line chart for single chemical */}
+                                    {isSingleChemical && (
+                                        <div className={`text-xl font-bold ${theme.textAmount} mt-2`}>
+                                            全年總金額: ${totalAmount.toLocaleString('zh-TW', { maximumFractionDigits: 0 })}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    };
+
                     if (selectedSystem === SystemType.COOLING) {
                         return (
                             <>
-                                <div className="space-y-6">
+                                {/* CT-1 系統總金額 */}
+                                <div id="summary-section" className="space-y-4">
+                                    {renderSystemSummaryCard("CT-1 藥劑，全年累計總金額", coolingGroup1, 'blue')}
                                     {coolingGroup1.map(renderTankCard)}
                                 </div>
-                                <div className="space-y-6">
+                                {/* CT-2 系統總金額 */}
+                                <div className="space-y-4">
+                                    {renderSystemSummaryCard("CT-2 藥劑，全年累計總金額", coolingGroup2, 'emerald')}
                                     {coolingGroup2.map(renderTankCard)}
                                 </div>
                             </>
@@ -461,6 +740,15 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
 
                     return (
                         <>
+                            {/* 系統總金額區塊 */}
+                            {/* 系統總金額區塊 */}
+                            <div className="col-span-2 mb-4">
+                                {renderSystemSummaryCard(
+                                    `${selectedSystem === SystemType.BOILER ? '鍋爐水系統藥劑' : selectedSystem === SystemType.DENOX ? '脫銷系統藥劑' : '全系統藥劑'}，全年累計總金額`,
+                                    aggregatedData,
+                                    'amber'
+                                )}
+                            </div>
                             <div className="space-y-6">
                                 {leftCol.map(renderTankCard)}
                             </div>
@@ -471,6 +759,23 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                     );
                 })()}
             </div>
+
+            {/* Floating Back-to-Top Button */}
+            <button
+                onClick={() => {
+                    // Use same scrollIntoView method as pie chart navigation
+                    const element = document.getElementById('summary-section');
+                    if (element) {
+                        element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                }}
+                className="fixed bottom-6 right-6 z-50 bg-blue-600 hover:bg-blue-700 text-white p-3 rounded-full shadow-lg transition-all duration-200 hover:scale-110"
+                title="返回頂部"
+            >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+                </svg>
+            </button>
         </div>
     );
 };

@@ -48,7 +48,9 @@ app.use(express.static('dist'));
 // 根路徑 - 如果 dist/index.html 存在則提供，否則顯示 API 資訊頁面
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { existsSync } from 'fs';
+import { existsSync, writeFileSync, unlinkSync } from 'fs';
+import { execSync } from 'child_process';
+import { tmpdir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -204,6 +206,395 @@ app.get('/', (req, res) => {
     `);
 });
 
+
+
+// ==================== PI Data Import API ====================
+
+const PI_BASE_URL = 'https://10.122.51.61/piwebapi';
+
+const BWS_TAGS = [
+    "W52_FI-MS27-A.PV",
+    "W52_FI-MS27-B.PV",
+    "W52_FI-MS27-C.PV",
+    "W52_FI-MS27-D.PV"
+];
+
+const CWS_TAGS_CONFIG = {
+    'CT-1': {
+        flow: ['W52_FI-CW56-Z.PV', 'W52_FI-CW57-Z.PV'],
+        tempOut: ['W52_TI-CW77-Z.PV'],
+        tempRet: ['W52_TI-CW76-Z.PV']
+    },
+    'CT-2': {
+        flow: ['W52_FI-CW56-Y.PV', 'W52_FI-CW57-Y.PV'],
+        tempOut: ['W52_TI-AC77-Y.PV'],
+        tempRet: ['W52_TI-CW76-Y.PV']
+    }
+};
+
+/**
+ * Batch fetch all PI tag values in a SINGLE PowerShell process.
+ * Forces UTF-8 output encoding to avoid CJK mojibake.
+ */
+const piBatchFetch = (requests, piAuth) => {
+    const fullUser = piAuth.domain ? `${piAuth.domain}\\${piAuth.username}` : piAuth.username;
+    const escapedPwd = piAuth.password.replace(/'/g, "''");
+    const baseUrl = PI_BASE_URL;
+
+    const psScript = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$OutputEncoding = [Text.Encoding]::UTF8
+chcp 65001 | Out-Null
+
+# SSL/TLS fixes
+[Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+[Net.ServicePointManager]::Expect100Continue = $false
+[Net.ServicePointManager]::DefaultConnectionLimit = 100
+$ErrorActionPreference = 'Stop'
+
+$secPwd = ConvertTo-SecureString '${escapedPwd}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential('${fullUser}', $secPwd)
+$results = @{}
+$tagWebIdCache = @{}
+$debugLogs = @()
+
+function PiGet($url) {
+    $maxRetry = 3
+    for ($attempt = 1; $attempt -le $maxRetry; $attempt++) {
+        try {
+            # Use HttpWebRequest for maximum control
+            $req = [System.Net.HttpWebRequest]::Create($url)
+            $req.Method = 'GET'
+            $req.ContentType = 'application/json'
+            $req.Accept = 'application/json'
+            $req.KeepAlive = $false
+            $req.PreAuthenticate = $true
+            $req.Credentials = $cred
+            $req.Timeout = 30000
+
+            $resp = $req.GetResponse()
+            $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $body = $reader.ReadToEnd()
+            $reader.Close()
+            $resp.Close()
+            return ($body | ConvertFrom-Json)
+        } catch {
+            $errDetail = $_.Exception.Message
+            if ($_.Exception.InnerException) {
+                $errDetail += ' | Inner: ' + $_.Exception.InnerException.Message
+                if ($_.Exception.InnerException.InnerException) {
+                    $errDetail += ' | InnerInner: ' + $_.Exception.InnerException.InnerException.Message
+                }
+            }
+            if ($attempt -eq $maxRetry) {
+                throw [System.Exception]::new("Attempt $attempt failed for $url : $errDetail")
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
+try {
+    $debugLogs += "Calling dataservers..."
+    $servers = PiGet '${baseUrl}/dataservers'
+    $serverId = $servers.Items[0].WebId
+    $results['_serverWebId'] = $serverId
+    $debugLogs += "DataServer OK: $serverId"
+
+${requests.map((req, i) => `
+    try {
+        $tagName = '${req.tagName}'
+        if ($tagWebIdCache.ContainsKey($tagName)) {
+            $webId = $tagWebIdCache[$tagName]
+        } else {
+            $searchUrl = "${baseUrl}/dataservers/$serverId/points?nameFilter=$tagName"
+            $debugLogs += "Search: $searchUrl"
+            $search = PiGet $searchUrl
+            if ($search.Items.Count -eq 0) {
+                $results['${req.tagName}__${i}'] = @{ error = 'Tag Not Found'; value = 0 }
+                $debugLogs += "Tag $tagName not found"
+                continue
+            }
+            $webId = $search.Items[0].WebId
+            $tagWebIdCache[$tagName] = $webId
+            $debugLogs += "Tag $tagName WebId: $webId"
+        }
+        $summaryUrl = "${baseUrl}/streams/$webId/summary?startTime=${req.startTime}&endTime=${req.endTime}&summaryType=${req.summaryType}"
+        $summary = PiGet $summaryUrl
+        $item = $summary.Items[0]
+        $val = $item.Value
+        if ($val -is [PSCustomObject] -and $val.PSObject.Properties['Value']) { $val = $val.Value }
+        $results['${req.tagName}__${i}'] = @{ value = [double]$val; error = $null }
+    } catch {
+        $errMsg = $_.Exception.Message
+        $results['${req.tagName}__${i}'] = @{ error = $errMsg; value = 0 }
+        $debugLogs += "ERROR ${req.tagName}: $errMsg"
+    }
+`).join('')}
+
+    $results['_debug'] = ($debugLogs -join ' || ')
+    $results | ConvertTo-Json -Depth 5 -Compress
+} catch {
+    $errDetail = $_.Exception.Message
+    if ($_.Exception.InnerException) {
+        $errDetail += ' | Inner: ' + $_.Exception.InnerException.Message
+    }
+    $errResults = @{ _authError = $errDetail; _debug = ($debugLogs -join ' || ') }
+    $errResults | ConvertTo-Json -Compress
+}
+`;
+    const tmpFile = join(tmpdir(), 'pi_batch_' + Date.now() + '.ps1');
+    const resultMap = new Map();
+
+    try {
+        writeFileSync(tmpFile, psScript, { encoding: 'utf8', flag: 'w' });
+        const stdout = execSync('powershell -NoProfile -ExecutionPolicy Bypass -File "' + tmpFile + '"', {
+            encoding: 'utf8',
+            timeout: 120000,
+            maxBuffer: 50 * 1024 * 1024
+        });
+
+        const parsed = JSON.parse(stdout.trim());
+
+        // Extract debug logs from PowerShell
+        if (parsed._debug) {
+            resultMap.set('_debug', parsed._debug);
+        }
+
+        if (parsed._authError) {
+            for (let i = 0; i < requests.length; i++) {
+                resultMap.set(requests[i].tagName + '__' + i, { value: 0, error: parsed._authError });
+            }
+        } else {
+            for (let i = 0; i < requests.length; i++) {
+                const key = requests[i].tagName + '__' + i;
+                const r = parsed[key];
+                if (r) {
+                    resultMap.set(key, { value: Number(r.value) || 0, error: r.error || null });
+                } else {
+                    resultMap.set(key, { value: 0, error: 'No result returned' });
+                }
+            }
+        }
+    } catch (e) {
+        const errMsg = (e.stderr || e.message || '').toString().trim().substring(0, 500);
+        for (let i = 0; i < requests.length; i++) {
+            resultMap.set(requests[i].tagName + '__' + i, { value: 0, error: errMsg.substring(0, 200) });
+        }
+    } finally {
+        try { unlinkSync(tmpFile); } catch (_) { }
+    }
+
+    return resultMap;
+};
+
+const getMonday = (d) => {
+    d = new Date(d);
+    const day = d.getDay();
+    const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+    const mon = new Date(d.setDate(diff));
+    mon.setHours(0, 0, 0, 0);
+    return mon;
+};
+
+app.post('/api/pi-import', async (req, res) => {
+    const logs = [];
+    try {
+        const { weeks = 4, username, password } = req.body;
+
+        if (!username || !password) {
+            return res.status(400).json({ success: false, error: "Missing 'username' or 'password' in request body." });
+        }
+
+        let domain = '';
+        let plainUsername = username;
+        if (username.includes('\\')) {
+            const parts = username.split('\\');
+            domain = parts[0];
+            plainUsername = parts[1];
+        }
+        const piAuth = { username: plainUsername, password, domain };
+        logs.push('Authenticating as: ' + (domain ? domain + '\\' : '') + plainUsername + ' (Kerberos)');
+
+        const currentWeekMonday = getMonday(new Date());
+        const targetWeeks = [];
+        for (let i = 1; i <= weeks; i++) {
+            const endDate = new Date(currentWeekMonday);
+            endDate.setDate(currentWeekMonday.getDate() - (7 * (i - 1)));
+            const startDate = new Date(endDate);
+            startDate.setDate(endDate.getDate() - 7);
+            targetWeeks.push({ start: startDate, end: endDate });
+        }
+        targetWeeks.reverse();
+
+        const allRequests = [];
+
+        for (const week of targetWeeks) {
+            const startStr = week.start.toISOString().split('T')[0] + 'T00:00:00';
+            const endStr = week.end.toISOString().split('T')[0] + 'T00:00:00';
+            for (const tag of BWS_TAGS) {
+                allRequests.push({ tagName: tag, startTime: startStr, endTime: endStr, summaryType: 'Total', _group: 'BWS', _weekStart: week.start });
+            }
+        }
+
+        for (const week of targetWeeks) {
+            const startStr = week.start.toISOString().split('T')[0] + 'T00:00:00';
+            const endStr = week.end.toISOString().split('T')[0] + 'T00:00:00';
+            for (const [areaKey, config] of Object.entries(CWS_TAGS_CONFIG)) {
+                for (const tag of config.flow) {
+                    allRequests.push({ tagName: tag, startTime: startStr, endTime: endStr, summaryType: 'Average', _group: 'CWS_' + areaKey + '_flow', _weekStart: week.start });
+                }
+                for (const tag of config.tempOut) {
+                    allRequests.push({ tagName: tag, startTime: startStr, endTime: endStr, summaryType: 'Average', _group: 'CWS_' + areaKey + '_tempOut', _weekStart: week.start });
+                }
+                for (const tag of config.tempRet) {
+                    allRequests.push({ tagName: tag, startTime: startStr, endTime: endStr, summaryType: 'Average', _group: 'CWS_' + areaKey + '_tempRet', _weekStart: week.start });
+                }
+            }
+        }
+
+        logs.push('  Total PI requests: ' + allRequests.length + ' (in single batch)');
+
+        const results = piBatchFetch(allRequests, piAuth);
+
+        // Output PowerShell debug logs
+        const debugLog = results.get('_debug');
+        if (debugLog) {
+            logs.push('  [PS Debug] ' + debugLog);
+        }
+
+        const summary = [];
+        const firstResult = results.values().next().value;
+        if (firstResult && firstResult.error && String(firstResult.error).includes('Auth')) {
+            const msg = '❌ Auth FAILED: ' + firstResult.error;
+            logs.push('  [Auth Test] FAILED: ' + firstResult.error);
+            summary.push(msg);
+        } else {
+            logs.push('  [Auth Test] OK (batch completed)');
+            // summary.push('✅ Auth OK'); // Optional, implicit if success
+        }
+
+        // --- Process BWS results ---
+        logs.push("Processing BWS data...");
+        const boilerTanksRes = await pool.query("SELECT * FROM tanks WHERE system_type = '鍋爐水系統'");
+        const boilerTanks = boilerTanksRes.rows;
+
+        for (const week of targetWeeks) {
+            let weekTotalSum = 0;
+            let errorCount = 0;
+            for (let i = 0; i < allRequests.length; i++) {
+                const req = allRequests[i];
+                if (req._group !== 'BWS' || req._weekStart.getTime() !== week.start.getTime()) continue;
+                const key = req.tagName + '__' + i;
+                const r = results.get(key);
+                if (r && r.error) {
+                    logs.push('    [BWS Error] ' + req.tagName + ': ' + r.error);
+                    errorCount++;
+                }
+                weekTotalSum += (r ? r.value || 0 : 0);
+            }
+            const safeTotal = Math.round(weekTotalSum * 24);
+            const dateTs = week.start.getTime();
+
+            let saveCount = 0;
+            for (const tank of boilerTanks) {
+                let existing = null;
+                try {
+                    const checkRes = await pool.query("SELECT id FROM bws_parameters WHERE tank_id = $1 AND date = $2", [tank.id, dateTs]);
+                    existing = checkRes.rows[0];
+                } catch (e) { /* ignore */ }
+
+                if (existing) {
+                    await pool.query("UPDATE bws_parameters SET steam_production = $1, updated_at = NOW() WHERE id = $2", [safeTotal, existing.id]);
+                } else {
+                    await pool.query("INSERT INTO bws_parameters (id, tank_id, steam_production, date) VALUES ($1, $2, $3, $4)", [crypto.randomUUID(), tank.id, safeTotal, dateTs]);
+                }
+                saveCount++;
+            }
+            logs.push('  Week ' + week.start.toLocaleDateString() + ': Updated ' + saveCount + ' BWS tanks (Steam: ' + safeTotal + ')');
+            if (errorCount > 0) {
+                summary.push(`⚠️ BWS ${week.start.toLocaleDateString()}: ${errorCount} errors`);
+            } else {
+                summary.push(`🔥 BWS ${week.start.toLocaleDateString()}: Steam ${safeTotal}`);
+            }
+        }
+
+        // --- Process CWS results ---
+        logs.push("Processing CWS data...");
+        const cwsTanksRes = await pool.query("SELECT * FROM tanks WHERE system_type = '冷卻水系統'");
+        const cwsTanks = cwsTanksRes.rows;
+        logs.push('  Found ' + cwsTanks.length + ' COOLING tanks');
+
+        const ct1Tanks = cwsTanks.filter(function (t) { return t.name.includes('CWS-1') || t.name.includes('CT-1') || (t.description || '').includes('\u4e00\u968e'); });
+        const ct2Tanks = cwsTanks.filter(function (t) { return !ct1Tanks.find(function (ct1) { return ct1.id === t.id; }); });
+
+        const getAreaData = (areaKey, weekStart) => {
+            let flowSum = 0, tOutSum = 0, tOutCount = 0, tRetSum = 0, tRetCount = 0;
+            let errors = 0;
+            for (let i = 0; i < allRequests.length; i++) {
+                const req = allRequests[i];
+                if (req._weekStart.getTime() !== weekStart.getTime()) continue;
+                const key = req.tagName + '__' + i;
+                const r = results.get(key);
+                if (r && r.error) errors++;
+
+                if (req._group === 'CWS_' + areaKey + '_flow') {
+                    if (r && r.error) logs.push('  [CWS Warn] ' + req.tagName + ': ' + r.error);
+                    flowSum += (r ? r.value || 0 : 0);
+                } else if (req._group === 'CWS_' + areaKey + '_tempOut') {
+                    if (r && r.error) { logs.push('  [CWS Warn] ' + req.tagName + ': ' + r.error); }
+                    else { tOutSum += (r ? r.value || 0 : 0); tOutCount++; }
+                } else if (req._group === 'CWS_' + areaKey + '_tempRet') {
+                    if (r && r.error) { logs.push('  [CWS Warn] ' + req.tagName + ': ' + r.error); }
+                    else { tRetSum += (r ? r.value || 0 : 0); tRetCount++; }
+                }
+            }
+            const tOut = tOutCount > 0 ? tOutSum / tOutCount : 0;
+            const tRet = tRetCount > 0 ? tRetSum / tRetCount : 0;
+            return { circulationRate: flowSum, tempOutlet: tOut, tempReturn: tRet, tempDiff: tRet - tOut, errors };
+        };
+
+        for (const week of targetWeeks) {
+            const dateTs = week.start.getTime();
+            let totalErrors = 0;
+            const saveCwsArea = async (tanks, areaKey) => {
+                if (tanks.length === 0) return;
+                const data = getAreaData(areaKey, week.start);
+                totalErrors += data.errors;
+                for (const tank of tanks) {
+                    const existingRes = await pool.query("SELECT * FROM cws_parameters WHERE tank_id = $1 AND date = $2", [tank.id, dateTs]);
+                    const existing = existingRes.rows[0];
+                    const cwsHardness = existing ? existing.cws_hardness || 0 : 0;
+                    const makeupHardness = existing ? existing.makeup_hardness || 0 : 0;
+                    const cycles = makeupHardness > 0 ? cwsHardness / makeupHardness : 1;
+                    if (existing) {
+                        await pool.query("UPDATE cws_parameters SET circulation_rate=$1, temp_outlet=$2, temp_return=$3, temp_diff=$4, concentration_cycles=$5, updated_at=NOW() WHERE id=$6",
+                            [data.circulationRate, data.tempOutlet, data.tempReturn, data.tempDiff, cycles, existing.id]);
+                    } else {
+                        await pool.query("INSERT INTO cws_parameters (id, tank_id, date, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                            [crypto.randomUUID(), tank.id, dateTs, data.circulationRate, data.tempOutlet, data.tempReturn, data.tempDiff, cwsHardness, makeupHardness, cycles]);
+                    }
+                }
+            };
+            await saveCwsArea(ct1Tanks, 'CT-1');
+            await saveCwsArea(ct2Tanks, 'CT-2');
+            logs.push('  Week ' + week.start.toLocaleDateString() + ': Updated CWS data');
+            if (totalErrors > 0) {
+                summary.push(`⚠️ CWS ${week.start.toLocaleDateString()}: ${totalErrors} errors`);
+            } else {
+                summary.push(`💧 CWS ${week.start.toLocaleDateString()}: Updated OK`);
+            }
+        }
+
+        const message = summary.length > 0 ? `✅ PI Import Success\n` + summary.join('\n') : `✅ PI Import Success (No data processed)`;
+        res.json({ success: true, logs, message });
+    } catch (error) {
+        console.error('PI Import Error:', error);
+        logs.push('CRITICAL ERROR: ' + error.message);
+        res.status(500).json({ success: false, error: error.message, logs, message: `❌ PI Import Failed: ${error.message}` });
+    }
+});
 
 
 // ==================== User Identity API ====================

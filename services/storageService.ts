@@ -2,12 +2,38 @@
 // 保持原有的介面，但底層改用 PostgreSQL API
 
 import * as API from './apiService';
-import { Tank, Reading, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote } from '../types';
+import { Tank, Reading, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, FluctuationAlert } from '../types';
 
 export class StorageService {
     // 初始化 - 不再需要，但保留介面相容性
     static init() {
-        console.log('StorageService initialized (using PostgreSQL backend)');
+        console.log('StorageService init (API mode)');
+    }
+
+    // ==================== App Settings ====================
+    static async getAppSettings(): Promise<any> {
+        const result = await API.fetchAppSettings();
+        // If API returns an array of {key, value}, convert it to an object
+        if (Array.isArray(result)) {
+            const settings: any = {};
+            result.forEach((item: any) => {
+                if (item.key && item.value !== undefined) {
+                    // If value is a JSON string (as seen in the screenshot where value type is jsonb but displayed with quotes), 
+                    // it might be auto-parsed by pg/node, or might need parsing?
+                    // The DB screenshot shows value column as 'jsonb'.
+                    // If the API returns it as matched JSON, it's fine. 
+                    // If the backend returns it exactly as in DB, it's a value.
+                    // Let's assume the value is directly usable or we treat it as is.
+                    settings[item.key] = item.value;
+                }
+            });
+            return settings;
+        }
+        return result;
+    }
+
+    static async saveAppSettings(settings: any): Promise<void> {
+        await API.saveAppSettings(settings);
     }
 
     // ==================== Tanks ====================
@@ -360,6 +386,8 @@ export class StorageService {
         }
     }
 
+
+
     // ==================== Conversion Helpers ====================
 
     private static convertTankFromAPI(apiTank: any): Tank {
@@ -529,6 +557,108 @@ export class StorageService {
             area: note.area,
             chemical_name: note.chemicalName,
             note: note.note
+        };
+    }
+    // ==================== Fluctuation Alerts ====================
+    static async getAlerts(): Promise<FluctuationAlert[]> {
+        try {
+            const alerts = await API.fetchAlerts();
+            const parsedAlerts = alerts.map(a => StorageService.convertAlertFromAPI(a));
+
+            return parsedAlerts.sort((a, b) => {
+                // Primary sort: Date String (Descending)
+                const dateA = new Date(a.dateStr).getTime();
+                const dateB = new Date(b.dateStr).getTime();
+                if (dateA !== dateB) {
+                    return dateB - dateA;
+                }
+                // Secondary sort: Creation Time (Descending)
+                const createdA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+                const createdB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+                return createdB - createdA;
+            });
+        } catch (err) {
+            console.error('Failed to get alerts:', err);
+            return [];
+        }
+    }
+
+    static async saveAlert(alert: Partial<FluctuationAlert>): Promise<void> {
+        try {
+            await API.createAlert(StorageService.convertAlertToAPI(alert));
+        } catch (err) {
+            console.error('Failed to save alert:', err);
+            throw err;
+        }
+    }
+
+    static async saveAlertsBatch(alerts: Partial<FluctuationAlert>[]): Promise<void> {
+        try {
+            const apiAlerts = alerts.map(a => StorageService.convertAlertToAPI(a));
+            await API.createAlertsBatch(apiAlerts);
+        } catch (err) {
+            console.error('Failed to save alerts batch:', err);
+            throw err;
+        }
+    }
+
+    static async updateAlertNote(id: string, note: string): Promise<void> {
+        try {
+            await API.updateAlert(id, note);
+        } catch (err) {
+            console.error('Failed to update alert note:', err);
+            throw err;
+        }
+    }
+
+    static async deleteAlert(id: string): Promise<void> {
+        try {
+            await API.deleteAlert(id);
+        } catch (err) {
+            console.error('Failed to delete alert:', err);
+            throw err;
+        }
+    }
+
+    static async deleteAlertsBatch(ids: string[]): Promise<void> {
+        try {
+            await API.deleteAlertsBatch(ids);
+        } catch (err) {
+            console.error('Failed to batch delete alerts:', err);
+            throw err;
+        }
+    }
+
+    private static convertAlertFromAPI(apiAlert: any): FluctuationAlert {
+        return {
+            id: apiAlert.id,
+            tankId: apiAlert.tank_id,
+            tankName: apiAlert.tank_name,
+            dateStr: apiAlert.date_str,
+            reason: apiAlert.reason,
+            currentValue: apiAlert.current_value ? parseFloat(apiAlert.current_value) : undefined,
+            prevValue: apiAlert.prev_value ? parseFloat(apiAlert.prev_value) : undefined,
+            nextValue: apiAlert.next_value ? parseFloat(apiAlert.next_value) : undefined,
+            isPossibleRefill: apiAlert.is_possible_refill,
+            source: apiAlert.source,
+            note: apiAlert.note,
+            createdAt: apiAlert.created_at
+        };
+    }
+
+    private static convertAlertToAPI(alert: Partial<FluctuationAlert>): any {
+        return {
+            id: alert.id,
+            tank_id: alert.tankId,
+            tank_name: alert.tankName,
+            date_str: alert.dateStr,
+            reason: alert.reason,
+            current_value: alert.currentValue,
+            prev_value: alert.prevValue,
+            next_value: alert.nextValue,
+            is_possible_refill: alert.isPossibleRefill,
+            source: alert.source,
+            note: alert.note
         };
     }
 }
