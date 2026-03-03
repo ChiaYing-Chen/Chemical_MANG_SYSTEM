@@ -5,7 +5,7 @@ export enum SystemType {
   DENOX = '脫銷系統'
 }
 
-export type InputUnit = 'CM' | 'PERCENT';
+export type InputUnit = 'CM' | 'PERCENT' | 'LIQUID_PERCENT';
 
 export type ShapeType = 'VERTICAL_CYLINDER' | 'HORIZONTAL_CYLINDER' | 'RECTANGULAR';
 export type HeadType = 'FLAT' | 'HEMISPHERICAL' | 'SEMI_ELLIPTICAL_2_1';
@@ -77,6 +77,8 @@ export interface Tank {
   bwsParams?: BWSParameterRecord;
 
   inputUnit?: InputUnit; // 'CM' or 'PERCENT'
+
+  piPercentFactor?: number; // 每 1% 對應的公分數（LIQUID_PERCENT 模式使用，例如 CT-1 高度 300cm → 3.0）
 
   sortOrder?: number;
 

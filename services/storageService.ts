@@ -245,7 +245,7 @@ export class StorageService {
     }
 
     // New: History
-    static async getCWSParamsHistory(tankId: string): Promise<CWSParameterRecord[]> {
+    static async getCWSParamsHistory(tankId?: string): Promise<CWSParameterRecord[]> {
         try {
             const history = await API.fetchCWSParamsHistory(tankId);
             return history.map((p: any) => StorageService.convertCWSParamFromAPI(p));
@@ -409,7 +409,8 @@ export class StorageService {
             inputUnit: apiTank.input_unit || 'CM',
             validationThreshold: apiTank.validation_threshold ? parseFloat(apiTank.validation_threshold) : 30,
             sgRangeMin: apiTank.sg_range_min ? parseFloat(apiTank.sg_range_min) : undefined,
-            sgRangeMax: apiTank.sg_range_max ? parseFloat(apiTank.sg_range_max) : undefined
+            sgRangeMax: apiTank.sg_range_max ? parseFloat(apiTank.sg_range_max) : undefined,
+            piPercentFactor: apiTank.pi_percent_factor ? parseFloat(apiTank.pi_percent_factor) : undefined
         };
     }
 
@@ -430,7 +431,8 @@ export class StorageService {
             input_unit: tank.inputUnit,
             validation_threshold: tank.validationThreshold ?? 30,
             sg_range_min: tank.sgRangeMin,
-            sg_range_max: tank.sgRangeMax
+            sg_range_max: tank.sgRangeMax,
+            pi_percent_factor: tank.piPercentFactor ?? null
         };
     }
 

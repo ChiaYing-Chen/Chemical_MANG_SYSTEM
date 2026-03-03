@@ -208,8 +208,9 @@ export const fetchCWSParams = async (tankId: string): Promise<any> => {
 };
 
 // New: Fetch CWS History
-export const fetchCWSParamsHistory = async (tankId: string): Promise<any> => {
-    const response = await fetch(`${API_BASE_URL}/cws-params/history/${tankId}`);
+export const fetchCWSParamsHistory = async (tankId?: string): Promise<any> => {
+    const targetId = tankId || 'all';
+    const response = await fetch(`${API_BASE_URL}/cws-params/history/${targetId}`);
     if (!response.ok) throw new Error('Failed to fetch CWS params history');
     return await response.json();
 };
@@ -235,8 +236,8 @@ export const updateCWSParams = async (params: any): Promise<any> => {
     return await response.json();
 };
 
-export const deleteCWSParams = async (tankId: string): Promise<any> => {
-    const response = await fetch(`${API_BASE_URL}/cws-params/${tankId}`, {
+export const deleteCWSParams = async (id: string): Promise<any> => {
+    const response = await fetch(`${API_BASE_URL}/cws-params/${id}`, {
         method: 'DELETE'
     });
     if (!response.ok) throw new Error('Failed to delete CWS params');

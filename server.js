@@ -5,6 +5,7 @@ import fetch from 'node-fetch';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
+import crypto from 'crypto';
 // ... (skip down to proxy imports/setup if needed, but cleanest to add import at top)
 
 // ...
@@ -567,7 +568,7 @@ app.post('/api/pi-import', async (req, res) => {
                     const existing = existingRes.rows[0];
                     const cwsHardness = existing ? existing.cws_hardness || 0 : 0;
                     const makeupHardness = existing ? existing.makeup_hardness || 0 : 0;
-                    const cycles = makeupHardness > 0 ? cwsHardness / makeupHardness : 1;
+                    const cycles = makeupHardness > 0 ? cwsHardness / makeupHardness : (existing ? (existing.concentration_cycles || 8) : 8);
                     if (existing) {
                         await pool.query("UPDATE cws_parameters SET circulation_rate=$1, temp_outlet=$2, temp_return=$3, temp_diff=$4, concentration_cycles=$5, updated_at=NOW() WHERE id=$6",
                             [data.circulationRate, data.tempOutlet, data.tempReturn, data.tempDiff, cycles, existing.id]);
@@ -646,18 +647,26 @@ app.post('/api/import/cws-weekly', async (req, res) => {
 
         // 3. Helper to Upsert
         const upsertTank = async (tank, hardnessValue) => {
-            const cycles = makeupHardness > 0 ? hardnessValue / makeupHardness : 0;
+            const cycles = makeupHardness > 0 ? hardnessValue / makeupHardness : 8;
+            const entryDateObj = new Date(Number(date));
 
-            // Check existing record
-            const existingRes = await pool.query("SELECT * FROM cws_parameters WHERE tank_id = $1 AND date = $2", [tank.id, date]);
-            const existing = existingRes.rows[0];
+            // Fetch all records for this tank to find same-day collisions
+            const allRes = await pool.query("SELECT * FROM cws_parameters WHERE tank_id = $1", [tank.id]);
+            const existingSameDay = allRes.rows.filter(r => {
+                const rDate = new Date(Number(r.date));
+                return rDate.getFullYear() === entryDateObj.getFullYear() &&
+                    rDate.getMonth() === entryDateObj.getMonth() &&
+                    rDate.getDate() === entryDateObj.getDate();
+            });
 
-            if (existing) {
+            if (existingSameDay.length > 0) {
                 // Update only hardness/cycles, keep others
-                await pool.query(
-                    "UPDATE cws_parameters SET cws_hardness=$1, makeup_hardness=$2, concentration_cycles=$3, updated_at=NOW() WHERE id=$4",
-                    [hardnessValue, makeupHardness, cycles, existing.id]
-                );
+                for (const existing of existingSameDay) {
+                    await pool.query(
+                        "UPDATE cws_parameters SET cws_hardness=$1, makeup_hardness=$2, concentration_cycles=$3, updated_at=NOW() WHERE id=$4",
+                        [hardnessValue, makeupHardness, cycles, existing.id]
+                    );
+                }
                 logs.push(`Updated ${tank.name}`);
             } else {
                 // Insert new with 0 for others
@@ -681,7 +690,65 @@ app.post('/api/import/cws-weekly', async (req, res) => {
     }
 });
 
+// ==================== App Settings APIs ====================
+
+// 取得所有設定
+app.get('/api/settings', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT key, value FROM app_settings');
+        res.json(result.rows);
+    } catch (err) {
+        // 若 app_settings 資料表不存在，則回傳空陣列（避免 UI 初始化失敗）
+        if (err.code === '42P01') {
+            return res.json([]);
+        }
+        console.error('GET /api/settings error:', err.message);
+        res.status(500).json({ error: '取得設定失敗', details: err.message });
+    }
+});
+
+// 儲存設定（將整個 settings 物件寫入 app_settings 資料表）
+app.post('/api/settings', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const settings = req.body;
+        if (!settings || typeof settings !== 'object') {
+            return res.status(400).json({ error: '請求 body 須為 JSON 物件' });
+        }
+
+        // 確保 app_settings 資料表存在
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value JSONB,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await client.query('BEGIN');
+        for (const [key, value] of Object.entries(settings)) {
+            await client.query(
+                `INSERT INTO app_settings (key, value, updated_at)
+                 VALUES ($1, $2::jsonb, NOW())
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+                [key, JSON.stringify(value)]
+            );
+        }
+        await client.query('COMMIT');
+
+        const rows = await client.query('SELECT key, value FROM app_settings');
+        res.json(rows.rows);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/settings error:', err.message);
+        res.status(500).json({ error: '儲存設定失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 // ==================== Tank APIs ====================
+
 
 // 取得所有儲槽
 app.get('/api/tanks', async (req, res) => {
@@ -808,11 +875,11 @@ app.get('/api/tanks/:id', async (req, res) => {
 // 新增儲槽
 app.post('/api/tanks', async (req, res) => {
     try {
-        const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold } = req.body;
+        const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold, pi_percent_factor } = req.body;
         const result = await pool.query(
-            `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold, sg_range_min, sg_range_max)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *`,
-            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level || 20.0, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max]
+            `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold, sg_range_min, sg_range_max, pi_percent_factor)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`,
+            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level || 20.0, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max, pi_percent_factor ?? null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -824,19 +891,20 @@ app.post('/api/tanks', async (req, res) => {
 app.put('/api/tanks/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold } = req.body;
+        const { name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold, pi_percent_factor } = req.body;
 
         // DEBUG LOG
         console.log('=== PUT /api/tanks/:id DEBUG ===');
         console.log('Tank ID:', id);
         console.log('Received validation_threshold:', validation_threshold);
+        console.log('Received pi_percent_factor:', pi_percent_factor);
         console.log('Full request body:', JSON.stringify(req.body, null, 2));
 
         const result = await pool.query(
             `UPDATE tanks SET name=$2, system_type=$3, capacity_liters=$4, geo_factor=$5, description=$6, 
-       safe_min_level=$7, target_daily_usage=$8, calculation_method=$9, sort_order=$10, shape_type=$11, dimensions=$12, input_unit=$13, validation_threshold=$14, sg_range_min=$15, sg_range_max=$16
+       safe_min_level=$7, target_daily_usage=$8, calculation_method=$9, sort_order=$10, shape_type=$11, dimensions=$12, input_unit=$13, validation_threshold=$14, sg_range_min=$15, sg_range_max=$16, pi_percent_factor=$17
        WHERE id=$1 RETURNING *`,
-            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max]
+            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max, pi_percent_factor ?? null]
         );
 
         console.log('Update result:', result.rows[0]);
@@ -1317,7 +1385,13 @@ app.get('/api/cws-params/:tankId', async (req, res) => {
 app.get('/api/cws-params/history/:tankId', async (req, res) => {
     try {
         const { tankId } = req.params;
-        const result = await pool.query('SELECT * FROM cws_parameters WHERE tank_id = $1 ORDER BY updated_at DESC NULLS LAST', [tankId]);
+        let query = 'SELECT * FROM cws_parameters ORDER BY updated_at DESC NULLS LAST';
+        let params = [];
+        if (tankId && tankId !== 'all') {
+            query = 'SELECT * FROM cws_parameters WHERE tank_id = $1 ORDER BY updated_at DESC NULLS LAST';
+            params = [tankId];
+        }
+        const result = await pool.query(query, params);
         res.json(result.rows);
     } catch (err) {
         console.error(err);
@@ -1881,25 +1955,41 @@ app.post('/api/alerts/batch', async (req, res) => {
     const client = await pool.connect();
     try {
         const { alerts } = req.body;
+
+        // === 詳細日誌：印出收到的資料 ===
+        console.log(`[POST /api/alerts/batch] 收到 ${alerts?.length ?? 'undefined'} 筆資料`);
+        if (!alerts || !Array.isArray(alerts) || alerts.length === 0) {
+            return res.status(400).json({ error: '請求 body 中缺少 alerts 陣列，或陣列為空' });
+        }
+
         await client.query('BEGIN');
 
         const results = [];
         for (const alert of alerts) {
             const { id, tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill, source, note } = alert;
+
+            // 逐筆印出插入參數，協助診斷
+            console.log(`[Batch Insert Alert] tank_id="${tank_id}", date_str="${date_str}", reason="${reason}", source="${source}"`);
+
             const result = await client.query(
                 `INSERT INTO fluctuation_alerts (id, tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill, source, note)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-                [id || crypto.randomUUID(), tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill || false, source || 'MANUAL', note]
+                [id || crypto.randomUUID(), tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill || false, source || 'MANUAL', note || '']
             );
             results.push(result.rows[0]);
         }
 
         await client.query('COMMIT');
+        console.log(`[POST /api/alerts/batch] 成功插入 ${results.length} 筆`);
         res.status(201).json({ count: results.length, data: results });
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('POST /api/alerts/batch error:', err);
-        res.status(500).json({ error: '批次新增警報失敗', details: err.message });
+        console.error('POST /api/alerts/batch error:', err.message);
+        console.error('  code:', err.code);
+        console.error('  detail:', err.detail);
+        console.error('  hint:', err.hint);
+        console.error('  stack:', err.stack);
+        res.status(500).json({ error: '批次新增警報失敗', details: err.message, code: err.code });
     } finally {
         client.release();
     }

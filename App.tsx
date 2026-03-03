@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { StorageService } from './services/storageService';
+import * as API from './services/apiService';
 import { calculateTankVolume } from './utils/calculationUtils';
 import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType, FluctuationAlert } from './types';
 import { Icons } from './components/Icons';
@@ -223,8 +224,9 @@ const TankStatusCard: React.FC<{
     dragProps?: any,
     onNavigate?: (tankId: string) => void,
     onDeliveryClick?: (tank: any) => void,
+    onLevelClick?: (tank: any) => void,
     lowLevelWarningText?: string
-}> = ({ tank, dragProps, onNavigate, onDeliveryClick, lowLevelWarningText = '存量偏低，請叫藥' }) => {
+}> = ({ tank, dragProps, onNavigate, onDeliveryClick, onLevelClick, lowLevelWarningText = '存量偏低，請叫藥' }) => {
 
     const handleCardClick = () => {
         if (onNavigate) {
@@ -285,8 +287,11 @@ const TankStatusCard: React.FC<{
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 text-xs border-t border-slate-50 pt-2">
-                    <div>
-                        <span className="text-slate-400 block">液位 (H)</span>
+                    <div
+                        className={onLevelClick ? "cursor-pointer group" : ""}
+                        onClick={onLevelClick ? (e) => { e.stopPropagation(); onLevelClick(tank); } : undefined}
+                    >
+                        <span className={`block transition-colors ${onLevelClick ? 'text-brand-500 group-hover:text-brand-600 font-medium' : 'text-slate-400'}`}>液位 (H) {onLevelClick && '📈'}</span>
                         <span className="font-medium text-slate-700">
                             {tank.lastReading?.levelCm || 0} cm
                             {tank.inputUnit === 'PERCENT' && tank.dimensions && (tank.dimensions.diameter || tank.dimensions.height) ? (
@@ -490,8 +495,124 @@ const DeliveryEstimationModal: React.FC<{
     );
 };
 
+// LiquidLevelTrendModal Component
+const LiquidLevelTrendModal: React.FC<{
+    tank: any;
+    onClose: () => void;
+}> = ({ tank, onClose }) => {
+    const [data, setData] = useState<any[]>([]);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        let isMounted = true;
+        const fetchData = async () => {
+            setLoading(true);
+            try {
+                // Fetch readings for this tank
+                const readings = await API.fetchReadings(tank.id);
+
+                if (!isMounted) return;
+
+                // Process data for the last 60 days
+                const now = new Date();
+                const processedData = [];
+
+                // Group readings by date string (YYYY-MM-DD)
+                const readingsByDate = new Map<string, number>();
+                readings.forEach((r: any) => {
+                    const ts = typeof r.timestamp === 'string' ? parseInt(r.timestamp, 10) : r.timestamp;
+                    const d = new Date(ts);
+                    const offset = d.getTimezoneOffset();
+                    const localDate = new Date(d.getTime() - (offset * 60 * 1000));
+                    const dateStr = localDate.toISOString().split('T')[0];
+
+                    // API returns sorted DESC, so first occurrence is the latest of that day
+                    if (!readingsByDate.has(dateStr)) {
+                        readingsByDate.set(dateStr, parseFloat(r.level_cm));
+                    }
+                });
+
+                // Generate 60 days array
+                for (let i = 59; i >= 0; i--) {
+                    const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+                    const offset = d.getTimezoneOffset();
+                    const localDate = new Date(d.getTime() - (offset * 60 * 1000));
+                    const dateStr = localDate.toISOString().split('T')[0];
+                    const shortDateStr = `${localDate.getMonth() + 1}/${localDate.getDate()}`; // MM/DD
+
+                    processedData.push({
+                        date: shortDateStr,
+                        fullDate: dateStr,
+                        level: readingsByDate.get(dateStr) ?? null
+                    });
+                }
+
+                setData(processedData);
+            } catch (error) {
+                console.error('Failed to fetch trend data', error);
+            } finally {
+                if (isMounted) setLoading(false);
+            }
+        };
+        fetchData();
+        return () => { isMounted = false; };
+    }, [tank.id]);
+
+    return (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+            <div className="bg-white rounded-xl shadow-2xl max-w-4xl w-full mx-4 overflow-hidden flex flex-col h-[70vh]" onClick={e => e.stopPropagation()}>
+                <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex justify-between items-center">
+                    <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                        📈 {tank.name} - 過去 60 天液位趨勢
+                    </h2>
+                    <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-2xl font-semibold leading-none">&times;</button>
+                </div>
+                <div className="p-6 flex-1 min-h-0 relative">
+                    {loading && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10 text-brand-600 font-medium">
+                            載入中...
+                        </div>
+                    )}
+                    <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={data} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+                            <XAxis
+                                dataKey="date"
+                                tick={{ fontSize: 12, fill: '#64748b' }}
+                                tickMargin={10}
+                                minTickGap={20}
+                            />
+                            <YAxis
+                                domain={['auto', 'auto']}
+                                tick={{ fontSize: 12, fill: '#64748b' }}
+                                label={{ value: '液位 (cm)', angle: -90, position: 'insideLeft', offset: 15, style: { fill: '#64748b' } }}
+                            />
+                            <Tooltip
+                                contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                                labelFormatter={(label, payload) => payload && payload.length > 0 ? payload[0].payload.fullDate : label}
+                                formatter={(value: number) => [`${value} cm`, '液位']}
+                            />
+                            <Line
+                                type="monotone"
+                                dataKey="level"
+                                stroke="#3b82f6"
+                                strokeWidth={2}
+                                dot={{ r: 3, fill: '#3b82f6', strokeWidth: 0 }}
+                                activeDot={{ r: 5, strokeWidth: 0 }}
+                                connectNulls={true}
+                                animationDuration={500}
+                            />
+                        </LineChart>
+                    </ResponsiveContainer>
+                </div>
+            </div>
+        </div>
+    );
+};
+
 const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onNavigate?: (tankId: string, month: number, year: number) => void, onLoading?: (loading: boolean) => void, usageCalcWeeks?: number, lowLevelWarningText?: string }> = ({ tanks, readings, onRefresh, onNavigate, onLoading, usageCalcWeeks = 8, lowLevelWarningText = '存量偏低，請叫藥' }) => {
     const [deliveryModalTank, setDeliveryModalTank] = useState<any>(null);
+    const [trendModalTank, setTrendModalTank] = useState<any>(null);
 
     const tanksWithStatus = useMemo(() => {
         const weeksAgo = Date.now() - usageCalcWeeks * 7 * 24 * 60 * 60 * 1000;
@@ -696,6 +817,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                     tank={t}
                                     onNavigate={handleNavigate}
                                     onDeliveryClick={setDeliveryModalTank}
+                                    onLevelClick={setTrendModalTank}
                                     lowLevelWarningText={lowLevelWarningText}
                                     dragProps={{
                                         draggable: true,
@@ -719,6 +841,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                     tank={t}
                                     onNavigate={handleNavigate}
                                     onDeliveryClick={setDeliveryModalTank}
+                                    onLevelClick={setTrendModalTank}
                                     lowLevelWarningText={lowLevelWarningText}
                                     dragProps={{
                                         draggable: true,
@@ -746,7 +869,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} lowLevelWarningText={lowLevelWarningText} />)}
+                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -763,7 +886,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 gap-4">
-                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} lowLevelWarningText={lowLevelWarningText} />)}
+                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -777,7 +900,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} lowLevelWarningText={lowLevelWarningText} />)}
+                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -788,6 +911,14 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                 <DeliveryEstimationModal
                     tank={deliveryModalTank}
                     onClose={() => setDeliveryModalTank(null)}
+                />
+            )}
+
+            {/* Trend Modal */}
+            {trendModalTank && (
+                <LiquidLevelTrendModal
+                    tank={trendModalTank}
+                    onClose={() => setTrendModalTank(null)}
                 />
             )}
         </div>
@@ -804,7 +935,7 @@ const DataEntryView: React.FC<{
     appSettings: any;
 }> = ({ tanks, readings, onSave, onBatchSave, onUpdateTank, onLoading, appSettings }) => {
     const [selectedTankId, setSelectedTankId] = useState<string>('');
-    const [date, setDate] = useState<string>(new Date().toISOString().split('T')[0]);
+    const [date, setDate] = useState<string>((() => { const d = new Date(); d.setDate(d.getDate() - 1); return d.toISOString().split('T')[0]; })());
     // Batch Levels for Type A
     const [batchLevels, setBatchLevels] = useState<{ [key: string]: string }>({});
     const [activeType, setActiveType] = useState<'A' | 'B' | 'C' | 'D'>('A');
@@ -822,6 +953,128 @@ const DataEntryView: React.FC<{
     const [pendingReadings, setPendingReadings] = useState<Reading[]>([]);
     const [convertedCountInfo, setConvertedCountInfo] = useState<number>(0);
 
+    const checkAnomalies = (newReadings: Reading[]): ImportAnomaly[] => {
+        const anomalies: ImportAnomaly[] = [];
+
+        // Group by tank for validation
+        const tankGroups = new Map<string, Reading[]>();
+        newReadings.forEach(r => {
+            if (!tankGroups.has(r.tankId)) tankGroups.set(r.tankId, []);
+            tankGroups.get(r.tankId)!.push(r);
+        });
+
+        tankGroups.forEach((tankNewReadings, tankId) => {
+            const tank = tanks.find(t => t.id === tankId);
+            if (!tank) return;
+
+            // Combine existing + new readings for this tank, sorted by date
+            const existingTankReadings = readings
+                .filter(r => r.tankId === tankId)
+                .sort((a, b) => a.timestamp - b.timestamp);
+
+            // Merge for analysis
+            // Note: newReadings might overwrite existing ones on same day.
+            // We need a consolidated list where same-day readings are replaced by new ones.
+            const consolidatedMap = new Map<number, Reading>();
+            existingTankReadings.forEach(r => consolidatedMap.set(r.timestamp, r));
+            tankNewReadings.forEach(r => consolidatedMap.set(r.timestamp, r));
+
+            const allReadings = Array.from(consolidatedMap.values())
+                .sort((a, b) => a.timestamp - b.timestamp);
+
+            // Calculate tank capacity for threshold (use volume if available)
+            // Priority: 1. Defined Capacity -> 2. Calculated from Height -> 3. Default
+            let tankCapacity = tank.capacityLiters > 0 ? tank.capacityLiters : 0;
+            if (tankCapacity === 0 && tank.dimensions?.height) {
+                tankCapacity = calculateTankVolume(tank, tank.dimensions.height);
+            }
+            if (tankCapacity === 0) tankCapacity = 10000; // Default 10000L if unknown
+            const thresholdPercent = tank.validationThreshold ?? 30; // Use tank setting or default 30%
+            const dailyThreshold = tankCapacity * (thresholdPercent / 100);
+
+            // Check each new reading against its predecessor/successor
+            for (const newReading of tankNewReadings) {
+                const idx = allReadings.findIndex(r => r.id === newReading.id);
+                if (idx === -1) continue;
+
+                let anomalyReason = null;
+                const prev = idx > 0 ? allReadings[idx - 1] : null;
+                const next = idx < allReadings.length - 1 ? allReadings[idx + 1] : null;
+
+                // 1. Check vs Prev
+                if (prev) {
+                    const daysDiff = (newReading.timestamp - prev.timestamp) / (1000 * 60 * 60 * 24);
+                    if (daysDiff > 0) {
+                        const addedAmount = newReading.addedAmountLiters || 0;
+                        const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
+                        const dailyChange = Math.abs(levelChange) / daysDiff;
+
+                        if (dailyChange > dailyThreshold) {
+                            // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
+                            const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
+                            // Use SG from the reading to display Kg
+                            const sg = newReading.appliedSpecificGravity || 1.0;
+                            const dailyChangeKg = dailyChange * sg;
+                            const dailyThresholdKg = dailyThreshold * sg;
+
+                            console.log('[AnomalyCheck]', {
+                                tank: tank.name,
+                                isPossibleRefill,
+                                settings: appSettings,
+                                refillText: appSettings?.possibleRefillText,
+                                warnText: appSettings?.thresholdWarningText
+                            });
+
+                            if (isPossibleRefill) {
+                                const warnText = appSettings?.possibleRefillText || '可能為補藥紀錄';
+                                anomalyReason = formatAnomalyMessage(warnText, {
+                                    text: '可能為補藥紀錄',
+                                    diff: dailyChangeKg.toFixed(0),
+                                    limit: dailyThresholdKg.toFixed(0),
+                                    unit: 'kg'
+                                });
+                            } else {
+                                const warnText = appSettings?.thresholdWarningText || '液位變化異常，請確認 ({diff} {unit} > {limit} {unit})';
+                                anomalyReason = formatAnomalyMessage(warnText, {
+                                    text: '液位變化異常，請確認',
+                                    diff: dailyChangeKg.toFixed(0),
+                                    limit: dailyThresholdKg.toFixed(0),
+                                    unit: 'kg'
+                                });
+                            }
+
+                            anomalies.push({
+                                id: newReading.id,
+                                tankId: tank.id,
+                                date: new Date(newReading.timestamp).toLocaleDateString(),
+                                tankName: tank.name,
+                                reason: anomalyReason,
+                                currentValue: newReading.calculatedVolume,
+                                prevDate: prev ? new Date(prev.timestamp).toLocaleDateString() : undefined,
+                                prevValue: prev ? prev.calculatedVolume : undefined,
+                                nextDate: next ? new Date(next.timestamp).toLocaleDateString() : undefined,
+                                nextValue: next ? next.calculatedVolume : undefined,
+                                isPossibleRefill
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        // 排序異常列表：先按日期，再按儲槽名稱
+        anomalies.sort((a, b) => {
+            // 先按日期排序
+            const dateA = new Date(a.date.replace(/\//g, '-')).getTime();
+            const dateB = new Date(b.date.replace(/\//g, '-')).getTime();
+            if (dateA !== dateB) return dateA - dateB;
+            // 日期相同則按儲槽名稱排序
+            return a.tankName.localeCompare(b.tankName, 'zh-TW');
+        });
+
+        return anomalies;
+    };
+
     const handleConfirmImport = async () => {
         if (pendingReadings.length === 0) return;
 
@@ -830,12 +1083,20 @@ const DataEntryView: React.FC<{
             // Save Anomalies as Alerts
             if (importAnomalies.length > 0) {
                 const alertsToSave: Partial<FluctuationAlert>[] = importAnomalies.map(anomaly => {
-                    // Find tank ID
-                    const tank = tanks.find(t => t.name === anomaly.tankName);
+                    // 將 toLocaleDateString() 產生的非標準日期（例如 2026/2/26）
+                    // 轉換為標準 ISO 格式 YYYY-MM-DD（月和日需補零）
+                    const parsedDate = new Date(anomaly.date.replace(/\//g, '-'));
+                    const isoDateStr = isNaN(parsedDate.getTime())
+                        ? anomaly.date.replace(/\//g, '-') // fallback
+                        : parsedDate.toISOString().split('T')[0]; // 確保 YYYY-MM-DD
+
+                    // 直接使用 anomaly.tankId（由 Excel 匯入處直接設定），作為第一優先
+                    // 若 anomaly.tankId 不存在，再透過名稱查找
+                    const tank = tanks.find(t => t.id === anomaly.tankId || t.name === anomaly.tankName);
                     return {
-                        tankId: tank?.id || 'UNKNOWN',
+                        tankId: anomaly.tankId || tank?.id || '',
                         tankName: anomaly.tankName,
-                        dateStr: anomaly.date.replace(/\//g, '-'), // Ensure YYYY-MM-DD
+                        dateStr: isoDateStr,
                         reason: anomaly.reason,
                         currentValue: anomaly.currentValue,
                         prevValue: anomaly.prevValue,
@@ -850,11 +1111,9 @@ const DataEntryView: React.FC<{
 
             if (anomalySource === 'MANUAL') {
                 // Manual Entry Saving
-                if (pendingReadings.length === 1) {
-                    await onSave(pendingReadings[0]);
-
-                    alert('Table A: 液位紀錄已儲存');
-                }
+                await onBatchSave(pendingReadings);
+                setBatchLevels({}); // Clear manual inputs
+                alert(`已成功儲存 ${pendingReadings.length} 筆液位紀錄`);
             } else {
                 // Import Saving
                 await onBatchSave(pendingReadings);
@@ -1123,19 +1382,17 @@ const DataEntryView: React.FC<{
 
     // Fetch History Effect
     const loadHistory = useCallback(async () => {
-        if (!selectedTankId) return;
-
-        // Always fetch ALL history types for the selected tank to ensure Analysis charts work correctly
-        // regardless of which "Manual Entry" tab is active.
         try {
-            // Type B (Global or Filtered? Service gets all, we sort/filter here)
+            // Unconditional fetches for global data
+            const allCwsData = await StorageService.getCWSParamsHistory();
+            setHistoryCWS(allCwsData);
+
+            if (!selectedTankId) return;
+
+            // Type B (Filtered)
             const supplies = await StorageService.getSupplies();
             const filteredSupplies = supplies.filter(s => s.tankId === selectedTankId);
             setHistorySupplies(filteredSupplies.sort((a, b) => b.startDate - a.startDate));
-
-            // Type C
-            const cwsData = await StorageService.getCWSParamsHistory(selectedTankId);
-            setHistoryCWS(cwsData);
 
             // Type D
             const bwsData = await StorageService.getBWSParamsHistory(selectedTankId);
@@ -1295,9 +1552,8 @@ const DataEntryView: React.FC<{
 
         onLoading(true);
         try {
-            let savedCount = 0;
-            // Pre-fetch supplies map could be optimizing, but sequentially is safer/easier for now
             const timestamp = new Date(date).getTime();
+            const newReadings: Reading[] = [];
 
             for (const [tId, valStr] of entries) {
                 if (!valStr) continue;
@@ -1314,14 +1570,19 @@ const DataEntryView: React.FC<{
 
                 // Unit Conversion
                 if (tank.inputUnit === 'PERCENT') {
-                    // Meters Input -> cm
+                    // 公尺 → 公分（CT-1 舊模式，維持不動）
                     finalLevelCm = finalLevelCm * 100;
+                } else if (tank.inputUnit === 'LIQUID_PERCENT') {
+                    // 百分比（0-100%）→ 公分，使用可設定的換算係數
+                    // 係數預設 = 桶槽高度 / 100（線性估算）
+                    const factor = tank.piPercentFactor ?? ((tank.dimensions?.height ?? 100) / 100);
+                    finalLevelCm = finalLevelCm * factor;
                 }
 
                 const vol = calculateTankVolume(tank, finalLevelCm);
                 const weight = vol * finalSG;
 
-                const newReading: Reading = {
+                newReadings.push({
                     id: generateUUID(),
                     tankId: tId,
                     timestamp: timestamp,
@@ -1332,17 +1593,28 @@ const DataEntryView: React.FC<{
                     supplyId: activeSup?.id,
                     addedAmountLiters: 0, // No refill calc in batch manual
                     operatorName: operator
-                };
-
-                await onSave(newReading);
-                savedCount++;
+                });
             }
 
-            setBatchLevels({}); // Clear inputs
-            alert(`已成功儲存 ${savedCount} 筆液位紀錄`);
+            if (newReadings.length > 0) {
+                const anomalies = checkAnomalies(newReadings);
+
+                if (anomalies.length > 0) {
+                    setImportAnomalies(anomalies);
+                    setPendingReadings(newReadings);
+                    setAnomalySource('MANUAL');
+                    setShowAnomalyModal(true);
+                    onLoading(false); // Stop loading to show modal
+                    return; // Wait for user confirmation
+                }
+
+                await onBatchSave(newReadings);
+                setBatchLevels({}); // Clear inputs
+                alert(`已成功儲存 ${newReadings.length} 筆液位紀錄`);
+            }
         } catch (e) {
             console.error(e);
-            alert('批次儲存部分或全部失敗');
+            alert('儲存處理過程中發生錯誤');
         } finally {
             onLoading(false);
         }
@@ -1486,7 +1758,7 @@ const DataEntryView: React.FC<{
             const tempDiff = tempReturn - tempOutlet;
 
             // 自動計算濃縮倍數
-            const concentrationCycles = (makeupHardness > 0) ? cwsHardness / makeupHardness : 1;
+            const concentrationCycles = (makeupHardness > 0) ? cwsHardness / makeupHardness : 8;
 
             // Determine target tanks
             let targetTanks: Tank[] = [];
@@ -1630,11 +1902,15 @@ const DataEntryView: React.FC<{
                                 const valStr = String(levelVal).trim();
                                 const hasPercentSign = valStr.includes('%');
                                 const isPercentMode = targetTank.inputUnit === 'PERCENT';
+                                const isLiquidPercentMode = targetTank.inputUnit === 'LIQUID_PERCENT';
 
-                                if (isPercentMode || hasPercentSign) {
-                                    // Interpret as Meters -> CM (e.g. 1.3 -> 130cm)
-                                    // This applies to both manual "1.3%" (excel formatting) or "1.3" (raw number)
-                                    // We multiply by 100.
+                                if (isLiquidPercentMode) {
+                                    // 百分比（0-100%）→ 公分，使用可設定的換算係數 (例如 CT-2 硫酸)
+                                    const factor = targetTank.piPercentFactor ?? ((targetTank.dimensions?.height ?? 100) / 100);
+                                    lvl = lvl * factor;
+                                    convertedCount++;
+                                } else if (isPercentMode || hasPercentSign) {
+                                    // 公尺 → 公分 (例如 CT-1 舊模式 "1.3" 或 "1.3%")
                                     lvl = lvl * 100;
                                     convertedCount++;
                                 }
@@ -1671,128 +1947,14 @@ const DataEntryView: React.FC<{
 
                 if (newReadings.length > 0) {
                     // === 液位合理性檢查 ===
-                    const anomalies: ImportAnomaly[] = [];
-
-                    // Group by tank for validation
-                    const tankGroups = new Map<string, Reading[]>();
-                    newReadings.forEach(r => {
-                        if (!tankGroups.has(r.tankId)) tankGroups.set(r.tankId, []);
-                        tankGroups.get(r.tankId)!.push(r);
-                    });
-
-                    tankGroups.forEach((tankNewReadings, tankId) => {
-                        const tank = tanks.find(t => t.id === tankId);
-                        if (!tank) return;
-
-                        // Combine existing + new readings for this tank, sorted by date
-                        const existingTankReadings = readings
-                            .filter(r => r.tankId === tankId)
-                            .sort((a, b) => a.timestamp - b.timestamp);
-
-                        // Merge for analysis
-                        // Note: newReadings might overwrite existing ones on same day.
-                        // We need a consolidated list where same-day readings are replaced by new ones.
-                        const consolidatedMap = new Map<number, Reading>();
-                        existingTankReadings.forEach(r => consolidatedMap.set(r.timestamp, r));
-                        tankNewReadings.forEach(r => consolidatedMap.set(r.timestamp, r));
-
-                        const allReadings = Array.from(consolidatedMap.values())
-                            .sort((a, b) => a.timestamp - b.timestamp);
-
-                        // Calculate tank capacity for threshold (use volume if available)
-                        // Priority: 1. Defined Capacity -> 2. Calculated from Height -> 3. Default
-                        let tankCapacity = tank.capacityLiters > 0 ? tank.capacityLiters : 0;
-                        if (tankCapacity === 0 && tank.dimensions?.height) {
-                            tankCapacity = calculateTankVolume(tank, tank.dimensions.height);
-                        }
-                        if (tankCapacity === 0) tankCapacity = 10000; // Default 10000L if unknown
-                        const thresholdPercent = tank.validationThreshold ?? 30; // Use tank setting or default 30%
-                        const dailyThreshold = tankCapacity * (thresholdPercent / 100);
-
-                        // Check each new reading against its predecessor/successor
-                        for (const newReading of tankNewReadings) {
-                            const idx = allReadings.findIndex(r => r.id === newReading.id);
-                            if (idx === -1) continue;
-
-                            let anomalyReason = null;
-                            const prev = idx > 0 ? allReadings[idx - 1] : null;
-                            const next = idx < allReadings.length - 1 ? allReadings[idx + 1] : null;
-
-                            // 1. Check vs Prev
-                            if (prev) {
-                                const daysDiff = (newReading.timestamp - prev.timestamp) / (1000 * 60 * 60 * 24);
-                                if (daysDiff > 0) {
-                                    const addedAmount = newReading.addedAmountLiters || 0;
-                                    const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
-                                    const dailyChange = Math.abs(levelChange) / daysDiff;
-
-                                    if (dailyChange > dailyThreshold) {
-                                        // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
-                                        const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
-                                        // Use SG from the reading to display Kg
-                                        const sg = newReading.appliedSpecificGravity || 1.0;
-                                        const dailyChangeKg = dailyChange * sg;
-                                        const dailyThresholdKg = dailyThreshold * sg;
-
-                                        console.log('[AnomalyCheck]', {
-                                            tank: tank.name,
-                                            isPossibleRefill,
-                                            settings: appSettings,
-                                            refillText: appSettings?.possibleRefillText,
-                                            warnText: appSettings?.thresholdWarningText
-                                        });
-
-                                        if (isPossibleRefill) {
-                                            const warnText = appSettings?.possibleRefillText || '可能為補藥紀錄';
-                                            anomalyReason = formatAnomalyMessage(warnText, {
-                                                text: '可能為補藥紀錄',
-                                                diff: dailyChangeKg.toFixed(0),
-                                                limit: dailyThresholdKg.toFixed(0),
-                                                unit: 'kg'
-                                            });
-                                        } else {
-                                            const warnText = appSettings?.thresholdWarningText || '液位變化異常，請確認 ({diff} {unit} > {limit} {unit})';
-                                            anomalyReason = formatAnomalyMessage(warnText, {
-                                                text: '液位變化異常，請確認',
-                                                diff: dailyChangeKg.toFixed(0),
-                                                limit: dailyThresholdKg.toFixed(0),
-                                                unit: 'kg'
-                                            });
-                                        }
-
-                                        anomalies.push({
-                                            id: newReading.id,
-                                            tankId: tank.id,
-                                            date: new Date(newReading.timestamp).toLocaleDateString(),
-                                            tankName: tank.name,
-                                            reason: anomalyReason,
-                                            currentValue: newReading.calculatedVolume,
-                                            prevDate: prev ? new Date(prev.timestamp).toLocaleDateString() : undefined,
-                                            prevValue: prev ? prev.calculatedVolume : undefined,
-                                            nextDate: next ? new Date(next.timestamp).toLocaleDateString() : undefined,
-                                            nextValue: next ? next.calculatedVolume : undefined,
-                                            isPossibleRefill
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    });
+                    const anomalies = checkAnomalies(newReadings);
 
                     // Show warning modal if any issues found
                     if (anomalies.length > 0) {
-                        // 排序異常列表：先按日期，再按儲槽名稱
-                        anomalies.sort((a, b) => {
-                            // 先按日期排序
-                            const dateA = new Date(a.date.replace(/\//g, '-')).getTime();
-                            const dateB = new Date(b.date.replace(/\//g, '-')).getTime();
-                            if (dateA !== dateB) return dateA - dateB;
-                            // 日期相同則按儲槽名稱排序
-                            return a.tankName.localeCompare(b.tankName, 'zh-TW');
-                        });
                         setImportAnomalies(anomalies);
                         setPendingReadings(newReadings);
                         setConvertedCountInfo(convertedCount);
+                        setAnomalySource('IMPORT');
                         setShowAnomalyModal(true);
                         onLoading(false); // Stop loading to show modal
                         return; // Stop here, wait for user confirmation
@@ -2003,7 +2165,7 @@ const DataEntryView: React.FC<{
 
                     // 自動計算 (Excel Row)
                     const rowTempDiff = rowTempReturn - rowTempOutlet;
-                    const concentrationCycles = (makeupHardness > 0) ? cwsHardness / makeupHardness : 1;
+                    const concentrationCycles = (makeupHardness > 0) ? cwsHardness / makeupHardness : 8;
 
                     // 檢查是否已存在相同 tankId + date 的紀錄
                     const existingHistory = await StorageService.getCWSParamsHistory(targetTankId);
@@ -2208,7 +2370,63 @@ const DataEntryView: React.FC<{
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, "Readings");
         XLSX.writeFile(wb, "PowerChem_Readings.xlsx");
-        XLSX.writeFile(wb, "PowerChem_Readings.xlsx");
+    };
+
+    const handleSmartPaste = async () => {
+        try {
+            const text = await navigator.clipboard.readText();
+            if (!text) {
+                alert('剪貼簿目前沒有內容！');
+                return;
+            }
+
+            const isExcludedChemical = (t: Tank) => t.name.includes('微生物分散劑') || t.name.includes('消泡劑');
+            const isCT1 = (t: Tank) => t.system === SystemType.COOLING && (t.name.toUpperCase().includes('CT-1') || t.description?.includes('一階'));
+            const isCT2 = (t: Tank) => t.system === SystemType.COOLING && (t.name.toUpperCase().includes('CT-2') || t.description?.includes('二階'));
+            const isCoolOther = (t: Tank) => t.system === SystemType.COOLING && !isCT1(t) && !isCT2(t);
+
+            const orderedTanks = [
+                ...tanks.filter(t => t.system === SystemType.BOILER),
+                ...tanks.filter(t => isCT1(t) && !isExcludedChemical(t)),
+                ...tanks.filter(t => t.system === SystemType.DENOX),
+                ...tanks.filter(t => isCT2(t) && !isExcludedChemical(t)),
+                ...tanks.filter(t => t.system !== SystemType.COOLING && t.system !== SystemType.BOILER && t.system !== SystemType.DENOX),
+                ...tanks.filter(isCoolOther)
+            ];
+
+            const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
+            const newBatchLevels = { ...batchLevels };
+            let matchedCount = 0;
+
+            const allNumbers: number[] = [];
+            for (const line of lines) {
+                const cells = line.split(/\t/);
+                for (const cell of cells) {
+                    const n = parseFloat(cell.trim().replace(/,/g, ''));
+                    // Check if it's a valid number and not an empty string
+                    if (!isNaN(n) && cell.trim() !== '') {
+                        allNumbers.push(n);
+                    }
+                }
+            }
+
+            if (allNumbers.length === 0) {
+                alert('剪貼簿中找不到能帶入的數值資料。');
+                return;
+            }
+
+            for (let i = 0; i < Math.min(allNumbers.length, orderedTanks.length); i++) {
+                const t = orderedTanks[i];
+                newBatchLevels[t.id] = allNumbers[i].toString();
+                matchedCount++;
+            }
+            setBatchLevels(newBatchLevels);
+            alert(`已成功自動依序填入 ${matchedCount} 筆資料！`);
+
+        } catch (error) {
+            console.error('Smart paste failed:', error);
+            alert('無法讀取剪貼簿，請確認瀏覽器已給予剪貼簿讀取權限。');
+        }
     };
 
     const handleAddNote = async (anomaly: ImportAnomaly, noteContent: string) => {
@@ -2281,14 +2499,17 @@ const DataEntryView: React.FC<{
                 </button>
             </div>
 
-            <div className={`grid grid-cols-1 gap-8 ${['A', 'C', 'D'].includes(activeType) ? 'lg:grid-cols-3' : 'lg:grid-cols-2'}`}>
+            <div className={activeType === 'A'
+                ? 'flex flex-col gap-6'
+                : `grid grid-cols-1 gap-8 ${activeType === 'B' ? 'lg:grid-cols-2' : 'lg:grid-cols-3'}`
+            }>
                 <Card
                     title={
                         activeType === 'A' ? "手動輸入 - 液位紀錄 (批次)" :
                             activeType === 'B' ? "手動輸入 - 合約資料" :
                                 activeType === 'C' ? "手動輸入 - 冷卻水參數" : "手動輸入 - 鍋爐水參數"
                     }
-                    className={`border-t-4 ${activeType === 'A' ? 'border-t-blue-500 lg:col-span-2' : // A type takes 2 cols
+                    className={`border-t-4 ${activeType === 'A' ? 'border-t-blue-500' :
                         activeType === 'B' ? 'border-t-purple-500' :
                             activeType === 'C' ? 'border-t-sky-500 lg:col-span-2' : 'border-t-orange-500 lg:col-span-2'
                         }`}
@@ -2310,45 +2531,80 @@ const DataEntryView: React.FC<{
                                     </div>
                                     <div className="text-sm text-blue-700 pt-5">
                                         <span className="bg-blue-200 px-2 py-1 rounded text-xs mr-2">提示</span>
-                                        若儲槽設定為 <span className="font-bold">PERCENT</span>，單位為「公尺」，系統自動換算 x100 為公分。
+                                        <span className="font-bold">PERCENT</span>（公尺×100）和 <span className="font-bold">LIQUID_PERCENT</span>（百分比0-100）的桶槽轉換後均存為公分。
                                     </div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <Button
+                                        type="button"
+                                        onClick={handleSmartPaste}
+                                        className="shrink-0 bg-green-600 hover:bg-green-700 text-white justify-center text-sm py-2 px-4 shadow-lg flex items-center"
+                                    >
+                                        <Icons.ClipboardPen className="w-4 h-4 mr-2" />
+                                        智慧貼上
+                                    </Button>
+                                    <Button type="submit" className="shrink-0 justify-center text-sm py-2 px-6 shadow-lg flex items-center">
+                                        <Icons.Save className="w-4 h-4 mr-2" />
+                                        批次儲存所有輸入
+                                    </Button>
                                 </div>
                             </div>
 
                             {/* Grouped Tank Inputs */}
                             {(() => {
-                                const groups = {
-                                    'CT-1 (一階)': tanks.filter(t => t.system === SystemType.COOLING && (t.name.includes('CT-1') || t.description?.includes('一階'))),
-                                    'CT-2 (二階)': tanks.filter(t => t.system === SystemType.COOLING && (t.name.includes('CT-2') || t.description?.includes('二階') || (!t.name.includes('CT-1') && !t.description?.includes('一階')))),
-                                    '鍋爐藥劑': tanks.filter(t => t.system === SystemType.BOILER),
-                                    '氨水 (脫硝)': tanks.filter(t => t.system === SystemType.DENOX),
-                                    '其他': tanks.filter(t => t.system !== SystemType.COOLING && t.system !== SystemType.BOILER && t.system !== SystemType.DENOX)
-                                };
+                                const isCT1 = (t: Tank) => t.system === SystemType.COOLING && (t.name.toUpperCase().includes('CT-1') || t.description?.includes('一階'));
+                                const isCT2 = (t: Tank) => t.system === SystemType.COOLING && (t.name.toUpperCase().includes('CT-2') || t.description?.includes('二階'));
+                                const isCoolOther = (t: Tank) => t.system === SystemType.COOLING && !isCT1(t) && !isCT2(t);
 
-                                return Object.entries(groups).map(([groupName, groupTanks]) => {
+                                const groups: [string, string, Tank[]][] = [
+                                    ['stage1', '一階：鍋爐水系統藥劑 + 冷卻水系統藥劑 (CT-1)', [
+                                        ...tanks.filter(t => t.system === SystemType.BOILER),
+                                        ...tanks.filter(isCT1)
+                                    ]],
+                                    ['stage2', '二階：脫硝系統藥劑 + 冷卻水系統藥劑 (CT-2)', [
+                                        ...tanks.filter(t => t.system === SystemType.DENOX),
+                                        ...tanks.filter(isCT2)
+                                    ]],
+                                    ['other', '其他', [
+                                        ...tanks.filter(t => t.system !== SystemType.COOLING && t.system !== SystemType.BOILER && t.system !== SystemType.DENOX),
+                                        ...tanks.filter(isCoolOther)
+                                    ]]
+                                ];
+
+                                return groups.map(([key, groupName, groupTanks]) => {
                                     if (groupTanks.length === 0) return null;
 
+                                    const bgColor = key === 'stage1' ? 'bg-blue-50' : key === 'stage2' ? 'bg-green-50' : 'bg-slate-50';
+                                    const borderColor = key === 'stage1' ? 'border-blue-200' : key === 'stage2' ? 'border-green-200' : 'border-slate-200';
+                                    const textColor = key === 'stage1' ? 'text-blue-800' : key === 'stage2' ? 'text-green-800' : 'text-slate-700';
+
                                     return (
-                                        <div key={groupName} className="border border-slate-200 rounded-lg overflow-hidden">
-                                            <div className="bg-slate-50 px-4 py-2 border-b border-slate-200 font-bold text-slate-700 text-sm">
+                                        <div key={key} className={`border ${borderColor} rounded-lg overflow-hidden`}>
+                                            <div className={`${bgColor} px-4 py-2 border-b ${borderColor} font-bold ${textColor} text-sm`}>
                                                 {groupName}
                                             </div>
-                                            <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            <div className="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                                                 {groupTanks.map(tank => {
                                                     const isMeters = tank.inputUnit === 'PERCENT';
-                                                    const unitLabel = isMeters ? '公尺' : '公分';
-                                                    const placeholder = isMeters ? 'M' : 'cm';
+                                                    const isPercent = tank.inputUnit === 'LIQUID_PERCENT';
+                                                    const unitLabel = isMeters ? '公尺' : isPercent ? '%' : '公分';
+                                                    const placeholder = isMeters ? 'M' : isPercent ? '0-100' : 'cm';
+                                                    const stepVal = isMeters ? '0.01' : isPercent ? '0.1' : '0.1';
 
                                                     return (
                                                         <div key={tank.id} className="flex items-center gap-3">
                                                             <div className="w-1/3 text-right">
-                                                                <div className="text-sm font-medium text-slate-700 truncate" title={tank.name}>{tank.name}</div>
+                                                                <div className={`text-sm font-medium truncate ${tank.system === SystemType.BOILER ? 'text-red-800 font-semibold' :
+                                                                    tank.system === SystemType.DENOX ? 'text-green-800 font-semibold' :
+                                                                        (tank.name.includes('微生物') || tank.name.includes('消泡')) ? 'text-amber-700 font-semibold' :
+                                                                            'text-slate-700'
+                                                                    }`} title={tank.name}>{tank.name}</div>
                                                                 <div className="text-[10px] text-slate-400">{tank.system}</div>
                                                             </div>
                                                             <div className="w-2/3 relative">
                                                                 <input
                                                                     type="number"
-                                                                    step={isMeters ? "0.01" : "0.1"}
+                                                                    step={stepVal}
                                                                     placeholder={placeholder}
                                                                     value={batchLevels[tank.id] || ''}
                                                                     onChange={(e) => setBatchLevels(prev => ({ ...prev, [tank.id]: e.target.value }))}
@@ -2367,18 +2623,12 @@ const DataEntryView: React.FC<{
                                 });
                             })()}
 
-                            <div className="pt-4 sticky bottom-0 bg-white border-t border-slate-100 p-4 -mx-6 -mb-6 shadow-up z-10">
-                                <Button type="submit" className="w-full justify-center text-lg py-3 shadow-lg">
-                                    <Icons.Save className="w-5 h-5 mr-2" />
-                                    批次儲存所有輸入
-                                </Button>
-                            </div>
                         </form>
                     )}
 
                     {/* 近期歷史紀錄列表 (全域) */}
                     {activeType === 'A' && (() => {
-                        const historyLimit = 20;
+                        const historyLimit = showMoreHistory ? 60 : 20;
                         const historyReadings = readings
                             .sort((a, b) => b.timestamp - a.timestamp)
                             .slice(0, historyLimit);
@@ -2408,10 +2658,18 @@ const DataEntryView: React.FC<{
 
                         return (
                             <div className="mt-8 border-t border-slate-200 pt-6">
-                                <h4 className="font-bold text-slate-800 flex items-center mb-4">
-                                    <Icons.ClipboardPen className="w-4 h-4 mr-2" />
-                                    近期歷史紀錄 (Top {historyLimit})
-                                </h4>
+                                <div className="flex justify-between items-center mb-4">
+                                    <h4 className="font-bold text-slate-800 flex items-center">
+                                        <Icons.ClipboardPen className="w-4 h-4 mr-2" />
+                                        近期歷史紀錄 (Top {historyLimit} - 可編輯)
+                                    </h4>
+                                    <button
+                                        onClick={() => setShowMoreHistory(!showMoreHistory)}
+                                        className="text-sm text-brand-600 hover:text-brand-800 underline"
+                                    >
+                                        {showMoreHistory ? '顯示較少' : '顯示更多歷史紀錄'}
+                                    </button>
+                                </div>
                                 <div className="overflow-x-auto border border-slate-200 rounded-lg max-h-[500px] overflow-y-auto">
                                     <table className="min-w-full divide-y divide-slate-200">
                                         <thead className="bg-slate-50 sticky top-0 z-10 shadow-sm">
@@ -2932,7 +3190,7 @@ const DataEntryView: React.FC<{
                     )}
 
                     {/* C - 冷卻水生產數據歷史記錄 */}
-                    {activeType === 'C' && selectedTankId && (() => {
+                    {activeType === 'C' && (() => {
                         const historyLimit = showMoreHistory ? 60 : 10;
                         const historyItems = historyCWS.slice(0, historyLimit);
 
@@ -2949,7 +3207,7 @@ const DataEntryView: React.FC<{
                             if (!confirm('確定要刪除此冷卻水生產數據紀錄嗎？')) return;
                             try {
                                 await StorageService.deleteCWSParamRecord(id);
-                                const data = await StorageService.getCWSParamsHistory(selectedTankId);
+                                const data = await StorageService.getCWSParamsHistory();
                                 setHistoryCWS(data);
                                 onUpdateTank();
                                 alert('刪除成功');
@@ -2980,39 +3238,46 @@ const DataEntryView: React.FC<{
                                         <thead className="bg-slate-50 sticky top-0 z-10 shadow-sm">
                                             <tr>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">週起始日</th>
+                                                <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">儲槽</th>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">循環水量 (m³/hr)</th>
                                                 <th className="px-3 py-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">溫差 (°C)</th>
                                                 <th className="px-3 py-2 text-right text-xs font-medium text-slate-500 uppercase tracking-wider bg-slate-50">操作</th>
                                             </tr>
                                         </thead>
                                         <tbody className="bg-white divide-y divide-slate-200">
-                                            {historyItems.map(item => (
-                                                <tr key={item.id} className="hover:bg-slate-50">
-                                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
-                                                        {item.date ? new Date(item.date).toLocaleDateString() : '-'}
-                                                    </td>
-                                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
-                                                        {item.circulationRate || '-'}
-                                                    </td>
-                                                    <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
-                                                        {item.tempDiff || '-'}
-                                                    </td>
-                                                    <td className="px-3 py-2 whitespace-nowrap text-right text-sm">
-                                                        <button
-                                                            onClick={() => handleHistoryEdit(item)}
-                                                            className="text-blue-600 hover:text-blue-900 mr-3"
-                                                        >
-                                                            編輯
-                                                        </button>
-                                                        <button
-                                                            onClick={() => handleHistoryDelete(item.id)}
-                                                            className="text-red-600 hover:text-red-900"
-                                                        >
-                                                            刪除
-                                                        </button>
-                                                    </td>
-                                                </tr>
-                                            ))}
+                                            {historyItems.map(item => {
+                                                const tankName = tanks.find(t => t.id === item.tankId)?.name || item.tankId;
+                                                return (
+                                                    <tr key={item.id} className="hover:bg-slate-50">
+                                                        <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
+                                                            {item.date ? new Date(item.date).toLocaleDateString() : '-'}
+                                                        </td>
+                                                        <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900 font-medium">
+                                                            {tankName}
+                                                        </td>
+                                                        <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
+                                                            {item.circulationRate || '-'}
+                                                        </td>
+                                                        <td className="px-3 py-2 whitespace-nowrap text-sm text-slate-900">
+                                                            {item.tempDiff || '-'}
+                                                        </td>
+                                                        <td className="px-3 py-2 whitespace-nowrap text-right text-sm">
+                                                            <button
+                                                                onClick={() => handleHistoryEdit(item)}
+                                                                className="text-blue-600 hover:text-blue-900 mr-3"
+                                                            >
+                                                                編輯
+                                                            </button>
+                                                            <button
+                                                                onClick={() => handleHistoryDelete(item.id)}
+                                                                className="text-red-600 hover:text-red-900"
+                                                            >
+                                                                刪除
+                                                            </button>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
                                         </tbody>
                                     </table>
                                 </div>
@@ -3679,7 +3944,7 @@ const AnalysisView: React.FC<{
                         const { circulationRate, tempDiff, cwsHardness, makeupHardness, concentrationCycles } = strictCwsParam;
                         const R = circulationRate || 0;
                         const dT = tempDiff || 0;
-                        let C = 1;
+                        let C = 8;
                         if (cwsHardness && makeupHardness && makeupHardness > 0) {
                             C = cwsHardness / makeupHardness;
                         } else if (concentrationCycles && concentrationCycles > 1) {
@@ -3810,7 +4075,7 @@ const AnalysisView: React.FC<{
                     const days = 7;
                     const E = (circulationRate * tempDiff * 1.8 * 24 * days) / 1000;
 
-                    let C = 1;
+                    let C = 8;
                     if (cwsHardness && makeupHardness && makeupHardness > 0) {
                         C = cwsHardness / makeupHardness;
                     } else if (concentrationCycles && concentrationCycles > 1) {
@@ -3945,8 +4210,8 @@ const AnalysisView: React.FC<{
                                     const days = 7;
                                     const E = (circulationRate * tempDiff * 1.8 * 24 * days) / 1000;
 
-                                    let C = 1;
-                                    let cFormula = `預設 1`;
+                                    let C = 8;
+                                    let cFormula = `預設 8`;
                                     // Same priority as chart logic
                                     if (cwsHardness && makeupHardness && makeupHardness > 0) {
                                         C = cwsHardness / makeupHardness;
@@ -5394,13 +5659,13 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
 
                             <div className="md:col-span-2 mt-4 p-3 bg-slate-50 rounded border border-slate-200">
                                 <label className="block text-sm font-medium text-slate-700 mb-2">液位輸入模式</label>
-                                <div className="flex gap-4">
+                                <div className="flex flex-col gap-2 sm:flex-row sm:gap-4">
                                     <label className="flex items-center gap-2 cursor-pointer">
                                         <input
                                             type="radio"
                                             name="inputUnit"
                                             value="CM"
-                                            checked={editingTank.inputUnit !== 'PERCENT'}
+                                            checked={editingTank.inputUnit !== 'PERCENT' && editingTank.inputUnit !== 'LIQUID_PERCENT'}
                                             onChange={() => updateTankField('inputUnit', 'CM')}
                                             className="text-brand-600 focus:ring-brand-500"
                                         />
@@ -5415,13 +5680,53 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                                             onChange={() => updateTankField('inputUnit', 'PERCENT')}
                                             className="text-brand-600 focus:ring-brand-500"
                                         />
-                                        <span>公尺 (×100)</span>
+                                        <span>公尺 (×100cm)</span>
+                                    </label>
+                                    <label className="flex items-center gap-2 cursor-pointer">
+                                        <input
+                                            type="radio"
+                                            name="inputUnit"
+                                            value="LIQUID_PERCENT"
+                                            checked={editingTank.inputUnit === 'LIQUID_PERCENT'}
+                                            onChange={() => updateTankField('inputUnit', 'LIQUID_PERCENT')}
+                                            className="text-brand-600 focus:ring-brand-500"
+                                        />
+                                        <span>液位百分比 (0–100%)</span>
                                     </label>
                                 </div>
                                 {editingTank.inputUnit === 'PERCENT' && (
-                                    <p className="text-xs text-amber-600 mt-1">
-                                        注意：此模式適用於如 CT-1 硫酸桶槽等特殊情況，輸入值會乘以 100 換算為公分 (例如輸入 0.72 = 72 cm)。
+                                    <p className="text-xs text-amber-600 mt-2">
+                                        注意：輸入值（公尺）會乘以 100 換算為公分，例如輸入 0.72 = 72 cm。
                                     </p>
+                                )}
+                                {editingTank.inputUnit === 'LIQUID_PERCENT' && (
+                                    <div className="mt-3 space-y-2">
+                                        <p className="text-xs text-blue-600">
+                                            輸入值為 0–100 的百分比（例如電子液位計讀數）。系統將依下方係數換算為公分。
+                                        </p>
+                                        <div className="flex items-center gap-3">
+                                            <label className="text-sm text-slate-600 whitespace-nowrap">
+                                                換算係數 (cm / 1%)
+                                            </label>
+                                            <input
+                                                type="number"
+                                                step="0.01"
+                                                min="0.01"
+                                                value={editingTank.piPercentFactor ?? ((editingTank.dimensions?.height ?? 100) / 100).toFixed(2)}
+                                                onChange={e => updateTankField('piPercentFactor', Number(e.target.value))}
+                                                className={`${inputClassName} w-32`}
+                                                placeholder="例如 3.0"
+                                            />
+                                        </div>
+                                        <p className="text-xs text-slate-500">
+                                            範例：CT-1 高度 300cm → 係數 3.0（即 50% × 3.0 = 150 cm）
+                                            {editingTank.piPercentFactor && (
+                                                <span className="text-slate-700 font-medium ml-2">
+                                                    ｜當前：50% → {(50 * editingTank.piPercentFactor).toFixed(1)} cm
+                                                </span>
+                                            )}
+                                        </p>
+                                    </div>
                                 )}
                             </div>
                         </div>
