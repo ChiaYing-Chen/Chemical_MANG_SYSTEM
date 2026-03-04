@@ -2385,11 +2385,32 @@ const DataEntryView: React.FC<{
             const isCT2 = (t: Tank) => t.system === SystemType.COOLING && (t.name.toUpperCase().includes('CT-2') || t.description?.includes('二階'));
             const isCoolOther = (t: Tank) => t.system === SystemType.COOLING && !isCT1(t) && !isCT2(t);
 
-            const orderedTanks = [
+            const getSortIndex = (name: string, orderList: string[]) => {
+                for (let i = 0; i < orderList.length; i++) {
+                    const keyword = orderList[i];
+                    if (keyword === '分散劑' && name.includes('微生物分散劑')) continue;
+                    if (keyword === '腐蝕結垢抑制' && (name.includes('腐蝕結垢抑制') || name.includes('腐蝕蝕結垢抑制'))) return i;
+                    if (name.includes(keyword)) return i;
+                }
+                return 999;
+            };
+
+            const stage1Order = ['清罐劑', '脫氧劑', '中和胺', '硫酸', '漂白水', '分散劑', '腐蝕結垢抑制', '銅腐蝕抑制劑', '非氧化殺菌劑'];
+            const stage2Order = ['氨水', '硫酸', '漂白水', '分散劑', '腐蝕結垢抑制', '銅腐蝕抑制劑', '非氧化殺菌劑'];
+
+            const stage1Tanks = [
                 ...tanks.filter(t => t.system === SystemType.BOILER),
-                ...tanks.filter(t => isCT1(t) && !isExcludedChemical(t)),
+                ...tanks.filter(t => isCT1(t) && !isExcludedChemical(t))
+            ].sort((a, b) => getSortIndex(a.name, stage1Order) - getSortIndex(b.name, stage1Order));
+
+            const stage2Tanks = [
                 ...tanks.filter(t => t.system === SystemType.DENOX),
-                ...tanks.filter(t => isCT2(t) && !isExcludedChemical(t)),
+                ...tanks.filter(t => isCT2(t) && !isExcludedChemical(t))
+            ].sort((a, b) => getSortIndex(a.name, stage2Order) - getSortIndex(b.name, stage2Order));
+
+            const orderedTanks = [
+                ...stage1Tanks,
+                ...stage2Tanks,
                 ...tanks.filter(t => t.system !== SystemType.COOLING && t.system !== SystemType.BOILER && t.system !== SystemType.DENOX),
                 ...tanks.filter(isCoolOther)
             ];
@@ -2556,15 +2577,28 @@ const DataEntryView: React.FC<{
                                 const isCT2 = (t: Tank) => t.system === SystemType.COOLING && (t.name.toUpperCase().includes('CT-2') || t.description?.includes('二階'));
                                 const isCoolOther = (t: Tank) => t.system === SystemType.COOLING && !isCT1(t) && !isCT2(t);
 
+                                const getSortIndex = (name: string, orderList: string[]) => {
+                                    for (let i = 0; i < orderList.length; i++) {
+                                        const keyword = orderList[i];
+                                        if (keyword === '分散劑' && name.includes('微生物分散劑')) continue;
+                                        if (keyword === '腐蝕結垢抑制' && (name.includes('腐蝕結垢抑制') || name.includes('腐蝕蝕結垢抑制'))) return i;
+                                        if (name.includes(keyword)) return i;
+                                    }
+                                    return 999;
+                                };
+
+                                const stage1Order = ['清罐劑', '脫氧劑', '中和胺', '硫酸', '漂白水', '分散劑', '腐蝕結垢抑制', '銅腐蝕抑制劑', '非氧化殺菌劑'];
+                                const stage2Order = ['氨水', '硫酸', '漂白水', '分散劑', '腐蝕結垢抑制', '銅腐蝕抑制劑', '非氧化殺菌劑'];
+
                                 const groups: [string, string, Tank[]][] = [
                                     ['stage1', '一階：鍋爐水系統藥劑 + 冷卻水系統藥劑 (CT-1)', [
                                         ...tanks.filter(t => t.system === SystemType.BOILER),
                                         ...tanks.filter(isCT1)
-                                    ]],
+                                    ].sort((a, b) => getSortIndex(a.name, stage1Order) - getSortIndex(b.name, stage1Order))],
                                     ['stage2', '二階：脫硝系統藥劑 + 冷卻水系統藥劑 (CT-2)', [
                                         ...tanks.filter(t => t.system === SystemType.DENOX),
                                         ...tanks.filter(isCT2)
-                                    ]],
+                                    ].sort((a, b) => getSortIndex(a.name, stage2Order) - getSortIndex(b.name, stage2Order))],
                                     ['other', '其他', [
                                         ...tanks.filter(t => t.system !== SystemType.COOLING && t.system !== SystemType.BOILER && t.system !== SystemType.DENOX),
                                         ...tanks.filter(isCoolOther)
