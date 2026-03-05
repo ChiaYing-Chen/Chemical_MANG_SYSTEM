@@ -1088,13 +1088,13 @@ const DataEntryView: React.FC<{
                     const parsedDate = new Date(anomaly.date.replace(/\//g, '-'));
                     const isoDateStr = isNaN(parsedDate.getTime())
                         ? anomaly.date.replace(/\//g, '-') // fallback
-                        : parsedDate.toISOString().split('T')[0]; // 確保 YYYY-MM-DD
+                        : `${parsedDate.getFullYear()}-${String(parsedDate.getMonth() + 1).padStart(2, '0')}-${String(parsedDate.getDate()).padStart(2, '0')}`; // 確保 YYYY-MM-DD 不受時區位移影響
 
                     // 直接使用 anomaly.tankId（由 Excel 匯入處直接設定），作為第一優先
                     // 若 anomaly.tankId 不存在，再透過名稱查找
                     const tank = tanks.find(t => t.id === anomaly.tankId || t.name === anomaly.tankName);
                     return {
-                        tankId: anomaly.tankId || tank?.id || '',
+                        tankId: anomaly.tankId || tank?.id || null,
                         tankName: anomaly.tankName,
                         dateStr: isoDateStr,
                         reason: anomaly.reason,
@@ -1143,6 +1143,8 @@ const DataEntryView: React.FC<{
     const [historyCWS, setHistoryCWS] = useState<CWSParameterRecord[]>([]);
     const [historyBWS, setHistoryBWS] = useState<BWSParameterRecord[]>([]);
     const [showMoreHistory, setShowMoreHistory] = useState(false); // Shared toggle state
+    // 新增狀態保存歷史紀錄截止日期
+    const [historyEndDate, setHistoryEndDate] = useState<string>('');
 
     // File input for Excel import
     const [file, setFile] = useState<File | null>(null);
@@ -1543,6 +1545,15 @@ const DataEntryView: React.FC<{
 
     const handleSubmitReadings = async (e: React.FormEvent) => {
         e.preventDefault();
+
+        // 智慧判斷：若按下儲存的時間落於晚上 23:00 ~ 23:59:59，提示確認抄表日期
+        const now = new Date();
+        if (now.getHours() === 23) {
+            const [y, m, d] = date.split('-');
+            const dateDisplay = `${y}/${m}/${d}`;
+            const confirmed = window.confirm(`⚠️ 注意：現在時間為深夜 ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}，即將跨日。\n\n儲存的抄表日期為「${dateDisplay}」，是否正確？\n\n按「確定」繼續儲存，按「取消」返回修改日期。`);
+            if (!confirmed) return;
+        }
 
         const entries = Object.entries(batchLevels);
         if (entries.length === 0) {
@@ -2663,7 +2674,15 @@ const DataEntryView: React.FC<{
                     {/* 近期歷史紀錄列表 (全域) */}
                     {activeType === 'A' && (() => {
                         const historyLimit = showMoreHistory ? 60 : 20;
-                        const historyReadings = readings
+
+                        // 過濾邏輯：若有選擇日期，則僅顯示小於等於該日期 23:59:59.999 的紀錄
+                        let filteredReadings = readings;
+                        if (historyEndDate) {
+                            const endOfDayTime = new Date(historyEndDate + 'T23:59:59.999').getTime();
+                            filteredReadings = readings.filter(r => r.timestamp <= endOfDayTime);
+                        }
+
+                        const historyReadings = filteredReadings
                             .sort((a, b) => b.timestamp - a.timestamp)
                             .slice(0, historyLimit);
 
@@ -2671,7 +2690,7 @@ const DataEntryView: React.FC<{
                             setEditingItem(item);
                             setEditForm({
                                 ...item,
-                                dateStr: new Date(item.timestamp).toISOString().split('T')[0]
+                                dateStr: formatDateForInput(item.timestamp)
                             });
                             setIsEditOpen(true);
                         };
@@ -2692,14 +2711,32 @@ const DataEntryView: React.FC<{
 
                         return (
                             <div className="mt-8 border-t border-slate-200 pt-6">
-                                <div className="flex justify-between items-center mb-4">
-                                    <h4 className="font-bold text-slate-800 flex items-center">
-                                        <Icons.ClipboardPen className="w-4 h-4 mr-2" />
-                                        近期歷史紀錄 (Top {historyLimit} - 可編輯)
-                                    </h4>
+                                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-4">
+                                    <div className="flex items-center flex-wrap gap-4">
+                                        <h4 className="font-bold text-slate-800 flex items-center">
+                                            <Icons.ClipboardPen className="w-4 h-4 mr-2" />
+                                            近期歷史紀錄 (Top {historyLimit} - 可編輯)
+                                        </h4>
+                                        <div className="flex items-center gap-2">
+                                            <input
+                                                type="date"
+                                                className="border border-slate-300 rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-brand-500"
+                                                value={historyEndDate}
+                                                onChange={e => setHistoryEndDate(e.target.value)}
+                                            />
+                                            {historyEndDate && (
+                                                <button
+                                                    onClick={() => setHistoryEndDate('')}
+                                                    className="text-sm text-slate-500 hover:text-red-500"
+                                                >
+                                                    清除
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
                                     <button
                                         onClick={() => setShowMoreHistory(!showMoreHistory)}
-                                        className="text-sm text-brand-600 hover:text-brand-800 underline"
+                                        className="text-sm text-brand-600 hover:text-brand-800 underline flex-shrink-0"
                                     >
                                         {showMoreHistory ? '顯示較少' : '顯示更多歷史紀錄'}
                                     </button>
@@ -2849,7 +2886,7 @@ const DataEntryView: React.FC<{
                                         onChange={e => {
                                             const lvl = parseFloat(e.target.value);
                                             const tank = tanks.find(t => t.id === editingItem?.tankId);
-                                            const vol = tank ? lvl * tank.factor : editingItem?.calculatedVolume;
+                                            const vol = tank ? calculateTankVolume(tank, lvl) : editingItem?.calculatedVolume;
                                             setEditForm({
                                                 ...editForm,
                                                 levelCm: e.target.value,

@@ -1941,7 +1941,7 @@ app.post('/api/alerts', async (req, res) => {
         const result = await pool.query(
             `INSERT INTO fluctuation_alerts (id, tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill, source, note)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-            [id || crypto.randomUUID(), tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill || false, source || 'MANUAL', note]
+            [id || crypto.randomUUID(), tank_id ?? null, tank_name ?? null, date_str ?? null, reason ?? null, current_value ?? null, prev_value ?? null, next_value ?? null, is_possible_refill || false, source || 'MANUAL', note || '']
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -1974,7 +1974,7 @@ app.post('/api/alerts/batch', async (req, res) => {
             const result = await client.query(
                 `INSERT INTO fluctuation_alerts (id, tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill, source, note)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-                [id || crypto.randomUUID(), tank_id, tank_name, date_str, reason, current_value, prev_value, next_value, is_possible_refill || false, source || 'MANUAL', note || '']
+                [id || crypto.randomUUID(), tank_id ?? null, tank_name ?? null, date_str ?? null, reason ?? null, current_value ?? null, prev_value ?? null, next_value ?? null, is_possible_refill || false, source || 'MANUAL', note || '']
             );
             results.push(result.rows[0]);
         }
