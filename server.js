@@ -237,10 +237,19 @@ const CWS_TAGS_CONFIG = {
  * Batch fetch all PI tag values in a SINGLE PowerShell process.
  * Forces UTF-8 output encoding to avoid CJK mojibake.
  */
-const piBatchFetch = (requests, piAuth) => {
-    const fullUser = piAuth.domain ? `${piAuth.domain}\\${piAuth.username}` : piAuth.username;
-    const escapedPwd = piAuth.password.replace(/'/g, "''");
+const piBatchFetch = (requests) => {
     const baseUrl = PI_BASE_URL;
+
+    // 從環境變數讀取 PI 憑證（在伺服器一次性設定，不需使用者重複輸入）
+    const piUser = process.env.PI_USERNAME || '';
+    const piPass = process.env.PI_PASSWORD || '';
+    const piDomain = process.env.PI_DOMAIN || '';
+    const useEnvCred = piUser && piPass;
+
+    const fullUser = useEnvCred
+        ? (piDomain ? `${piDomain}\\${piUser}` : piUser)
+        : '';
+    const escapedPwd = useEnvCred ? piPass.replace(/'/g, "''") : '';
 
     const psScript = `
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -254,8 +263,13 @@ chcp 65001 | Out-Null
 [Net.ServicePointManager]::DefaultConnectionLimit = 100
 $ErrorActionPreference = 'Stop'
 
+${useEnvCred
+            ? `# 使用環境變數設定的 PI 帳號驗證
 $secPwd = ConvertTo-SecureString '${escapedPwd}' -AsPlainText -Force
-$cred = New-Object System.Management.Automation.PSCredential('${fullUser}', $secPwd)
+$cred = New-Object System.Management.Automation.PSCredential('${fullUser}', $secPwd)`
+            : `# 環境變數未設定，使用目前 Windows 登入帳號自動驗證
+$cred = $null`
+        }
 $results = @{}
 $tagWebIdCache = @{}
 $debugLogs = @()
@@ -269,9 +283,13 @@ function PiGet($url) {
             $req.Method = 'GET'
             $req.ContentType = 'application/json'
             $req.Accept = 'application/json'
-            $req.KeepAlive = $false
+            $req.KeepAlive = $true
             $req.PreAuthenticate = $true
-            $req.Credentials = $cred
+            if ($null -ne $cred) {
+                $req.Credentials = $cred
+            } else {
+                $req.UseDefaultCredentials = $true
+            }
             $req.Timeout = 30000
 
             $resp = $req.GetResponse()
@@ -297,11 +315,12 @@ function PiGet($url) {
 }
 
 try {
-    $debugLogs += "Calling dataservers..."
     $servers = PiGet '${baseUrl}/dataservers'
+    if ($null -eq $servers -or $null -eq $servers.Items -or $servers.Items.Count -eq 0) {
+        throw "No data server found. Check permissions."
+    }
     $serverId = $servers.Items[0].WebId
     $results['_serverWebId'] = $serverId
-    $debugLogs += "DataServer OK: $serverId"
 
 ${requests.map((req, i) => `
     try {
@@ -310,16 +329,13 @@ ${requests.map((req, i) => `
             $webId = $tagWebIdCache[$tagName]
         } else {
             $searchUrl = "${baseUrl}/dataservers/$serverId/points?nameFilter=$tagName"
-            $debugLogs += "Search: $searchUrl"
             $search = PiGet $searchUrl
             if ($search.Items.Count -eq 0) {
                 $results['${req.tagName}__${i}'] = @{ error = 'Tag Not Found'; value = 0 }
-                $debugLogs += "Tag $tagName not found"
                 continue
             }
             $webId = $search.Items[0].WebId
             $tagWebIdCache[$tagName] = $webId
-            $debugLogs += "Tag $tagName WebId: $webId"
         }
         $summaryUrl = "${baseUrl}/streams/$webId/summary?startTime=${req.startTime}&endTime=${req.endTime}&summaryType=${req.summaryType}"
         $summary = PiGet $summaryUrl
@@ -402,21 +418,9 @@ const getMonday = (d) => {
 app.post('/api/pi-import', async (req, res) => {
     const logs = [];
     try {
-        const { weeks = 4, username, password } = req.body;
+        const { weeks = 4 } = req.body;
 
-        if (!username || !password) {
-            return res.status(400).json({ success: false, error: "Missing 'username' or 'password' in request body." });
-        }
-
-        let domain = '';
-        let plainUsername = username;
-        if (username.includes('\\')) {
-            const parts = username.split('\\');
-            domain = parts[0];
-            plainUsername = parts[1];
-        }
-        const piAuth = { username: plainUsername, password, domain };
-        logs.push('Authenticating as: ' + (domain ? domain + '\\' : '') + plainUsername + ' (Kerberos)');
+        logs.push('自動驗證 PI Web API，同時匯入 CWS 冷卻水與 BWS 鍋爐水數據...');
 
         const currentWeekMonday = getMonday(new Date());
         const targetWeeks = [];
@@ -455,25 +459,15 @@ app.post('/api/pi-import', async (req, res) => {
             }
         }
 
-        logs.push('  Total PI requests: ' + allRequests.length + ' (in single batch)');
-
-        const results = piBatchFetch(allRequests, piAuth);
-
-        // Output PowerShell debug logs
-        const debugLog = results.get('_debug');
-        if (debugLog) {
-            logs.push('  [PS Debug] ' + debugLog);
-        }
+        const results = piBatchFetch(allRequests);
 
         const summary = [];
+        // 驗證是否有驗證錯誤
         const firstResult = results.values().next().value;
         if (firstResult && firstResult.error && String(firstResult.error).includes('Auth')) {
-            const msg = '❌ Auth FAILED: ' + firstResult.error;
-            logs.push('  [Auth Test] FAILED: ' + firstResult.error);
+            const msg = '❌ 驗證失敗: ' + firstResult.error;
+            logs.push(msg);
             summary.push(msg);
-        } else {
-            logs.push('  [Auth Test] OK (batch completed)');
-            // summary.push('✅ Auth OK'); // Optional, implicit if success
         }
 
         // --- Process BWS results ---
@@ -489,10 +483,7 @@ app.post('/api/pi-import', async (req, res) => {
                 if (req._group !== 'BWS' || req._weekStart.getTime() !== week.start.getTime()) continue;
                 const key = req.tagName + '__' + i;
                 const r = results.get(key);
-                if (r && r.error) {
-                    logs.push('    [BWS Error] ' + req.tagName + ': ' + r.error);
-                    errorCount++;
-                }
+                if (r && r.error) errorCount++;
                 weekTotalSum += (r ? r.value || 0 : 0);
             }
             const safeTotal = Math.round(weekTotalSum * 24);
@@ -521,11 +512,9 @@ app.post('/api/pi-import', async (req, res) => {
             }
         }
 
-        // --- Process CWS results ---
-        logs.push("Processing CWS data...");
+        // --- Process BWS/CWS results ---
         const cwsTanksRes = await pool.query("SELECT * FROM tanks WHERE system_type = '冷卻水系統'");
         const cwsTanks = cwsTanksRes.rows;
-        logs.push('  Found ' + cwsTanks.length + ' COOLING tanks');
 
         const ct1Tanks = cwsTanks.filter(function (t) { return t.name.includes('CWS-1') || t.name.includes('CT-1') || (t.description || '').includes('\u4e00\u968e'); });
         const ct2Tanks = cwsTanks.filter(function (t) { return !ct1Tanks.find(function (ct1) { return ct1.id === t.id; }); });
@@ -541,13 +530,13 @@ app.post('/api/pi-import', async (req, res) => {
                 if (r && r.error) errors++;
 
                 if (req._group === 'CWS_' + areaKey + '_flow') {
-                    if (r && r.error) logs.push('  [CWS Warn] ' + req.tagName + ': ' + r.error);
+                    if (r && r.error) errors++;
                     flowSum += (r ? r.value || 0 : 0);
                 } else if (req._group === 'CWS_' + areaKey + '_tempOut') {
-                    if (r && r.error) { logs.push('  [CWS Warn] ' + req.tagName + ': ' + r.error); }
+                    if (r && r.error) errors++;
                     else { tOutSum += (r ? r.value || 0 : 0); tOutCount++; }
                 } else if (req._group === 'CWS_' + areaKey + '_tempRet') {
-                    if (r && r.error) { logs.push('  [CWS Warn] ' + req.tagName + ': ' + r.error); }
+                    if (r && r.error) errors++;
                     else { tRetSum += (r ? r.value || 0 : 0); tRetCount++; }
                 }
             }

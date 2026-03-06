@@ -1197,181 +1197,38 @@ const DataEntryView: React.FC<{
         }
     };
 
-    const handleBatchImportBWS = async () => {
-        if (!confirm(`確定要匯入「近 ${importWeeks} 週」的數據至資料庫嗎？\n這將寫入所有鍋爐儲槽的生產參數。`)) return;
+
+    const handleBatchImportAll = async () => {
+        if (!confirm(`確定要匯入「近 ${importWeeks} 週」的數據至資料庫嗎？\n這將同時寫入冷卻水系統(CWS)的循環量與溫度參數，以及鍋爐水系統(BWS)的蒸汽生產量。`)) return;
+
         setImporting(true);
-        // onLoading(true); // Disabled as per user request
         setImportLogs([]);
         const addLog = (msg: string) => setImportLogs(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`]);
         try {
-            addLog("開始初始化...");
-            const currentWeekMonday = getMonday(new Date());
-            const targetWeeks = [];
-            for (let i = 1; i <= importWeeks; i++) {
-                const endDate = new Date(currentWeekMonday);
-                endDate.setDate(currentWeekMonday.getDate() - (7 * (i - 1)));
-                const startDate = new Date(endDate);
-                startDate.setDate(endDate.getDate() - 7);
-                targetWeeks.push({ start: startDate, end: endDate });
+            addLog('開始 PI 自動匯入（CWS 冷卻水 + BWS 鍋爐水）...');
+            // 呼叫後端 API，由伺服器使用 Windows 服務帳號（UseDefaultCredentials）存取 PI Web API
+            const res = await fetch(`${import.meta.env.BASE_URL}api/pi-import`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ weeks: importWeeks })
+            });
+            const data = await res.json();
+
+            // 顯示後端回傳的 logs
+            if (data.logs && Array.isArray(data.logs)) {
+                data.logs.forEach((log: string) => addLog(log));
             }
-            targetWeeks.reverse();
-            addLog(`準備處理 ${targetWeeks.length} 個週次...`);
 
-            const boilerTanks = tanks.filter(t => t.system === SystemType.BOILER);
-
-            for (const week of targetWeeks) {
-                const startStr = week.start.toISOString().split('T')[0] + 'T00:00:00';
-                const endStr = week.end.toISOString().split('T')[0] + 'T00:00:00';
-                addLog(`處理週次: ${week.start.toLocaleDateString()} ~ ${week.end.toLocaleDateString()}`);
-
-                let weekTotalSum = 0;
-                for (const tag of BWS_TAGS) {
-                    const result = await fetchPiValue(tag, startStr, endStr, 'Total');
-                    if (result.error) addLog(`    [Error] ${tag}: ${result.error}`);
-                    weekTotalSum += result.value;
-                }
-                const safeTotal = Math.round(weekTotalSum * 24);
-                addLog(`  -> 總和: ${safeTotal}`);
-                const dateTs = week.start.getTime();
-                let saveCount = 0;
-                for (const tank of boilerTanks) {
-                    const record: BWSParameterRecord = {
-                        id: generateUUID(),
-                        tankId: tank.id,
-                        steamProduction: safeTotal,
-                        date: dateTs
-                    };
-                    const history = await StorageService.getBWSParamsHistory(tank.id);
-                    const existing = history.find(h => h.date === dateTs);
-                    if (existing) {
-                        await StorageService.updateBWSParamRecord({ ...existing, steamProduction: safeTotal });
-                    } else {
-                        await StorageService.saveBWSParam(record);
-                    }
-                    saveCount++;
-                }
-                addLog(`  -> 已更新 ${saveCount} 個儲槽`);
+            if (data.success) {
+                addLog('✅ PI 匯入完成（CWS + BWS）');
+                await loadHistory();
+            } else {
+                addLog(`❌ 匯入失敗: ${data.error || data.message || '未知錯誤'}`);
             }
-            addLog("完成");
-            await loadHistory();
         } catch (e: any) {
             addLog(`錯誤: ${e.message}`);
         } finally {
             setImporting(false);
-            // onLoading(false); // Disabled as per user request
-        }
-    };
-
-    const handleBatchImportCWS = async () => {
-        if (!confirm(`確定要匯入「近 ${importWeeks} 週」的數據至資料庫嗎？\n這將寫入冷卻水系統的循環量與溫度參數。`)) return;
-
-        setImporting(true);
-        // onLoading(true); // Disabled as per user request
-        setImportLogs([]);
-        const addLog = (msg: string) => setImportLogs(prev => [...prev, `${new Date().toLocaleTimeString()} - ${msg}`]);
-        try {
-            addLog("開始 CWS 資料匯入...");
-            const cwsTanks = tanks.filter(t => t.system === SystemType.COOLING);
-            const ct1Tanks = cwsTanks.filter(t => t.name.includes('CWS-1') || t.name.includes('CT-1') || (t.description || '').includes('一階'));
-            const ct2Tanks = cwsTanks.filter(t => !ct1Tanks.find(ct1 => ct1.id === t.id));
-            addLog(`偵測到 CT-1: ${ct1Tanks.length}, CT-2: ${ct2Tanks.length}`);
-
-            const currentWeekMonday = getMonday(new Date());
-            const targetWeeks = [];
-            for (let i = 1; i <= importWeeks; i++) {
-                const endDate = new Date(currentWeekMonday);
-                endDate.setDate(currentWeekMonday.getDate() - (7 * (i - 1)));
-                const startDate = new Date(endDate);
-                startDate.setDate(endDate.getDate() - 7);
-                targetWeeks.push({ start: startDate, end: endDate });
-            }
-            targetWeeks.reverse();
-
-            const fetchAreaData = async (areaKey: 'CT-1' | 'CT-2', start: string, end: string) => {
-                const config = CWS_TAGS_CONFIG[areaKey];
-                let flowSum = 0;
-                for (const tag of config.flow) {
-                    const r = await fetchPiValue(tag, start, end, 'Average');
-                    if (r.error) addLog(`  [Warn] ${tag}: ${r.error}`);
-                    flowSum += r.value;
-                }
-                let tOutSum = 0, tOutCount = 0;
-                for (const tag of config.tempOut) {
-                    const r = await fetchPiValue(tag, start, end, 'Average');
-                    if (!r.error) { tOutSum += r.value; tOutCount++; }
-                }
-                const tOut = tOutCount > 0 ? tOutSum / tOutCount : 0;
-                let tRetSum = 0, tRetCount = 0;
-                for (const tag of config.tempRet) {
-                    const r = await fetchPiValue(tag, start, end, 'Average');
-                    if (!r.error) { tRetSum += r.value; tRetCount++; }
-                }
-                const tRet = tRetCount > 0 ? tRetSum / tRetCount : 0;
-                return { circulationRate: flowSum, tempOutlet: tOut, tempReturn: tRet, tempDiff: tRet - tOut };
-            };
-
-            for (const week of targetWeeks) {
-                const startStr = week.start.toISOString().split('T')[0] + 'T00:00:00';
-                const endStr = week.end.toISOString().split('T')[0] + 'T00:00:00';
-                const dateTs = week.start.getTime();
-                addLog(`處理週次: ${week.start.toLocaleDateString()}`);
-
-                if (ct1Tanks.length > 0) {
-                    const d1 = await fetchAreaData('CT-1', startStr, endStr);
-                    for (const tank of ct1Tanks) {
-                        const history = await StorageService.getCWSParamsHistory(tank.id);
-                        const existing = history.find(h => h.date === dateTs);
-                        const cwsHardness = existing?.cwsHardness || 0;
-                        const makeupHardness = existing?.makeupHardness || 0;
-                        const cycles = makeupHardness > 0 ? cwsHardness / makeupHardness : 1;
-                        const record: CWSParameterRecord = {
-                            id: existing?.id || generateUUID(),
-                            tankId: tank.id,
-                            date: dateTs,
-                            circulationRate: d1.circulationRate,
-                            tempOutlet: d1.tempOutlet,
-                            tempReturn: d1.tempReturn,
-                            tempDiff: d1.tempDiff,
-                            cwsHardness: cwsHardness,
-                            makeupHardness: makeupHardness,
-                            concentrationCycles: cycles
-                        };
-                        await StorageService.saveCWSParam(record);
-                    }
-                    addLog(`  -> Updated CT-1`);
-                }
-                if (ct2Tanks.length > 0) {
-                    const d2 = await fetchAreaData('CT-2', startStr, endStr);
-                    for (const tank of ct2Tanks) {
-                        const history = await StorageService.getCWSParamsHistory(tank.id);
-                        const existing = history.find(h => h.date === dateTs);
-                        const cwsHardness = existing?.cwsHardness || 0;
-                        const makeupHardness = existing?.makeupHardness || 0;
-                        const cycles = makeupHardness > 0 ? cwsHardness / makeupHardness : 1;
-                        const record: CWSParameterRecord = {
-                            id: existing?.id || generateUUID(),
-                            tankId: tank.id,
-                            date: dateTs,
-                            circulationRate: d2.circulationRate,
-                            tempOutlet: d2.tempOutlet,
-                            tempReturn: d2.tempReturn,
-                            tempDiff: d2.tempDiff,
-                            cwsHardness: cwsHardness,
-                            makeupHardness: makeupHardness,
-                            concentrationCycles: cycles
-                        };
-                        await StorageService.saveCWSParam(record);
-                    }
-                    addLog(`  -> Updated CT-2`);
-                }
-            }
-            addLog("完成");
-            await loadHistory();
-        } catch (e: any) {
-            addLog(`錯誤: ${e.message}`);
-        } finally {
-            setImporting(false);
-            // onLoading(false); // Disabled as per user request
         }
     };
 
@@ -3535,26 +3392,16 @@ const DataEntryView: React.FC<{
                     </div>
                 </Card>
 
-                {/* PI Import Card for CWS & BWS */}
+                {/* PI Import Card - 同時匯入 CWS & BWS */}
                 {(activeType === 'C' || activeType === 'D') && (
-                    <Card title={activeType === 'C' ? "冷卻水系統 (CWS) PI 匯入" : "鍋爐系統 (BWS) PI 匯入"} className="border-l-4 border-l-brand-400 bg-brand-50/30">
+                    <Card title="PI 自動匯入（CWS + BWS）" className="border-l-4 border-l-brand-400 bg-brand-50/30">
                         <div className="space-y-4">
                             <div className="bg-white p-4 rounded-lg border border-slate-200 text-sm text-slate-600">
-                                {activeType === 'C' ? (
-                                    <>讀取 CT-1 / CT-2 區域 Tags 的 <strong>Average</strong> 值。<br />自動寫入該週次的循環水量與溫度。</>
-                                ) : (
-                                    <>讀取 4 個 Steam Tags 的 <strong>Total</strong> 值 (加總 x 24)。<br />寫入所有鍋爐儲槽。</>
-                                )}
-                            </div>
-
-                            <div>
-                                <label className="block text-slate-500 text-xs mb-1">PI Web API URL</label>
-                                <input
-                                    type="text"
-                                    value={piBaseUrl}
-                                    onChange={e => setPiBaseUrl(e.target.value)}
-                                    className="w-full text-xs rounded border-slate-300 bg-white"
-                                />
+                                一次同時匯入以下兩類數據：
+                                <ul className="mt-2 space-y-1 list-disc list-inside">
+                                    <li><strong>冷卻水 (CWS)</strong>：CT-1 / CT-2 區域 Tags 的 Average 值（循環水量與溫度）</li>
+                                    <li><strong>鍋爐水 (BWS)</strong>：4 個 Steam Tags 的 Total 值（蒸汽產量）</li>
+                                </ul>
                             </div>
 
                             <div className="flex items-end gap-3">
@@ -3571,11 +3418,11 @@ const DataEntryView: React.FC<{
                                     </select>
                                 </div>
                                 <Button
-                                    onClick={activeType === 'C' ? handleBatchImportCWS : handleBatchImportBWS}
+                                    onClick={handleBatchImportAll}
                                     disabled={importing}
                                     className="bg-brand-600 hover:bg-brand-700 text-white h-[40px] px-6"
                                 >
-                                    {importing ? "匯入中..." : `開始 ${activeType === 'C' ? 'CWS' : 'BWS'} 匯入`}
+                                    {importing ? "匯入中..." : "開始 PI 匯入"}
                                 </Button>
                             </div>
 
