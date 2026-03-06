@@ -671,7 +671,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                 remainingDays
             };
         });
-    }, [tanks, readings]);
+    }, [tanks, readings, usageCalcWeeks]);
 
     const groups = useMemo(() => {
         const cooling = tanksWithStatus.filter(t => t.system === SystemType.COOLING);
@@ -6147,7 +6147,7 @@ const App: React.FC = () => {
 
     const renderContent = () => {
         switch (currentView) {
-            case 'dashboard': return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} onNavigate={handleNavigateToAnalysis} onLoading={setIsLoading} />;
+            case 'dashboard': return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} onNavigate={handleNavigateToAnalysis} onLoading={setIsLoading} usageCalcWeeks={appSettings.usageCalcWeeks} lowLevelWarningText={appSettings.lowLevelWarningText} />;
             case 'entry': return <DataEntryView tanks={tanks} readings={readings} onSave={handleSaveReading} onBatchSave={handleBatchSaveReadings} onUpdateTank={() => refreshData()} onLoading={setIsLoading} appSettings={appSettings} />;
             case 'analysis': return (
                 <AnalysisView

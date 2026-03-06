@@ -714,6 +714,12 @@ app.post('/api/settings', async (req, res) => {
             )
         `);
 
+        // 為舊版資料庫加入 updated_at 欄位
+        await client.query(`
+            ALTER TABLE app_settings 
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+        `);
+
         await client.query('BEGIN');
         for (const [key, value] of Object.entries(settings)) {
             await client.query(
