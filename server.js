@@ -1340,20 +1340,66 @@ app.post('/api/supplies/batch', async (req, res) => {
 
 // 刪除藥劑合約
 app.delete('/api/supplies/:id', async (req, res) => {
+    const client = await pool.connect();
     try {
         const { id } = req.params;
-        const result = await pool.query(
+        await client.query('BEGIN');
+
+        // 1. 取得即將刪除合約的資訊 (包含所屬儲槽與生效日期)
+        const targetSupplyRes = await client.query('SELECT tank_id, start_date FROM chemical_supplies WHERE id = $1', [id]);
+
+        if (targetSupplyRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: '找不到此合約紀錄' });
+        }
+
+        const { tank_id, start_date } = targetSupplyRes.rows[0];
+
+        // 2. 尋找「前一筆」合約 (該儲槽在被刪除合約的生效日之前的最新一筆紀錄)
+        const prevSupplyRes = await client.query(`
+            SELECT id, specific_gravity 
+            FROM chemical_supplies 
+            WHERE tank_id = $1 AND start_date < $2 
+            ORDER BY start_date DESC 
+            LIMIT 1
+        `, [tank_id, start_date]);
+
+        // 3. 重新計算並換綁歷史紀錄
+        if (prevSupplyRes.rows.length > 0) {
+            // 有前一筆合約，將綁定在此合約的 readings 轉移至前一筆，並用前一筆的比重重新計算重量
+            const prevSupply = prevSupplyRes.rows[0];
+            await client.query(`
+                UPDATE readings 
+                SET supply_id = $1, 
+                    applied_sg = $2, 
+                    calculated_weight_kg = calculated_volume * $2 
+                WHERE supply_id = $3
+            `, [prevSupply.id, prevSupply.specific_gravity, id]);
+        } else {
+            // 找不到前一筆合約 (這是該儲槽最舊的第一份合約)，則解除綁定並將比重退回 1.0 (水)
+            await client.query(`
+                UPDATE readings 
+                SET supply_id = NULL, 
+                    applied_sg = 1.0, 
+                    calculated_weight_kg = calculated_volume * 1.0 
+                WHERE supply_id = $1
+            `, [id]);
+        }
+
+        // 4. 安全刪除合約 (關聯已被移除)
+        const result = await client.query(
             'DELETE FROM chemical_supplies WHERE id = $1 RETURNING *',
             [id]
         );
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: '找不到此合約紀錄' });
-        }
-        res.json({ message: '合約紀錄已刪除', deleted: result.rows[0] });
+        await client.query('COMMIT');
+        res.json({ message: '合約紀錄已刪除，且關聯歷史紀錄已溯源重新計算', deleted: result.rows[0] });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: '刪除藥劑合約失敗' });
+        await client.query('ROLLBACK');
+        console.error('刪除合約失敗 (Transaction Rolled Back):', err);
+        res.status(500).json({ error: '刪除藥劑合約失敗，發生系統層級錯誤' });
+    } finally {
+        client.release();
     }
 });
 
@@ -2084,7 +2130,7 @@ app.post('/api/notes', async (req, res) => {
         `;
 
         const result = await client.query(sql, [
-            note.id,
+            note.id || crypto.randomUUID(),
             note.date_str,
             note.area,
             note.chemical_name,

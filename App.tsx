@@ -158,6 +158,15 @@ const formatDateForInput = (date: any): string => {
     }
 };
 
+// 取得台北時間 (UTC+8) 的 YYYY-MM-DD 日期字串，支援增減天數
+const getTaipeiDateString = (dateObj?: Date | number | string, offsetDays: number = 0): string => {
+    const d = dateObj ? new Date(dateObj) : new Date();
+    if (isNaN(d.getTime())) return "";
+    const taipeiTime = new Date(d.getTime() + (8 * 60 * 60 * 1000));
+    taipeiTime.setUTCDate(taipeiTime.getUTCDate() + offsetDays);
+    return taipeiTime.toISOString().split('T')[0];
+};
+
 // Helper: Normalize date string "YYYY-MM-DD" or "YYYY/MM/DD" to timestamp at Local Midnight
 // This ensures consistency between Manual Input and Excel Import for "Same Day" checks
 const getNormalizedTimestamp = (dateStr: string | Date | number): number | null => {
@@ -935,7 +944,7 @@ const DataEntryView: React.FC<{
     appSettings: any;
 }> = ({ tanks, readings, onSave, onBatchSave, onUpdateTank, onLoading, appSettings }) => {
     const [selectedTankId, setSelectedTankId] = useState<string>('');
-    const [date, setDate] = useState<string>((() => { const d = new Date(); d.setDate(d.getDate() - 1); return d.toISOString().split('T')[0]; })());
+    const [date, setDate] = useState<string>(getTaipeiDateString(undefined, -1));
     // Batch Levels for Type A
     const [batchLevels, setBatchLevels] = useState<{ [key: string]: string }>({});
     const [activeType, setActiveType] = useState<'A' | 'B' | 'C' | 'D'>('A');
@@ -1003,8 +1012,15 @@ const DataEntryView: React.FC<{
 
                 // 1. Check vs Prev
                 if (prev) {
-                    const daysDiff = (newReading.timestamp - prev.timestamp) / (1000 * 60 * 60 * 24);
-                    if (daysDiff > 0) {
+                    const d1 = new Date(newReading.timestamp);
+                    d1.setHours(0, 0, 0, 0);
+                    const d2 = new Date(prev.timestamp);
+                    d2.setHours(0, 0, 0, 0);
+                    const calendarDays = (d1.getTime() - d2.getTime()) / (1000 * 60 * 60 * 24);
+                    // Use actual time difference if greater than 1, otherwise use at least 1, but if it's multiple calendar days, use calendar days
+                    const daysDiff = Math.max(1, calendarDays);
+
+                    if (daysDiff >= 1) { // Will always be true now
                         const addedAmount = newReading.addedAmountLiters || 0;
                         const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
                         const dailyChange = Math.abs(levelChange) / daysDiff;
@@ -1271,8 +1287,8 @@ const DataEntryView: React.FC<{
     const [activeSupply, setActiveSupply] = useState<ChemicalSupply | undefined>(undefined);
     const [lastReadingSG, setLastReadingSG] = useState<number | null>(null);
     const [newSupply, setNewSupply] = useState<Partial<ChemicalSupply>>({});
-    const [cwsInput, setCwsInput] = useState<Partial<CWSParameterRecord> & { dateStr?: string }>({ dateStr: new Date().toISOString().split('T')[0] });
-    const [bwsInput, setBwsInput] = useState<Partial<BWSParameterRecord> & { dateStr?: string }>({ dateStr: new Date().toISOString().split('T')[0] });
+    const [cwsInput, setCwsInput] = useState<Partial<CWSParameterRecord> & { dateStr?: string }>({ dateStr: getTaipeiDateString() });
+    const [bwsInput, setBwsInput] = useState<Partial<BWSParameterRecord> & { dateStr?: string }>({ dateStr: getTaipeiDateString() });
 
     const selectedTank = tanks.find(t => t.id === selectedTankId);
 
@@ -1342,8 +1358,14 @@ const DataEntryView: React.FC<{
         let anomalyReason = null;
 
         if (prev) {
-            const daysDiff = (newReading.timestamp - prev.timestamp) / (1000 * 60 * 60 * 24);
-            if (daysDiff > 0) {
+            const d1 = new Date(newReading.timestamp);
+            d1.setHours(0, 0, 0, 0);
+            const d2 = new Date(prev.timestamp);
+            d2.setHours(0, 0, 0, 0);
+            const calendarDays = (d1.getTime() - d2.getTime()) / (1000 * 60 * 60 * 24);
+            const daysDiff = Math.max(1, calendarDays);
+
+            if (daysDiff >= 1) { // Will always be true
                 const addedAmount = newReading.addedAmountLiters || 0;
                 // Calculate consumption (positive means consumption, negative means level rose)
                 const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
@@ -1418,9 +1440,28 @@ const DataEntryView: React.FC<{
             return;
         }
 
+        const timestamp = getNormalizedTimestamp(date);
+        if (!timestamp) {
+            alert('日期格式錯誤');
+            return;
+        }
+
+        // 檢查是否有現存紀錄 (將資料庫的時戳明確轉換為 YYYY-MM-DD 字串，以確保跨瀏覽器相容性並完美比對)
+        const existingRecordsForDate = readings.filter(r => {
+            const rd = new Date(r.timestamp);
+            const rDateStr = `${rd.getFullYear()}-${String(rd.getMonth() + 1).padStart(2, '0')}-${String(rd.getDate()).padStart(2, '0')}`;
+            return rDateStr === date && entries.some(([tId, val]) => tId === r.tankId && val);
+        });
+
+        if (existingRecordsForDate.length > 0) {
+            const tankNames = existingRecordsForDate.map(r => tanks.find(t => t.id === r.tankId)?.name || r.tankId).join(', ');
+            const dateDisplay = new Date(timestamp).toLocaleDateString('zh-TW');
+            const confirmed = window.confirm(`⚠️ 覆蓋確認\n\n選定日期 (${dateDisplay}) 已有以下儲槽的紀錄：\n${tankNames}\n\n是否確定要覆蓋現有數據？`);
+            if (!confirmed) return;
+        }
+
         onLoading(true);
         try {
-            const timestamp = new Date(date).getTime();
             const newReadings: Reading[] = [];
 
             for (const [tId, valStr] of entries) {
@@ -1450,8 +1491,11 @@ const DataEntryView: React.FC<{
                 const vol = calculateTankVolume(tank, finalLevelCm);
                 const weight = vol * finalSG;
 
+                // 若有現存紀錄，則重複使用其 ID 以進行覆蓋 (UPSERT)
+                const existingRecord = existingRecordsForDate.find(r => r.tankId === tId);
+
                 newReadings.push({
-                    id: generateUUID(),
+                    id: existingRecord ? existingRecord.id : generateUUID(),
                     tankId: tId,
                     timestamp: timestamp,
                     levelCm: finalLevelCm,
@@ -1459,7 +1503,7 @@ const DataEntryView: React.FC<{
                     calculatedWeightKg: weight,
                     appliedSpecificGravity: finalSG,
                     supplyId: activeSup?.id,
-                    addedAmountLiters: 0, // No refill calc in batch manual
+                    addedAmountLiters: existingRecord?.addedAmountLiters || 0, // 保留原有的加藥量
                     operatorName: operator
                 });
             }
@@ -2956,7 +3000,7 @@ const DataEntryView: React.FC<{
                             setEditingItem(item);
                             setEditForm({
                                 ...item,
-                                dateStr: new Date(item.startDate).toISOString().split('T')[0]
+                                dateStr: getTaipeiDateString(item.startDate)
                             });
                             setIsEditOpen(true);
                         };
@@ -3126,7 +3170,7 @@ const DataEntryView: React.FC<{
                             setEditingItem(item);
                             setEditForm({
                                 ...item,
-                                dateStr: item.date ? new Date(item.date).toISOString().split('T')[0] : ''
+                                dateStr: item.date ? getTaipeiDateString(item.date) : ''
                             });
                             setIsEditOpen(true);
                         };
@@ -3253,7 +3297,7 @@ const DataEntryView: React.FC<{
                             setEditingItem(item);
                             setEditForm({
                                 ...item,
-                                dateStr: item.date ? new Date(item.date).toISOString().split('T')[0] : ''
+                                dateStr: item.date ? getTaipeiDateString(item.date) : ''
                             });
                             setIsEditOpen(true);
                         };
@@ -4790,7 +4834,7 @@ const ImportantNotesView: React.FC<{ thresholdWarningText?: string }> = ({ thres
             if (editingNote) {
                 await StorageService.updateNote({ ...editingNote, ...formData } as ImportantNote);
             } else {
-                await StorageService.saveNote(formData as ImportantNote);
+                await StorageService.saveNote({ ...formData, id: generateUUID() } as ImportantNote);
             }
             setIsEditOpen(false);
             setEditingNote(null);
@@ -5187,7 +5231,7 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
         const ws = XLSX.utils.json_to_sheet(data);
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, "Tanks Config");
-        XLSX.writeFile(wb, `WTCA_Tanks_Config_${new Date().toISOString().slice(0, 10)}.xlsx`);
+        XLSX.writeFile(wb, `WTCA_Tanks_Config_${getTaipeiDateString()}.xlsx`);
     };
 
     const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
