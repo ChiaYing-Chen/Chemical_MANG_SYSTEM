@@ -1162,7 +1162,128 @@ const DataEntryView: React.FC<{
     // 新增狀態保存歷史紀錄截止日期
     const [historyEndDate, setHistoryEndDate] = useState<string>('');
 
-    // File input for Excel import
+    // === 數據品質檢查 State ===
+    interface DupGroup {
+        tankId: string;
+        tankName: string;
+        date: string; // YYYY-MM-DD (台北)
+        readings: Reading[];
+        context: Reading[]; // 前後兩天
+    }
+    const toTaipeiDateStr = (ts: number) =>
+        new Date(ts + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    const [dupCheckStart, setDupCheckStart] = useState('');
+    const [dupCheckEnd, setDupCheckEnd] = useState('');
+    const [dupGroups, setDupGroups] = useState<DupGroup[]>([]);
+    const [dupChecked, setDupChecked] = useState(false);
+    const [dupDialogIndex, setDupDialogIndex] = useState(0);
+    const [isDupDialogOpen, setIsDupDialogOpen] = useState(false);
+
+    const handleDuplicateCheck = () => {
+        const startTs = dupCheckStart ? new Date(dupCheckStart + 'T00:00:00+08:00').getTime() : 0;
+        const endTs = dupCheckEnd ? new Date(dupCheckEnd + 'T23:59:59+08:00').getTime() : Date.now();
+        const inRange = readings.filter(r => r.timestamp >= startTs && r.timestamp <= endTs);
+
+        // 依 (tankId, 台北日期) 分組
+        const groupMap = new Map<string, Reading[]>();
+        for (const r of inRange) {
+            const key = r.tankId + '|' + toTaipeiDateStr(r.timestamp);
+            if (!groupMap.has(key)) groupMap.set(key, []);
+            groupMap.get(key)!.push(r);
+        }
+
+        const results: DupGroup[] = [];
+        for (const [key, group] of groupMap.entries()) {
+            if (group.length < 2) continue;
+            const [tankId, date] = key.split('|');
+            const tank = tanks.find(t => t.id === tankId);
+            // 前後兩天參考讀數
+            const dayMs = 24 * 3600 * 1000;
+            const centerTs = new Date(date + 'T12:00:00+08:00').getTime();
+            const context = readings
+                .filter(r => r.tankId === tankId
+                    && r.timestamp >= centerTs - 3 * dayMs
+                    && r.timestamp <= centerTs + 3 * dayMs)
+                .sort((a, b) => a.timestamp - b.timestamp);
+            results.push({
+                tankId,
+                tankName: tank?.name || tankId,
+                date,
+                readings: group.sort((a, b) => a.timestamp - b.timestamp),
+                context
+            });
+        }
+        setDupGroups(results);
+        setDupChecked(true);
+        if (results.length > 0) {
+            setDupDialogIndex(0);
+            setIsDupDialogOpen(true);
+        }
+    };
+
+    // 匙出日期範圍
+    const [exportStart, setExportStart] = useState('');
+    const [exportEnd, setExportEnd] = useState('');
+
+    // === B/C/D 數據品質檢查 State ===
+    interface DupBCDGroup {
+        tankId: string;
+        tankName: string;
+        date: string; // YYYY-MM-DD
+        items: any[]; // 各類型的原始資料
+    }
+    const [dupBCDCheckStart, setDupBCDCheckStart] = useState('');
+    const [dupBCDCheckEnd, setDupBCDCheckEnd] = useState('');
+    const [dupBCDGroups, setDupBCDGroups] = useState<DupBCDGroup[]>([]);
+    const [dupBCDChecked, setDupBCDChecked] = useState(false);
+    const [dupBCDDialogIndex, setDupBCDDialogIndex] = useState(0);
+    const [isDupBCDDialogOpen, setIsDupBCDDialogOpen] = useState(false);
+
+    const handleDupBCDCheck = async (type: 'B' | 'C' | 'D') => {
+        const startTs = dupBCDCheckStart ? new Date(dupBCDCheckStart + 'T00:00:00+08:00').getTime() : 0;
+        const endTs = dupBCDCheckEnd ? new Date(dupBCDCheckEnd + 'T23:59:59+08:00').getTime() : Date.now();
+
+        let allItems: { tankId: string; date: number; id: string; raw: any }[] = [];
+        if (type === 'B') {
+            const allSupplies = await StorageService.getSupplies();
+            allItems = allSupplies.filter(s => s.startDate >= startTs && s.startDate <= endTs)
+                .map(s => ({ tankId: s.tankId, date: s.startDate, id: s.id, raw: s }));
+        } else if (type === 'C') {
+            allItems = historyCWS.filter(p => {
+                const d = Number(p.date);
+                return d >= startTs && d <= endTs;
+            }).map(p => ({ tankId: p.tankId, date: Number(p.date), id: p.id, raw: p }));
+        } else {
+            allItems = historyBWS.filter(p => {
+                const d = Number(p.date);
+                return d >= startTs && d <= endTs;
+            }).map(p => ({ tankId: p.tankId, date: Number(p.date), id: p.id, raw: p }));
+        }
+
+        const groupMap = new Map<string, { tankId: string; date: number; items: any[] }>();
+        for (const item of allItems) {
+            const dateKey = toTaipeiDateStr(item.date);
+            const key = item.tankId + '|' + dateKey;
+            if (!groupMap.has(key)) groupMap.set(key, { tankId: item.tankId, date: item.date, items: [] });
+            groupMap.get(key)!.items.push(item.raw);
+        }
+
+        const results: DupBCDGroup[] = [];
+        for (const [key, g] of groupMap.entries()) {
+            if (g.items.length < 2) continue;
+            const [tankId, date] = key.split('|');
+            const tank = tanks.find(t => t.id === tankId);
+            results.push({ tankId, tankName: tank?.name || tankId, date, items: g.items });
+        }
+        setDupBCDGroups(results);
+        setDupBCDChecked(true);
+        if (results.length > 0) {
+            setDupBCDDialogIndex(0);
+            setIsDupBCDDialogOpen(true);
+        }
+    };
+
+
     const [file, setFile] = useState<File | null>(null);
 
     // --- PI Import State ---
@@ -2266,10 +2387,17 @@ const DataEntryView: React.FC<{
     };
 
     const handleExport = () => {
-        const data = readings.map(r => {
+        const startTs = exportStart ? new Date(exportStart + 'T00:00:00+08:00').getTime() : 0;
+        const endTs = exportEnd ? new Date(exportEnd + 'T23:59:59+08:00').getTime() : Infinity;
+        const exportReadings = readings.filter(r => r.timestamp >= startTs && r.timestamp <= endTs);
+        if (exportReadings.length === 0) {
+            alert('所選日期範圍內沒有資料可匙出。');
+            return;
+        }
+        const data = exportReadings.map(r => {
             const t = tanks.find(tank => tank.id === r.tankId);
             return {
-                'Date': new Date(r.timestamp).toLocaleDateString(),
+                'Date': new Date(r.timestamp).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }),
                 'Tank': t ? t.name : r.tankId,
                 'Level (cm)': r.levelCm,
                 'Volume (L)': r.calculatedVolume.toFixed(2),
@@ -2281,8 +2409,12 @@ const DataEntryView: React.FC<{
         const ws = XLSX.utils.json_to_sheet(data);
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, "Readings");
-        XLSX.writeFile(wb, "PowerChem_Readings.xlsx");
+        const suffix = (exportStart || exportEnd)
+            ? `_${exportStart || 'all'}~${exportEnd || 'all'}`
+            : '';
+        XLSX.writeFile(wb, `PowerChem_Readings${suffix}.xlsx`);
     };
+
 
     const handleSmartPaste = async () => {
         try {
@@ -2686,14 +2818,175 @@ const DataEntryView: React.FC<{
 
                     {activeType === 'A' && (
                         <div className="mt-4 pt-4 border-t border-slate-100">
-                            <Button onClick={handleExport} variant="ghost" className="text-slate-500 w-full justify-center">
-                                <Icons.Download className="w-4 h-4 mr-2" />
-                                匯出歷史液位資料 (Table A)
-                            </Button>
+                            <div className="flex flex-wrap items-end gap-3">
+                                <div>
+                                    <label className="block text-xs text-slate-500 mb-1">匯出起始日期（選填）</label>
+                                    <input type="date" value={exportStart} onChange={e => setExportStart(e.target.value)}
+                                        className="border border-slate-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-500 mb-1">匯出結束日期（選填）</label>
+                                    <input type="date" value={exportEnd} onChange={e => setExportEnd(e.target.value)}
+                                        className="border border-slate-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <Button onClick={handleExport} variant="ghost" className="text-slate-500 justify-center flex items-center">
+                                    <Icons.Download className="w-4 h-4 mr-2" />
+                                    匯出歷史液位資料 (Table A)
+                                </Button>
+                            </div>
+                            {(exportStart || exportEnd) && (
+                                <p className="text-xs text-slate-400 mt-1">
+                                    將匯出 {exportStart || '最早'} ～ {exportEnd || '最新'} 的資料
+                                </p>
+                            )}
                         </div>
                     )}
 
-                    {/* Edit Dialog - 重用 DataEntryView 內部的狀態 */}
+
+                    {/* === 數據品質檢查卡片 === */}
+                    {activeType === 'A' && (
+                        <div className="mt-6 pt-6 border-t-2 border-amber-300">
+                            <h4 className="font-bold text-amber-800 flex items-center mb-4">
+                                <span className="mr-2">🔍</span>
+                                數據品質檢查：偵測同一桶槽同日重複液位讀數
+                            </h4>
+                            <div className="flex flex-wrap items-end gap-3 mb-3">
+                                <div>
+                                    <label className="block text-xs text-slate-600 mb-1">起始日期</label>
+                                    <input type="date" value={dupCheckStart} onChange={e => setDupCheckStart(e.target.value)}
+                                        className="border border-amber-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-600 mb-1">結束日期</label>
+                                    <input type="date" value={dupCheckEnd} onChange={e => setDupCheckEnd(e.target.value)}
+                                        className="border border-amber-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <Button onClick={handleDuplicateCheck}
+                                    className="bg-amber-500 hover:bg-amber-600 text-white text-sm py-2 px-4">
+                                    開始檢查
+                                </Button>
+                            </div>
+                            {dupChecked && (
+                                dupGroups.length === 0
+                                    ? <p className="text-green-700 text-sm font-medium">✅ 所選日期範圍內，未偵測到重複讀數。</p>
+                                    : <p className="text-red-700 text-sm font-medium">⚠️ 發現 {dupGroups.length} 組重複讀數，請逐組處理。
+                                        <button onClick={() => { setDupDialogIndex(0); setIsDupDialogOpen(true); }}
+                                            className="ml-2 underline text-amber-700">重新開啟視窗</button>
+                                    </p>
+                            )}
+                        </div>
+                    )}
+
+                    {/* 重複讀數處理彈窗 */}
+                    {isDupDialogOpen && dupGroups.length > 0 && (() => {
+                        const group = dupGroups[dupDialogIndex];
+                        const handleDeleteDup = async (id: string) => {
+                            if (!confirm('確定要刪除此筆液位讀數？')) return;
+                            try {
+                                onLoading(true);
+                                await StorageService.deleteReading(id);
+                                onUpdateTank();
+                                const updatedGroup = { ...group, readings: group.readings.filter(r => r.id !== id) };
+                                const newGroups = dupGroups.map((g, i) => i === dupDialogIndex ? updatedGroup : g)
+                                    .filter(g => g.readings.length >= 2);
+                                setDupGroups(newGroups);
+                                if (newGroups.length === 0) {
+                                    setIsDupDialogOpen(false);
+                                    alert('所有重複液位讀數已處理完成！');
+                                } else if (dupDialogIndex >= newGroups.length) {
+                                    setDupDialogIndex(newGroups.length - 1);
+                                }
+                            } catch (e) { alert('刪除失敗'); } finally { onLoading(false); }
+                        };
+                        return (
+                            <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
+                                onClick={e => { if (e.target === e.currentTarget) setIsDupDialogOpen(false); }}>
+                                <div className="bg-white rounded-xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-y-auto">
+                                    <div className="bg-amber-50 border-b border-amber-200 px-6 py-4 rounded-t-xl">
+                                        <div className="flex justify-between items-center">
+                                            <h3 className="font-bold text-amber-900 text-lg">
+                                                ⚠️ 重複液位讀數 {dupDialogIndex + 1} / {dupGroups.length}
+                                            </h3>
+                                            <button onClick={() => setIsDupDialogOpen(false)}
+                                                className="text-slate-500 hover:text-red-600 text-2xl font-bold leading-none">×</button>
+                                        </div>
+                                        <p className="text-sm text-amber-800 mt-1">
+                                            桶槽：<strong>{group.tankName}</strong> &bull; 日期：<strong>{group.date}</strong>
+                                        </p>
+                                    </div>
+                                    <div className="px-6 py-4 space-y-5">
+                                        {/* 重複筆數列表 */}
+                                        <div>
+                                            <h4 className="font-semibold text-red-700 mb-2">同日重複筆數（請刪除不正確的那筆）</h4>
+                                            <div className="space-y-2">
+                                                {group.readings.map(r => (
+                                                    <div key={r.id} className="flex items-center justify-between bg-red-50 border border-red-200 rounded-lg p-3">
+                                                        <div className="text-sm">
+                                                            <span className="font-mono text-red-900">
+                                                                {new Date(r.timestamp).toLocaleString('zh-TW', { hour12: false, timeZone: 'Asia/Taipei' })}
+                                                            </span>
+                                                            <span className="ml-4 text-slate-700">液位: <strong>{r.levelCm} cm</strong></span>
+                                                            <span className="ml-4 text-slate-700">存量: <strong>{Math.round(r.calculatedVolume)} L</strong></span>
+                                                            {r.operatorName && <span className="ml-4 text-slate-400">操作者: {r.operatorName}</span>}
+                                                        </div>
+                                                        <button onClick={() => handleDeleteDup(r.id)}
+                                                            className="ml-4 shrink-0 text-sm bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded">
+                                                            刪除
+                                                        </button>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                        {/* 前後日期參考 */}
+                                        <div>
+                                            <h4 className="font-semibold text-slate-700 mb-2">📊 前後大約兩天的液位參考（黃色為問題日）</h4>
+                                            <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                                                <table className="min-w-full text-xs">
+                                                    <thead className="bg-slate-100">
+                                                        <tr>
+                                                            <th className="px-3 py-2 text-left">日期時間（台北）</th>
+                                                            <th className="px-3 py-2 text-left">液位 (cm)</th>
+                                                            <th className="px-3 py-2 text-left">存量 (L)</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-100">
+                                                        {group.context.map(r => {
+                                                            const isCurrentDay = new Date(r.timestamp + 8 * 3600 * 1000).toISOString().slice(0, 10) === group.date;
+                                                            return (
+                                                                <tr key={r.id} className={isCurrentDay ? 'bg-amber-100 font-semibold' : 'bg-white'}>
+                                                                    <td className="px-3 py-1.5">
+                                                                        {new Date(r.timestamp).toLocaleString('zh-TW', { hour12: false, timeZone: 'Asia/Taipei' })}
+                                                                    </td>
+                                                                    <td className="px-3 py-1.5">{r.levelCm}</td>
+                                                                    <td className="px-3 py-1.5">{Math.round(r.calculatedVolume)}</td>
+                                                                </tr>
+                                                            );
+                                                        })}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    {/* 導航列 */}
+                                    <div className="border-t border-slate-200 px-6 py-4 flex justify-between items-center">
+                                        <button disabled={dupDialogIndex === 0}
+                                            onClick={() => setDupDialogIndex(i => i - 1)}
+                                            className="text-sm px-4 py-2 border rounded disabled:opacity-40 hover:bg-slate-50">
+                                            ← 上一組
+                                        </button>
+                                        <span className="text-xs text-slate-500">{dupDialogIndex + 1} / {dupGroups.length}</span>
+                                        <button disabled={dupDialogIndex >= dupGroups.length - 1}
+                                            onClick={() => setDupDialogIndex(i => i + 1)}
+                                            className="text-sm px-4 py-2 border rounded disabled:opacity-40 hover:bg-slate-50">
+                                            下一組 →
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })()}
+
+
                     <EditDialog
                         isOpen={isEditOpen}
                         title={
@@ -3372,7 +3665,153 @@ const DataEntryView: React.FC<{
                             </div>
                         );
                     })()}
+                    {/* B 頁籤數據品質檢查 */}
+                    {activeType === 'B' && (
+                        <div className="mt-6 pt-6 border-t-2 border-amber-300">
+                            <h4 className="font-bold text-amber-800 flex items-center mb-4">
+                                <span className="mr-2">🔍</span>數據品質檢查：偵測同一桶槽同日重複藥劑合約
+                            </h4>
+                            <div className="flex flex-wrap items-end gap-3 mb-3">
+                                <div>
+                                    <label className="block text-xs text-slate-600 mb-1">起始日期</label>
+                                    <input type="date" value={dupBCDCheckStart} onChange={e => setDupBCDCheckStart(e.target.value)} className="border border-amber-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-600 mb-1">結束日期</label>
+                                    <input type="date" value={dupBCDCheckEnd} onChange={e => setDupBCDCheckEnd(e.target.value)} className="border border-amber-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <Button onClick={() => handleDupBCDCheck('B')} className="bg-amber-500 hover:bg-amber-600 text-white text-sm py-2 px-4">開始檢查</Button>
+                            </div>
+                            {dupBCDChecked && activeType === 'B' && (dupBCDGroups.length === 0
+                                ? <p className="text-green-700 text-sm">✅ 未偵測到重複資料。</p>
+                                : <p className="text-red-700 text-sm">⚠️ 發現 {dupBCDGroups.length} 組重複。<button onClick={() => { setDupBCDDialogIndex(0); setIsDupBCDDialogOpen(true); }} className="ml-2 underline text-amber-700">重新開啟</button></p>)}
+                        </div>
+                    )}
+                    {/* C 頁籤數據品質檢查 */}
+                    {activeType === 'C' && (
+                        <div className="mt-6 pt-6 border-t-2 border-amber-300">
+                            <h4 className="font-bold text-amber-800 flex items-center mb-4">
+                                <span className="mr-2">🔍</span>數據品質檢查：偵測同一桶槽同日重複冷卻水生產數據
+                            </h4>
+                            <div className="flex flex-wrap items-end gap-3 mb-3">
+                                <div>
+                                    <label className="block text-xs text-slate-600 mb-1">起始日期</label>
+                                    <input type="date" value={dupBCDCheckStart} onChange={e => setDupBCDCheckStart(e.target.value)} className="border border-amber-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-600 mb-1">結束日期</label>
+                                    <input type="date" value={dupBCDCheckEnd} onChange={e => setDupBCDCheckEnd(e.target.value)} className="border border-amber-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <Button onClick={() => handleDupBCDCheck('C')} className="bg-amber-500 hover:bg-amber-600 text-white text-sm py-2 px-4">開始檢查</Button>
+                            </div>
+                            {dupBCDChecked && activeType === 'C' && (dupBCDGroups.length === 0
+                                ? <p className="text-green-700 text-sm">✅ 未偵測到重複資料。</p>
+                                : <p className="text-red-700 text-sm">⚠️ 發現 {dupBCDGroups.length} 組重複。<button onClick={() => { setDupBCDDialogIndex(0); setIsDupBCDDialogOpen(true); }} className="ml-2 underline text-amber-700">重新開啟</button></p>)}
+                        </div>
+                    )}
+                    {/* D 頁籤數據品質檢查 */}
+                    {activeType === 'D' && (
+                        <div className="mt-6 pt-6 border-t-2 border-amber-300">
+                            <h4 className="font-bold text-amber-800 flex items-center mb-4">
+                                <span className="mr-2">🔍</span>數據品質檢查：偵測同一桶槽同日重複鍋爐水生產數據
+                            </h4>
+                            <div className="flex flex-wrap items-end gap-3 mb-3">
+                                <div>
+                                    <label className="block text-xs text-slate-600 mb-1">起始日期</label>
+                                    <input type="date" value={dupBCDCheckStart} onChange={e => setDupBCDCheckStart(e.target.value)} className="border border-amber-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-slate-600 mb-1">結束日期</label>
+                                    <input type="date" value={dupBCDCheckEnd} onChange={e => setDupBCDCheckEnd(e.target.value)} className="border border-amber-300 rounded px-2 py-1 text-sm" />
+                                </div>
+                                <Button onClick={() => handleDupBCDCheck('D')} className="bg-amber-500 hover:bg-amber-600 text-white text-sm py-2 px-4">開始檢查</Button>
+                            </div>
+                            {dupBCDChecked && activeType === 'D' && (dupBCDGroups.length === 0
+                                ? <p className="text-green-700 text-sm">✅ 未偵測到重複資料。</p>
+                                : <p className="text-red-700 text-sm">⚠️ 發現 {dupBCDGroups.length} 組重複。<button onClick={() => { setDupBCDDialogIndex(0); setIsDupBCDDialogOpen(true); }} className="ml-2 underline text-amber-700">重新開啟</button></p>)}
+                        </div>
+                    )}
+
+                    {/* B/C/D 重複處理彈窗 */}
+                    {isDupBCDDialogOpen && dupBCDGroups.length > 0 && (() => {
+                        const group = dupBCDGroups[dupBCDDialogIndex];
+                        const handleDeleteBCDDup = async (id: string) => {
+                            if (!confirm('確定要刪除此筆資料？')) return;
+                            try {
+                                onLoading(true);
+                                if (activeType === 'B') {
+                                    await StorageService.deleteSupply(id);
+                                    const data = await StorageService.getSupplies();
+                                    setHistorySupplies(data.filter((s: any) => s.tankId === selectedTankId).sort((a: any, b: any) => b.startDate - a.startDate));
+                                } else if (activeType === 'C') {
+                                    await StorageService.deleteCWSParamRecord(id);
+                                    const data = await StorageService.getCWSParamsHistory();
+                                    setHistoryCWS(data);
+                                } else {
+                                    await StorageService.deleteBWSParamRecord(id);
+                                    const data = await StorageService.getBWSParamsHistory(selectedTankId);
+                                    setHistoryBWS(data);
+                                }
+                                onUpdateTank();
+                                const updatedGroup = { ...group, items: group.items.filter((r: any) => r.id !== id) };
+                                const newGroups = dupBCDGroups
+                                    .map((g, i) => i === dupBCDDialogIndex ? updatedGroup : g)
+                                    .filter(g => g.items.length >= 2);
+                                setDupBCDGroups(newGroups);
+                                if (newGroups.length === 0) {
+                                    setIsDupBCDDialogOpen(false);
+                                    alert('所有重複資料已處理完成！');
+                                } else if (dupBCDDialogIndex >= newGroups.length) {
+                                    setDupBCDDialogIndex(newGroups.length - 1);
+                                }
+                            } catch (e) { alert('刪除失敗'); } finally { onLoading(false); }
+                        };
+
+                        const getLabel = (item: any): string => {
+                            if (activeType === 'B') return `生效日: ${item.startDate ? new Date(item.startDate).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-'} | SG: ${item.specificGravity ?? '-'} | 供應商: ${item.supplierName ?? '-'}`;
+                            if (activeType === 'C') return `日期: ${item.date ? new Date(Number(item.date)).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-'} | 循環水量: ${item.circulationRate ?? '-'} | 溫差: ${item.tempDiff ?? '-'}`;
+                            return `日期: ${item.date ? new Date(Number(item.date)).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-'} | 製氣量: ${item.steamProduction ?? '-'} T`;
+                        };
+
+                        return (
+                            <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
+                                onClick={e => { if (e.target === e.currentTarget) setIsDupBCDDialogOpen(false); }}>
+                                <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[85vh] overflow-y-auto">
+                                    <div className="bg-amber-50 border-b border-amber-200 px-6 py-4 rounded-t-xl">
+                                        <div className="flex justify-between items-center">
+                                            <h3 className="font-bold text-amber-900 text-lg">⚠️ 重複資料 {dupBCDDialogIndex + 1} / {dupBCDGroups.length}</h3>
+                                            <button onClick={() => setIsDupBCDDialogOpen(false)} className="text-2xl font-bold text-slate-400 hover:text-red-600">×</button>
+                                        </div>
+                                        <p className="text-sm text-amber-800 mt-1">桶槽：<strong>{group.tankName}</strong> &bull; 日期：<strong>{group.date}</strong></p>
+                                    </div>
+                                    <div className="px-6 py-4">
+                                        <h4 className="font-semibold text-red-700 mb-3">同日重複筆數（請刪除不正確的那筆）</h4>
+                                        <div className="space-y-2">
+                                            {group.items.map((item: any) => (
+                                                <div key={item.id} className="flex items-center justify-between bg-red-50 border border-red-200 rounded-lg p-3">
+                                                    <span className="text-sm text-red-900">{getLabel(item)}</span>
+                                                    <button onClick={() => handleDeleteBCDDup(item.id)}
+                                                        className="ml-4 shrink-0 text-sm bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded">
+                                                        刪除
+                                                    </button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                    <div className="border-t border-slate-200 px-6 py-4 flex justify-between items-center">
+                                        <button disabled={dupBCDDialogIndex === 0} onClick={() => setDupBCDDialogIndex(i => i - 1)}
+                                            className="text-sm px-4 py-2 border rounded disabled:opacity-40 hover:bg-slate-50">&larr; 上一組</button>
+                                        <span className="text-xs text-slate-500">{dupBCDDialogIndex + 1} / {dupBCDGroups.length}</span>
+                                        <button disabled={dupBCDDialogIndex >= dupBCDGroups.length - 1} onClick={() => setDupBCDDialogIndex(i => i + 1)}
+                                            className="text-sm px-4 py-2 border rounded disabled:opacity-40 hover:bg-slate-50">下一組 &rarr;</button>
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })()}
+
                 </Card>
+
 
 
                 <Card

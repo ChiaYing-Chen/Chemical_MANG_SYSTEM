@@ -6,6 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
 import crypto from 'crypto';
+import * as backendUtils from './backendUtils.js';
 // ... (skip down to proxy imports/setup if needed, but cleanest to add import at top)
 
 // ...
@@ -658,12 +659,20 @@ app.post('/api/import/cws-weekly', async (req, res) => {
                 }
                 logs.push(`Updated ${tank.name}`);
             } else {
-                // Insert new with 0 for others
+                // Find the latest existing parameters to inherit circulation and temperatures
+                const latestRes = await pool.query("SELECT * FROM cws_parameters WHERE tank_id = $1 ORDER BY date DESC LIMIT 1", [tank.id]);
+                const latest = latestRes.rows[0];
+                const circ = latest ? (latest.circulation_rate || 0) : 0;
+                const tOut = latest ? (latest.temp_outlet || 0) : 0;
+                const tRet = latest ? (latest.temp_return || 0) : 0;
+                const tempDiff = latest ? (latest.temp_diff || 0) : 0;
+
+                // Insert new with inherited values for others
                 await pool.query(
-                    "INSERT INTO cws_parameters (id, tank_id, date, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles) VALUES ($1,$2,$3,0,0,0,0,$4,$5,$6)",
-                    [crypto.randomUUID(), tank.id, date, hardnessValue, makeupHardness, cycles]
+                    "INSERT INTO cws_parameters (id, tank_id, date, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                    [crypto.randomUUID(), tank.id, date, circ, tOut, tRet, tempDiff, hardnessValue, makeupHardness, cycles]
                 );
-                logs.push(`Inserted ${tank.name}`);
+                logs.push(`Inserted ${tank.name} with inherited params`);
             }
         };
 
@@ -2247,6 +2256,223 @@ app.delete('/api/notes/:id', async (req, res) => {
     } catch (err) {
         console.error(`DELETE /api/notes/${id} error:`, err);
         res.status(500).json({ error: '刪除重要紀事失敗', details: err.message });
+    }
+});
+
+// ==================== Weekly Usage Report ====================
+app.get('/api/weekly-usage-report', async (req, res) => {
+    try {
+        // === 時區修正：所有日期計算改用台北時間 (UTC+8) ===
+        const refDate = req.query.date ? new Date(req.query.date) : new Date();
+        // 台北時間相對 UTC 的偏移量
+        const TZ_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+        // 將 UTC timestamp 轉換為台北時間的「天」（年/月/日）
+        const toTaipeiDate = (ts) => {
+            const d = new Date(Number(ts) + TZ_OFFSET_MS);
+            return { Y: d.getUTCFullYear(), M: d.getUTCMonth(), D: d.getUTCDate() };
+        };
+        const toTaipeiDateKey = (ts) => {
+            const { Y, M, D } = toTaipeiDate(ts);
+            return `${Y}-${String(M + 1).padStart(2, '0')}-${String(D).padStart(2, '0')}`;
+        };
+
+        // 取得台北時間今天的「週一 00:00 台北」的 UTC timestamp
+        const refDateTaipei = new Date(Number(refDate) + TZ_OFFSET_MS);
+        const dayOfWeekTW = refDateTaipei.getUTCDay(); // 0=Sun, 1=Mon...
+        const diffToMondayTW = dayOfWeekTW === 0 ? -6 : 1 - dayOfWeekTW;
+
+        // 台北時間「本週週一 00:00」= (refDate 台北日午夜) + diffToMonday 天
+        const refDayStartTaipei = Date.UTC(
+            refDateTaipei.getUTCFullYear(),
+            refDateTaipei.getUTCMonth(),
+            refDateTaipei.getUTCDate()
+        ) - TZ_OFFSET_MS; // 換回 UTC
+        const thisMondayUTC = refDayStartTaipei + diffToMondayTW * 24 * 60 * 60 * 1000;
+        const lastMondayUTC = thisMondayUTC - 7 * 24 * 60 * 60 * 1000;
+        const lastSundayEndUTC = thisMondayUTC - 1; // 週日最後一毫秒
+
+        const startTime = lastMondayUTC;
+        const endTime = lastSundayEndUTC;
+
+        // 顯示用日期（台北時間）
+        const lastMonday = new Date(lastMondayUTC);
+        const lastSunday = new Date(lastSundayEndUTC);
+
+
+        const reportData = [];
+
+        // Fetch ALL tanks, we will filter them by active supply's target_ppm later
+        const tanksRes = await pool.query(
+            "SELECT * FROM tanks ORDER BY sort_order ASC, name ASC"
+        );
+        const tanks = tanksRes.rows;
+
+        for (const tank of tanks) {
+            // Check valid JSON dimensions
+            if (typeof tank.dimensions === 'string') {
+                try { tank.dimensions = JSON.parse(tank.dimensions); } catch (e) { }
+            }
+
+            const suppliesRes = await pool.query('SELECT * FROM chemical_supplies WHERE tank_id = $1 ORDER BY start_date DESC', [tank.id]);
+            const activeSupply = backendUtils.getActiveSupplyForDate(startTime, suppliesRes.rows);
+
+            // Only process tanks that have an active supply WITH a target_ppm defined
+            if (!activeSupply || !activeSupply.target_ppm || Number(activeSupply.target_ppm) === 0) continue;
+            const targetPpm = Number(activeSupply.target_ppm);
+
+            // 分兩步取讀數，確保不受加藥週期長短影響：
+            // Step 1: 找本週開始前「最後一筆」讀數（作為區間起點）
+            const prevReadingRes = await pool.query(
+                "SELECT * FROM readings WHERE tank_id = $1 AND timestamp < $2 ORDER BY timestamp DESC LIMIT 1",
+                [tank.id, startTime]
+            );
+            // Step 2: 取本週（含下週一第一天）的所有讀數
+            const searchEnd = endTime + (24 * 60 * 60 * 1000);
+            const weekReadingsRes = await pool.query(
+                "SELECT * FROM readings WHERE tank_id = $1 AND timestamp >= $2 AND timestamp <= $3 ORDER BY timestamp ASC",
+                [tank.id, startTime, searchEnd]
+            );
+            // 合併：[上週最後一筆] + [本週所有], 若前者沒資料則不影響
+            const allReadings = [...prevReadingRes.rows, ...weekReadingsRes.rows];
+
+            // 採用與前端 AnalysisView/AnnualDataView 完全相同的「每日均攤算法」
+            // 公式：(前次重量KG + 補充KG) - 本次重量KG = 區間總用量；再按天均攤後加總目標週內的天數
+            const dailyActualMap = new Map();
+
+            for (let i = 1; i < allReadings.length; i++) {
+                const curr = allReadings[i];
+                const prev = allReadings[i - 1];
+
+                const diffMs = Number(curr.timestamp) - Number(prev.timestamp);
+                const diffDays = diffMs / (1000 * 60 * 60 * 24);
+                if (diffDays <= 0) continue;
+
+                // 讀取重量KG：優先使用 calculated_weight_kg；若為 null/0 則 fallback 到 calculated_volume * applied_sg
+                const prevWeightKg = Number(prev.calculated_weight_kg) || (Number(prev.calculated_volume || 0) * Number(prev.applied_sg || 1));
+                const currWeightKg = Number(curr.calculated_weight_kg) || (Number(curr.calculated_volume || 0) * Number(curr.applied_sg || 1));
+
+                // 補充量換算KG (與前端一致：addedAmountLiters * appliedSpecificGravity)
+                const addedKg = Number(curr.added_amount_liters || 0) * Number(curr.applied_sg || 1);
+                const intervalUsageKg = (prevWeightKg + addedKg) - currWeightKg;
+                const dailyUsageKg = Math.max(0, intervalUsageKg / diffDays);
+
+                // 從 prev 日期迭代到 curr 日期，將每日用量寫入 Map（只寫第一次，不覆蓋）
+                let iterDate = new Date(Number(prev.timestamp) + TZ_OFFSET_MS); // 轉為台北時間
+                const endIterDate = new Date(Number(curr.timestamp) + TZ_OFFSET_MS);
+                while (iterDate < endIterDate) {
+                    // 使用 UTC 方法讀台北時間日期
+                    const Y = iterDate.getUTCFullYear();
+                    const M = String(iterDate.getUTCMonth() + 1).padStart(2, '0');
+                    const D = String(iterDate.getUTCDate()).padStart(2, '0');
+                    const dateKey = `${Y}-${M}-${D}`;
+                    if (!dailyActualMap.has(dateKey)) {
+                        dailyActualMap.set(dateKey, dailyUsageKg);
+                    }
+                    iterDate.setUTCDate(iterDate.getUTCDate() + 1);
+                }
+            }
+
+            // 加總本週（Monday ~ Sunday 台北時間）每天的用量
+            let actualUsageKg = 0;
+            for (let dMs = startTime; dMs <= endTime; dMs += 24 * 60 * 60 * 1000) {
+                const dateKey = toTaipeiDateKey(dMs);
+                actualUsageKg += dailyActualMap.get(dateKey) || 0;
+            }
+
+            let theoreticalUsageKg = 0;
+            // 無論 method 是什麼，只要是 COOLING system 就嘗試從 cws_parameters 抓，BOILER 從 bws_parameters 抓，並進行計算
+            // 注意 DB 欄位為 system_type，值可能包含 '冷卻' 或 '鍋爐'
+            if (tank.system_type && tank.system_type.includes('冷卻')) {
+                const cwsRes = await pool.query(
+                    "SELECT * FROM cws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3",
+                    [tank.id, startTime - (7 * 24 * 60 * 60 * 1000), endTime]
+                );
+                const paramsHistory = cwsRes.rows;
+
+                for (let dTs = startTime; dTs <= endTime; dTs += 24 * 60 * 60 * 1000) {
+                    const validParam = paramsHistory.find(p => {
+                        const pTs = Number(p.date);
+                        return dTs >= pTs && dTs < (pTs + 7 * 24 * 60 * 60 * 1000);
+                    }) || paramsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
+
+                    if (validParam) {
+                        theoreticalUsageKg += backendUtils.calculateCWSUsage(
+                            validParam.circulation_rate || 0,
+                            validParam.temp_diff || 0,
+                            validParam.concentration_cycles || (validParam.cws_hardness && validParam.makeup_hardness && validParam.makeup_hardness > 0 ? validParam.cws_hardness / validParam.makeup_hardness : 8),
+                            targetPpm,
+                            1
+                        );
+                    }
+                }
+            } else if (tank.system_type && tank.system_type.includes('鍋爐')) {
+                const bwsRes = await pool.query(
+                    "SELECT * FROM bws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3",
+                    [tank.id, startTime - (7 * 24 * 60 * 60 * 1000), endTime]
+                );
+                const paramsHistory = bwsRes.rows;
+
+                for (let dTs = startTime; dTs <= endTime; dTs += 24 * 60 * 60 * 1000) {
+                    const validParam = paramsHistory.find(p => {
+                        const pTs = Number(p.date);
+                        return dTs >= pTs && dTs < (pTs + 7 * 24 * 60 * 60 * 1000);
+                    }) || paramsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
+
+                    if (validParam) {
+                        theoreticalUsageKg += ((Number(validParam.steam_production || 0) / 7) * targetPpm) / 1000;
+                    }
+                }
+            } else {
+                continue;
+            }
+
+            const diff = actualUsageKg - theoreticalUsageKg;
+            const diffPercent = theoreticalUsageKg > 0 ? (Math.abs(diff) / theoreticalUsageKg) * 100 : 0;
+
+            reportData.push({
+                tankName: tank.name,
+                theoretical: theoreticalUsageKg,
+                actual: actualUsageKg,
+                diff: diff,
+                diffPercent: (diff > 0 ? diffPercent : -diffPercent), // signed
+                unit: 'KG'
+            });
+        }
+
+        const periodStr = `${lastMonday.toLocaleDateString()} ~ ${lastSunday.toLocaleDateString()}`;
+        let htmlMessage = `<h2>中龍W521 每週藥劑用量檢查報告 (${periodStr})</h2>`;
+        htmlMessage += `<table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width: 100%; font-family: sans-serif;">`;
+        htmlMessage += `<tr style="background-color: #f2f2f2;"><th>藥劑名稱</th><th>理論用量 (KG)</th><th>實際用量 (KG)</th><th>誤差 (KG)</th><th>誤差百分比 (%)</th></tr>`;
+
+        for (const r of reportData) {
+            const isWarning = r.diffPercent > 5;  // 實際 > 理論 5% 以上才標紅
+            const rowStyle = isWarning ? 'style="color: red; font-weight: bold;"' : '';
+            const diffSign = r.diff > 0 ? '+' : '';
+            htmlMessage += `
+                <tr ${rowStyle}>
+                    <td>${r.tankName}</td>
+                    <td>${r.theoretical.toFixed(1)}</td>
+                    <td>${r.actual.toFixed(1)}</td>
+                    <td>${diffSign}${r.diff.toFixed(1)}</td>
+                    <td>${diffSign}${r.diffPercent.toFixed(1)}%</td>
+                </tr>
+            `;
+        }
+        htmlMessage += `</table>`;
+        htmlMessage += `<p style="font-size: 0.9em; color: #666; margin-top: 20px;">提示：紅色標示表示實際用量超過理論用量 5% 以上。本報告為系統自動寄送。</p>`;
+
+        res.json({
+            success: true,
+            period: periodStr,
+            data: reportData,
+            htmlMessage: htmlMessage,
+            textMessage: `中龍W521 每週藥劑用量檢查 (${periodStr})\n` + reportData.map(r => `${r.tankName}: 理論 ${r.theoretical.toFixed(1)} KG, 實際 ${r.actual.toFixed(1)} KG (誤差 ${r.diff > 0 ? '+' : ''}${r.diff.toFixed(1)} KG, ${r.diff > 0 ? '+' : ''}${r.diffPercent.toFixed(1)}%)`).join('\n')
+        });
+
+    } catch (err) {
+        console.error('Weekly usage report error:', err);
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
