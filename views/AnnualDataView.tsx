@@ -180,8 +180,23 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                 }
             }
 
-            // 將每日用量匯總到對應月份
+            // [Method B] 建立「當年有讀數的月份」集合
+            // 只有桶槽在該年度的某月內有實際抄表記錄，該月才計算實際用量。
+            // 原因：若最後一筆讀數在 4 月，而下一筆在隔年，spreading 邏輯會將用量
+            //       分攤至 5～12 月，造成沒有抄表的月份出現「幽靈數據」。
+            const monthsWithReadings = new Set<number>(); // 1-based (1=1月)
+            tankReadings.forEach(r => {
+                const d = new Date(r.timestamp);
+                if (d.getFullYear() === year) {
+                    monthsWithReadings.add(d.getMonth() + 1);
+                }
+            });
+
+            // 將每日用量匯總到對應月份（只有有讀數的月份才計入）
             tData.months.forEach(m => {
+                // 若該月在當年度無任何讀數，維持 actualUsage = 0 → 顯示 "-"
+                if (!monthsWithReadings.has(m.month)) return;
+
                 const daysInMonth = new Date(year, m.month, 0).getDate();
                 for (let d = 1; d <= daysInMonth; d++) {
                     // 使用 ISO 格式的日期 key (YYYY-MM-DD)

@@ -4937,7 +4937,10 @@ const AnalysisView: React.FC<{
                             type="date"
                             value={tempDateRange.start}
                             onClick={(e) => e.currentTarget.showPicker()}
-                            onChange={e => setTempDateRange(prev => ({ ...prev, start: e.target.value }))}
+                            onChange={e => {
+                                setTempDateRange(prev => ({ ...prev, start: e.target.value }));
+                                setSelectedMonth('');
+                            }}
                             className={`${inputClassName} w-32 text-sm`}
                         />
                         <span className="text-slate-400">~</span>
@@ -4945,13 +4948,15 @@ const AnalysisView: React.FC<{
                             type="date"
                             value={tempDateRange.end}
                             onClick={(e) => e.currentTarget.showPicker()}
-                            onChange={e => setTempDateRange(prev => ({ ...prev, end: e.target.value }))}
+                            onChange={e => {
+                                setTempDateRange(prev => ({ ...prev, end: e.target.value }));
+                                setSelectedMonth('');
+                            }}
                             className={`${inputClassName} w-32 text-sm`}
                         />
                         <Button
                             onClick={() => {
                                 setAppliedDateRange(tempDateRange);
-                                setSelectedMonth('');
                             }}
                             className="bg-brand-600 hover:bg-brand-700 text-white text-sm px-3 py-1.5"
                         >
