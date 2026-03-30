@@ -5,10 +5,11 @@
  * - {limit}: The threshold limit (e.g., 300)
  * - {unit}: The unit string (e.g., "kg" or "L")
  * - {text}: The base warning text (optional, if user wants to reuse the 'text' field)
+ * - {recentUsage}: The recent daily average usage (e.g., 50.5)
  */
 export const formatAnomalyMessage = (
     template: string,
-    values: { diff?: number | string; limit?: number | string; unit?: string; text?: string }
+    values: { diff?: number | string; limit?: number | string; unit?: string; text?: string; recentUsage?: number | string; }
 ): string => {
     let result = template;
 
@@ -23,6 +24,9 @@ export const formatAnomalyMessage = (
     }
     if (values.text !== undefined) {
         result = result.replace(/{text}/gi, values.text);
+    }
+    if (values.recentUsage !== undefined) {
+        result = result.replace(/{recentUsage}/gi, values.recentUsage.toString());
     }
 
     return result;

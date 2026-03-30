@@ -523,14 +523,22 @@ app.post('/api/pi-import', async (req, res) => {
 
             let saveCount = 0;
             for (const tank of boilerTanks) {
-                let existing = null;
+                let existingSameDay = [];
                 try {
-                    const checkRes = await pool.query("SELECT id FROM bws_parameters WHERE tank_id = $1 AND date = $2", [tank.id, dateTs]);
-                    existing = checkRes.rows[0];
+                    const checkRes = await pool.query("SELECT id, date FROM bws_parameters WHERE tank_id = $1", [tank.id]);
+                    const targetDate = new Date(dateTs);
+                    existingSameDay = checkRes.rows.filter(r => {
+                        const rDate = new Date(Number(r.date));
+                        return rDate.getFullYear() === targetDate.getFullYear() &&
+                               rDate.getMonth() === targetDate.getMonth() &&
+                               rDate.getDate() === targetDate.getDate();
+                    });
                 } catch (e) { /* ignore */ }
 
-                if (existing) {
-                    await pool.query("UPDATE bws_parameters SET steam_production = $1, updated_at = NOW() WHERE id = $2", [safeTotal, existing.id]);
+                if (existingSameDay.length > 0) {
+                    for (const existing of existingSameDay) {
+                        await pool.query("UPDATE bws_parameters SET steam_production = $1, updated_at = NOW() WHERE id = $2", [safeTotal, existing.id]);
+                    }
                 } else {
                     await pool.query("INSERT INTO bws_parameters (id, tank_id, steam_production, date) VALUES ($1, $2, $3, $4)", [crypto.randomUUID(), tank.id, safeTotal, dateTs]);
                 }
@@ -585,17 +593,28 @@ app.post('/api/pi-import', async (req, res) => {
                 const data = getAreaData(areaKey, week.start);
                 totalErrors += data.errors;
                 for (const tank of tanks) {
-                    const existingRes = await pool.query("SELECT * FROM cws_parameters WHERE tank_id = $1 AND date = $2", [tank.id, dateTs]);
-                    const existing = existingRes.rows[0];
-                    const cwsHardness = existing ? existing.cws_hardness || 0 : 0;
-                    const makeupHardness = existing ? existing.makeup_hardness || 0 : 0;
-                    const cycles = makeupHardness > 0 ? cwsHardness / makeupHardness : (existing ? (existing.concentration_cycles || 8) : 8);
-                    if (existing) {
-                        await pool.query("UPDATE cws_parameters SET circulation_rate=$1, temp_outlet=$2, temp_return=$3, temp_diff=$4, concentration_cycles=$5, updated_at=NOW() WHERE id=$6",
-                            [data.circulationRate, data.tempOutlet, data.tempReturn, data.tempDiff, cycles, existing.id]);
+                    const existingRes = await pool.query("SELECT * FROM cws_parameters WHERE tank_id = $1", [tank.id]);
+                    const targetDate = new Date(dateTs);
+                    const existingSameDay = existingRes.rows.filter(r => {
+                        const rDate = new Date(Number(r.date));
+                        return rDate.getFullYear() === targetDate.getFullYear() &&
+                               rDate.getMonth() === targetDate.getMonth() &&
+                               rDate.getDate() === targetDate.getDate();
+                    });
+                    
+                    if (existingSameDay.length > 0) {
+                        for (const existing of existingSameDay) {
+                            const cwsHardness = existing.cws_hardness || 0;
+                            const makeupHardness = existing.makeup_hardness || 0;
+                            const cycles = makeupHardness > 0 ? cwsHardness / makeupHardness : (existing.concentration_cycles || 8);
+                            
+                            await pool.query("UPDATE cws_parameters SET circulation_rate=$1, temp_outlet=$2, temp_return=$3, temp_diff=$4, concentration_cycles=$5, updated_at=NOW() WHERE id=$6",
+                                [data.circulationRate, data.tempOutlet, data.tempReturn, data.tempDiff, cycles, existing.id]);
+                        }
                     } else {
+                        const cycles = 8;
                         await pool.query("INSERT INTO cws_parameters (id, tank_id, date, circulation_rate, temp_outlet, temp_return, temp_diff, cws_hardness, makeup_hardness, concentration_cycles) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-                            [crypto.randomUUID(), tank.id, dateTs, data.circulationRate, data.tempOutlet, data.tempReturn, data.tempDiff, cwsHardness, makeupHardness, cycles]);
+                            [crypto.randomUUID(), tank.id, dateTs, data.circulationRate, data.tempOutlet, data.tempReturn, data.tempDiff, 0, 0, cycles]);
                     }
                 }
             };

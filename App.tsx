@@ -9,7 +9,7 @@ import { ImportAnomalyModal, ImportAnomaly } from './components/ImportAnomalyMod
 import * as XLSX from 'xlsx';
 import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
-    BarChart, Bar, ComposedChart, Area
+    BarChart, Bar, ComposedChart, Area, ReferenceLine
 } from 'recharts';
 import AnnualDataView from './views/AnnualDataView';
 import { ExcelImportView } from './views/ExcelImportView';
@@ -234,8 +234,9 @@ const TankStatusCard: React.FC<{
     onNavigate?: (tankId: string) => void,
     onDeliveryClick?: (tank: any) => void,
     onLevelClick?: (tank: any) => void,
+    onDailyUsageClick?: (tank: any) => void,
     lowLevelWarningText?: string
-}> = ({ tank, dragProps, onNavigate, onDeliveryClick, onLevelClick, lowLevelWarningText = '存量偏低，請叫藥' }) => {
+}> = ({ tank, dragProps, onNavigate, onDeliveryClick, onLevelClick, onDailyUsageClick, lowLevelWarningText = '存量偏低，請叫藥' }) => {
 
     const handleCardClick = () => {
         if (onNavigate) {
@@ -318,9 +319,12 @@ const TankStatusCard: React.FC<{
 
                 {/* Daily Usage & Remaining Days */}
                 <div className="grid grid-cols-2 gap-2 text-xs border-t border-slate-100 pt-2 bg-slate-50 -mx-4 px-4 py-2">
-                    <div>
-                        <span className="text-slate-400 block">日用量</span>
-                        <span className="font-medium text-blue-600">
+                    <div
+                        className={onDailyUsageClick ? "cursor-pointer group" : ""}
+                        onClick={onDailyUsageClick ? (e) => { e.stopPropagation(); onDailyUsageClick(tank); } : undefined}
+                    >
+                        <span className={`block transition-colors ${onDailyUsageClick ? 'text-brand-500 group-hover:text-brand-600 font-medium' : 'text-slate-400'}`}>日用量 {onDailyUsageClick && '📊'}</span>
+                        <span className="font-medium text-blue-600 group-hover:text-blue-700">
                             {tank.avgDailyUsageKg > 0 ? `${tank.avgDailyUsageKg.toFixed(1)} kg/日` : '-'}
                         </span>
                     </div>
@@ -619,9 +623,169 @@ const LiquidLevelTrendModal: React.FC<{
     );
 };
 
+// DailyUsageTrendModal Component
+const DailyUsageTrendModal: React.FC<{
+    tank: any;
+    onClose: () => void;
+}> = ({ tank, onClose }) => {
+    const [data, setData] = useState<any[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [anomalyThresholdKg, setAnomalyThresholdKg] = useState<number | null>(null);
+
+    useEffect(() => {
+        let isMounted = true;
+        const fetchData = async () => {
+            setLoading(true);
+            try {
+                // Fetch readings for this tank
+                const readings = await API.fetchReadings(tank.id);
+
+                if (!isMounted) return;
+
+                // Sort readings ascending (oldest to newest) for processing
+                const sortedReadings = [...readings].map(r => ({
+                    timestamp: typeof r.timestamp === 'string' ? parseInt(r.timestamp, 10) : r.timestamp,
+                    calculatedWeightKg: parseFloat(r.calculated_weight_kg || '0'),
+                    addedAmountLiters: parseFloat(r.added_amount_liters || '0'),
+                    appliedSpecificGravity: parseFloat(r.applied_sg || '1')
+                })).sort((a, b) => a.timestamp - b.timestamp);
+
+                const dailyActualMap = new Map<string, number>();
+
+                // Calculate daily usage (identical logic to AnnualDataView)
+                for (let i = 1; i < sortedReadings.length; i++) {
+                    const curr = sortedReadings[i];
+                    const prev = sortedReadings[i - 1];
+
+                    const diffMs = curr.timestamp - prev.timestamp;
+                    const diffDays = diffMs / (1000 * 60 * 60 * 24);
+
+                    if (diffDays <= 0) continue;
+
+                    const addedKg = curr.addedAmountLiters * curr.appliedSpecificGravity;
+                    const totalUsageKg = (prev.calculatedWeightKg + addedKg) - curr.calculatedWeightKg;
+
+                    const dailyUsage = Math.max(0, totalUsageKg / diffDays);
+
+                    let iterDate = new Date(prev.timestamp);
+                    const endDate = new Date(curr.timestamp);
+
+                    // Spread from prev to curr
+                    while (iterDate < endDate) {
+                        const Y = iterDate.getFullYear();
+                        const M = String(iterDate.getMonth() + 1).padStart(2, '0');
+                        const D = String(iterDate.getDate()).padStart(2, '0');
+                        const dateKey = `${Y}-${M}-${D}`;
+
+                        if (!dailyActualMap.has(dateKey)) {
+                            dailyActualMap.set(dateKey, dailyUsage);
+                        }
+                        iterDate.setDate(iterDate.getDate() + 1);
+                    }
+                }
+
+                // Process data for the last 28 days (4 weeks)
+                const now = new Date();
+                const processedData = [];
+
+                for (let i = 27; i >= 0; i--) {
+                    const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+                    const offset = d.getTimezoneOffset();
+                    const localDate = new Date(d.getTime() - (offset * 60 * 1000));
+                    
+                    const Y = localDate.getFullYear();
+                    const M = String(localDate.getMonth() + 1).padStart(2, '0');
+                    const D = String(localDate.getDate()).padStart(2, '0');
+                    const dateKey = `${Y}-${M}-${D}`;
+                    const shortDateStr = `${localDate.getMonth() + 1}/${localDate.getDate()}`;
+
+                    const usageVal = dailyActualMap.get(dateKey);
+
+                    processedData.push({
+                        date: shortDateStr,
+                        fullDate: dateKey,
+                        usage: usageVal !== undefined ? usageVal : 0
+                    });
+                }
+
+                setData(processedData);
+
+                if (sortedReadings.length > 0) {
+                    const latestReading = sortedReadings[sortedReadings.length - 1];
+                    const currentSG = latestReading.appliedSpecificGravity || 1.0;
+                    const thresholdVol = tank.capacityLiters * ((tank.validationThreshold ?? 30) / 100);
+                    setAnomalyThresholdKg(Math.round(thresholdVol * currentSG));
+                }
+            } catch (error) {
+                console.error('Failed to fetch daily usage trend data', error);
+            } finally {
+                if (isMounted) setLoading(false);
+            }
+        };
+        fetchData();
+        return () => { isMounted = false; };
+    }, [tank.id]);
+
+    return (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+            <div className="bg-white rounded-xl shadow-2xl max-w-4xl w-full mx-4 overflow-hidden flex flex-col h-[70vh]" onClick={e => e.stopPropagation()}>
+                <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex justify-between items-center">
+                    <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                        📊 {tank.name} - 過去 4 週日用量分析
+                    </h2>
+                    <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-2xl font-semibold leading-none">&times;</button>
+                </div>
+                <div className="p-6 flex-1 min-h-0 relative">
+                    {loading && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10 text-brand-600 font-medium">
+                            載入中...
+                        </div>
+                    )}
+                    <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={data} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+                            <XAxis
+                                dataKey="date"
+                                tick={{ fontSize: 12, fill: '#64748b' }}
+                                tickMargin={10}
+                                minTickGap={10}
+                            />
+                            <YAxis
+                                tick={{ fontSize: 12, fill: '#64748b' }}
+                                label={{ value: '用量 (kg)', angle: -90, position: 'insideLeft', offset: 15, style: { fill: '#64748b' } }}
+                            />
+                            <Tooltip
+                                cursor={{ fill: '#f1f5f9' }}
+                                contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                                labelFormatter={(label, payload) => payload && payload.length > 0 ? payload[0].payload.fullDate : label}
+                                formatter={(value: number) => [`${value.toFixed(1)} kg`, '日用量']}
+                            />
+                            <Bar
+                                dataKey="usage"
+                                fill="#3b82f6"
+                                radius={[4, 4, 0, 0]}
+                                animationDuration={500}
+                            />
+                            {anomalyThresholdKg !== null && anomalyThresholdKg > 0 && (
+                                <ReferenceLine
+                                    y={anomalyThresholdKg}
+                                    stroke="#ef4444"
+                                    strokeDasharray="5 5"
+                                    label={{ position: 'top', value: `異常閥值: ${anomalyThresholdKg} kg`, fill: '#ef4444', fontSize: 12 }}
+                                />
+                            )}
+                        </BarChart>
+                    </ResponsiveContainer>
+                </div>
+            </div>
+        </div>
+    );
+};
+
 const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onNavigate?: (tankId: string, month: number, year: number) => void, onLoading?: (loading: boolean) => void, usageCalcWeeks?: number, lowLevelWarningText?: string }> = ({ tanks, readings, onRefresh, onNavigate, onLoading, usageCalcWeeks = 8, lowLevelWarningText = '存量偏低，請叫藥' }) => {
     const [deliveryModalTank, setDeliveryModalTank] = useState<any>(null);
     const [trendModalTank, setTrendModalTank] = useState<any>(null);
+    const [dailyUsageModalTank, setDailyUsageModalTank] = useState<any>(null);
 
     const tanksWithStatus = useMemo(() => {
         const weeksAgo = Date.now() - usageCalcWeeks * 7 * 24 * 60 * 60 * 1000;
@@ -827,6 +991,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                     onNavigate={handleNavigate}
                                     onDeliveryClick={setDeliveryModalTank}
                                     onLevelClick={setTrendModalTank}
+                                    onDailyUsageClick={setDailyUsageModalTank}
                                     lowLevelWarningText={lowLevelWarningText}
                                     dragProps={{
                                         draggable: true,
@@ -851,6 +1016,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                     onNavigate={handleNavigate}
                                     onDeliveryClick={setDeliveryModalTank}
                                     onLevelClick={setTrendModalTank}
+                                    onDailyUsageClick={setDailyUsageModalTank}
                                     lowLevelWarningText={lowLevelWarningText}
                                     dragProps={{
                                         draggable: true,
@@ -878,7 +1044,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} lowLevelWarningText={lowLevelWarningText} />)}
+                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} onDailyUsageClick={setDailyUsageModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -895,7 +1061,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 gap-4">
-                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} lowLevelWarningText={lowLevelWarningText} />)}
+                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} onDailyUsageClick={setDailyUsageModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -909,7 +1075,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} lowLevelWarningText={lowLevelWarningText} />)}
+                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} onDailyUsageClick={setDailyUsageModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -928,6 +1094,14 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                 <LiquidLevelTrendModal
                     tank={trendModalTank}
                     onClose={() => setTrendModalTank(null)}
+                />
+            )}
+
+            {/* Daily Usage Trend Modal */}
+            {dailyUsageModalTank && (
+                <DailyUsageTrendModal
+                    tank={dailyUsageModalTank}
+                    onClose={() => setDailyUsageModalTank(null)}
                 />
             )}
         </div>
@@ -961,6 +1135,29 @@ const DataEntryView: React.FC<{
     const [anomalySource, setAnomalySource] = useState<'IMPORT' | 'MANUAL'>('IMPORT');
     const [pendingReadings, setPendingReadings] = useState<Reading[]>([]);
     const [convertedCountInfo, setConvertedCountInfo] = useState<number>(0);
+
+    const getRecentDailyUsageKg = (tankId: string) => {
+        const usageCalcWeeks = appSettings?.usageCalcWeeks || 4;
+        const now = Date.now();
+        const weeksAgo = now - (usageCalcWeeks * 7 * 24 * 60 * 60 * 1000);
+        const tankReadings = readings.filter(r => r.tankId === tankId && r.timestamp >= weeksAgo).sort((a, b) => a.timestamp - b.timestamp);
+        
+        if (tankReadings.length >= 2) {
+            let totalUsageLiters = 0;
+            for (let i = 1; i < tankReadings.length; i++) {
+                const prev = tankReadings[i - 1];
+                const curr = tankReadings[i];
+                const usage = prev.calculatedVolume - curr.calculatedVolume + (curr.addedAmountLiters || 0);
+                if (usage > 0) totalUsageLiters += usage;
+            }
+            const firstTs = tankReadings[0].timestamp;
+            const lastTs = tankReadings[tankReadings.length - 1].timestamp;
+            const daysCovered = Math.max(1, (lastTs - firstTs) / (24 * 60 * 60 * 1000));
+            const sg = tankReadings[tankReadings.length - 1]?.appliedSpecificGravity || 1;
+            return ((totalUsageLiters / daysCovered) * sg).toFixed(1);
+        }
+        return '0.0';
+    };
 
     const checkAnomalies = (newReadings: Reading[]): ImportAnomaly[] => {
         const anomalies: ImportAnomaly[] = [];
@@ -1041,21 +1238,25 @@ const DataEntryView: React.FC<{
                                 warnText: appSettings?.thresholdWarningText
                             });
 
+                            const recentDailyUsageKg = getRecentDailyUsageKg(tank.id);
+
                             if (isPossibleRefill) {
-                                const warnText = appSettings?.possibleRefillText || '可能為補藥紀錄';
+                                const warnText = appSettings?.possibleRefillText || '可能為補藥紀錄({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認';
                                 anomalyReason = formatAnomalyMessage(warnText, {
                                     text: '可能為補藥紀錄',
                                     diff: dailyChangeKg.toFixed(0),
                                     limit: dailyThresholdKg.toFixed(0),
-                                    unit: 'kg'
+                                    unit: 'kg',
+                                    recentUsage: recentDailyUsageKg
                                 });
                             } else {
-                                const warnText = appSettings?.thresholdWarningText || '液位變化異常，請確認 ({diff} {unit} > {limit} {unit})';
+                                const warnText = appSettings?.thresholdWarningText || '液位變化異常({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認';
                                 anomalyReason = formatAnomalyMessage(warnText, {
                                     text: '液位變化異常，請確認',
                                     diff: dailyChangeKg.toFixed(0),
                                     limit: dailyThresholdKg.toFixed(0),
-                                    unit: 'kg'
+                                    unit: 'kg',
+                                    recentUsage: recentDailyUsageKg
                                 });
                             }
 
@@ -1486,44 +1687,41 @@ const DataEntryView: React.FC<{
             const calendarDays = (d1.getTime() - d2.getTime()) / (1000 * 60 * 60 * 24);
             const daysDiff = Math.max(1, calendarDays);
 
-            if (daysDiff >= 1) { // Will always be true
+            if (daysDiff >= 1) {
                 const addedAmount = newReading.addedAmountLiters || 0;
-                // Calculate consumption (positive means consumption, negative means level rose)
                 const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
                 const dailyChange = Math.abs(levelChange) / daysDiff;
 
-                // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
-                const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
-
-                // Check for abnormal consumption rate
                 if (dailyChange > dailyThreshold) {
-                    if (isPossibleRefill) {
-                        const warnText = appSettings?.possibleRefillText || '可能為補藥紀錄';
-                        // Refill warning usually doesn't have format variables in current logic, but we can support if user asks. Current logic just appends label.
-                        // Wait, user asked for "可能為補藥警告" to ALSO be a template.
-                        // The user's example: "液位異常上升超過閾值數倍，判斷可能為入藥"
-                        // If they want variables, we should pass them.
-                        // Let's pass diff if applicable? Refill condition: levelChange < 0 (meaning 'added' in current logic? No, check calc mechanism).
-                        // In `detectReadingAnomaly`: levelChange = prevLevel - currentLevel. If negative, implies current > prev (Refill).
-                        // dailyChange is absolute.
+                    const sg = newReading.appliedSpecificGravity || 1.0;
+                    const dailyChangeKg = dailyChange * sg;
+                    const dailyThresholdKg = dailyThreshold * sg;
+                    const recentDailyUsageKg = getRecentDailyUsageKg(tank.id);
 
-                        // Actually, for Refill, the user might just want text.
-                        // But to be consistent, let's allow formatting if they put {diff} etc.
+                    // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
+                    const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
+
+                    let warnText = '';
+                    if (isPossibleRefill) {
+                        warnText = appSettings?.possibleRefillText || '可能為補藥紀錄({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認';
                         anomalyReason = formatAnomalyMessage(warnText, {
                             text: '可能為補藥紀錄',
-                            diff: dailyChange.toFixed(0),
-                            limit: dailyThreshold.toFixed(0),
-                            unit: 'L'
+                            diff: dailyChangeKg.toFixed(0),
+                            limit: dailyThresholdKg.toFixed(0),
+                            unit: 'kg',
+                            recentUsage: recentDailyUsageKg
                         });
                     } else {
-                        const warnText = appSettings?.thresholdWarningText || '液位變化異常，請確認 ({diff} {unit} > {limit} {unit})';
+                        warnText = appSettings?.thresholdWarningText || '液位變化異常({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認';
                         anomalyReason = formatAnomalyMessage(warnText, {
                             text: '液位變化異常，請確認',
-                            diff: dailyChange.toFixed(0),
-                            limit: dailyThreshold.toFixed(0),
-                            unit: 'L'
+                            diff: dailyChangeKg.toFixed(0),
+                            limit: dailyThresholdKg.toFixed(0),
+                            unit: 'kg',
+                            recentUsage: recentDailyUsageKg
                         });
                     }
+
                     return {
                         id: newReading.id,
                         tankId: tank.id,
@@ -6424,6 +6622,7 @@ const ParamsSettingsView: React.FC<{
                                     <li><code className="bg-slate-700 px-1 rounded">{'{diff}'}</code> 日均變動量</li>
                                     <li><code className="bg-slate-700 px-1 rounded">{'{limit}'}</code> 閾值</li>
                                     <li><code className="bg-slate-700 px-1 rounded">{'{unit}'}</code> 單位</li>
+                                    <li><code className="bg-slate-700 px-1 rounded">{'{recentUsage}'}</code> 近期日用量</li>
                                 </ul>
                                 <p className="mt-2 text-slate-400 border-t border-slate-700 pt-2">
                                     適用於「液位變化超標」與「可能為補藥」警告
@@ -6451,7 +6650,7 @@ const ParamsSettingsView: React.FC<{
                                 value={localSettings.thresholdWarningText}
                                 onChange={e => setLocalSettings(prev => ({ ...prev, thresholdWarningText: e.target.value }))}
                                 className={inputClassName}
-                                placeholder="範例: 液位變化異常 ({diff} {unit} > {limit} {unit})"
+                                placeholder="範例: 液位變化異常({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認"
                             />
                         </div>
 
@@ -6462,7 +6661,7 @@ const ParamsSettingsView: React.FC<{
                                 value={localSettings.possibleRefillText}
                                 onChange={e => setLocalSettings(prev => ({ ...prev, possibleRefillText: e.target.value }))}
                                 className={inputClassName}
-                                placeholder="可能為補藥紀錄"
+                                placeholder="範例: 可能為補藥紀錄({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認"
                             />
                         </div>
                     </div>
