@@ -665,7 +665,8 @@ const DailyUsageTrendModal: React.FC<{
                     const addedKg = curr.addedAmountLiters * curr.appliedSpecificGravity;
                     const totalUsageKg = (prev.calculatedWeightKg + addedKg) - curr.calculatedWeightKg;
 
-                    const dailyUsage = Math.max(0, totalUsageKg / diffDays);
+                    // Do not clamp to 0 here to distinguish "flat" vs "rise"
+                    const dailyUsage = totalUsageKg / diffDays;
 
                     let iterDate = new Date(prev.timestamp);
                     const endDate = new Date(curr.timestamp);
@@ -704,7 +705,8 @@ const DailyUsageTrendModal: React.FC<{
                     processedData.push({
                         date: shortDateStr,
                         fullDate: dateKey,
-                        usage: usageVal !== undefined ? usageVal : 0
+                        usage: usageVal !== undefined ? Math.max(0, usageVal) : 0, // Bar visually stays at 0 if negative
+                        rawUsage: usageVal !== undefined ? usageVal : 0 // Pass raw value for tooltip
                     });
                 }
 
@@ -758,7 +760,16 @@ const DailyUsageTrendModal: React.FC<{
                                 cursor={{ fill: '#f1f5f9' }}
                                 contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
                                 labelFormatter={(label, payload) => payload && payload.length > 0 ? payload[0].payload.fullDate : label}
-                                formatter={(value: number) => [`${value.toFixed(1)} kg`, '日用量']}
+                                formatter={(value: number, name: string, props: { payload: any }) => {
+                                    const rawUsage = props.payload.rawUsage;
+                                    if (rawUsage !== undefined && rawUsage < 0) {
+                                        return ['液位上升', '日用量'];
+                                    }
+                                    if (rawUsage === 0) {
+                                        return ['0.0 kg', '日用量'];
+                                    }
+                                    return [`${value.toFixed(1)} kg`, '日用量'];
+                                }}
                             />
                             <Bar
                                 dataKey="usage"
