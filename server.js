@@ -2447,7 +2447,7 @@ app.get('/api/weekly-usage-report', async (req, res) => {
                 const areaDescPattern = isCt1 ? '%一階%' : '%二階%';
 
                 const cwsRes = await pool.query(
-                    "SELECT * FROM cws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3",
+                    "SELECT * FROM cws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 AND circulation_rate IS NOT NULL ORDER BY date ASC",
                     [tank.id, startTime - (7 * 24 * 60 * 60 * 1000), endTime]
                 );
                 let paramsHistory = cwsRes.rows;
@@ -2466,11 +2466,14 @@ app.get('/api/weekly-usage-report', async (req, res) => {
                 }
 
                 let hasMissingTheoretical = false;
+                // 有效參數：circulation_rate 不為 null（已在 SQL 層過濾），再依 date ASC 排序取最近記錄
+                const validParamsHistory = paramsHistory.filter(p => p.circulation_rate != null && Number(p.circulation_rate) > 0);
                 for (let dTs = startTime; dTs <= endTime; dTs += 24 * 60 * 60 * 1000) {
-                    const validParam = paramsHistory.find(p => {
+                    // 優先找：此筆記錄的有效週窗口（date <= dTs < date+7天）
+                    const validParam = validParamsHistory.find(p => {
                         const pTs = Number(p.date);
                         return dTs >= pTs && dTs < (pTs + 7 * 24 * 60 * 60 * 1000);
-                    }) || paramsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
+                    }) || validParamsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
 
                     if (validParam) {
                         theoreticalUsageKg += backendUtils.calculateCWSUsage(
@@ -2487,30 +2490,33 @@ app.get('/api/weekly-usage-report', async (req, res) => {
                 if (hasMissingTheoretical) missingTheoreticalTanks.push(tank.name);
             } else if (tank.system_type && tank.system_type.includes('鍋爐')) {
                 const bwsRes = await pool.query(
-                    "SELECT * FROM bws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3",
+                    "SELECT * FROM bws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 AND steam_production IS NOT NULL ORDER BY date ASC",
                     [tank.id, startTime - (7 * 24 * 60 * 60 * 1000), endTime]
                 );
-                let paramsHistory = bwsRes.rows;
+                // 有效參數：steam_production 不為 null（已在 SQL 層過濾）
+                let validBwsHistory = bwsRes.rows.filter(p => p.steam_production != null && Number(p.steam_production) > 0);
 
                 // Fallback: If no parameters for THIS tank, find any for OTHER boiler tanks
-                if (paramsHistory.length === 0) {
+                if (validBwsHistory.length === 0) {
                     const fallbackRes = await pool.query(
                         `SELECT p.* FROM bws_parameters p 
                          JOIN tanks t ON p.tank_id = t.id 
                          WHERE t.system_type LIKE '%鍋爐%' 
-                         AND p.date >= $1 AND p.date <= $2 
-                         ORDER BY p.date DESC LIMIT 50`,
+                         AND p.date >= $1 AND p.date <= $2
+                         AND p.steam_production IS NOT NULL
+                         ORDER BY p.date ASC`,
                         [startTime - (14 * 24 * 60 * 60 * 1000), endTime]
                     );
-                    paramsHistory = fallbackRes.rows;
+                    validBwsHistory = fallbackRes.rows.filter(p => p.steam_production != null && Number(p.steam_production) > 0);
                 }
 
                 let hasMissingTheoretical = false;
                 for (let dTs = startTime; dTs <= endTime; dTs += 24 * 60 * 60 * 1000) {
-                    const validParam = paramsHistory.find(p => {
+                    // 優先找：此筆記錄的有效週窗口（date <= dTs < date+7天）
+                    const validParam = validBwsHistory.find(p => {
                         const pTs = Number(p.date);
                         return dTs >= pTs && dTs < (pTs + 7 * 24 * 60 * 60 * 1000);
-                    }) || paramsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
+                    }) || validBwsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
 
                     if (validParam) {
                         theoreticalUsageKg += ((Number(validParam.steam_production || 0) / 7) * targetPpm) / 1000;
@@ -2692,16 +2698,17 @@ app.get('/api/monthly-usage-report', async (req, res) => {
 
             if (tank.system_type && tank.system_type.includes('冷卻')) {
                 const cwsRes = await pool.query(
-                    "SELECT * FROM cws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3",
+                    "SELECT * FROM cws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 AND circulation_rate IS NOT NULL ORDER BY date ASC",
                     [tank.id, lookbackStart, endTime]
                 );
-                const paramsHistory = cwsRes.rows;
+                // 有效參數：circulation_rate 不為 null（已在 SQL 層過濾）
+                const validParamsHistoryM = cwsRes.rows.filter(p => p.circulation_rate != null && Number(p.circulation_rate) > 0);
                 let hasMissingTheoretical = false;
                 for (let dTs = startTime; dTs <= endTime; dTs += 24 * 60 * 60 * 1000) {
-                    const validParam = paramsHistory.find(p => {
+                    const validParam = validParamsHistoryM.find(p => {
                         const pTs = Number(p.date);
                         return dTs >= pTs && dTs < (pTs + 7 * 24 * 60 * 60 * 1000);
-                    }) || paramsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
+                    }) || validParamsHistoryM.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
 
                     if (validParam) {
                         theoreticalUsageKg += backendUtils.calculateCWSUsage(
