@@ -38,6 +38,141 @@ const pool = new Pool({
     port: 5432,
 });
 
+const TAIPEI_OFFSET_MS = 8 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const LIKELY_REFILL_RISE_DAYS = 16;
+
+const normalizeTimestampToTaipeiDayStart = (ts) => {
+    const d = new Date(Number(ts) + TAIPEI_OFFSET_MS);
+    if (isNaN(d.getTime())) return 0;
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - TAIPEI_OFFSET_MS;
+};
+
+const getActiveSupplyAt = (timestamp, supplies) => {
+    return supplies
+        .filter(s => Number(s.start_date) <= Number(timestamp))
+        .sort((a, b) => Number(b.start_date) - Number(a.start_date))[0];
+};
+
+const calculateActualUsageKgFromLevel = (tank, periodReadings, supplies) => {
+    const orderedReadings = [...periodReadings].sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
+    if (orderedReadings.length < 2) return { value: 0, hasEnoughData: false };
+
+    const getVolume = (reading) => {
+        const volume = backendUtils.calculateTankVolume(tank, Number(reading.level_cm));
+        if (Number.isFinite(volume) && volume >= 0) return volume;
+        return Number(reading.calculated_volume || 0);
+    };
+
+    const toKg = (liters, readingForContract) => {
+        if (liters <= 0) return 0;
+        const activeSupply = getActiveSupplyAt(Number(readingForContract.timestamp), supplies);
+        const sg = Number(activeSupply?.specific_gravity || readingForContract.applied_sg || 1);
+        return liters * sg;
+    };
+
+    const intervals = orderedReadings.slice(1).map((curr, index) => {
+        const prev = orderedReadings[index];
+        const prevVolume = getVolume(prev);
+        const currVolume = getVolume(curr);
+
+        return {
+            curr,
+            prevVolume,
+            currVolume,
+            addedLiters: Number(curr.added_amount_liters || 0),
+            decreaseLiters: Math.max(0, prevVolume - currVolume),
+            riseLiters: Math.max(0, currVolume - prevVolume)
+        };
+    });
+
+    const firstReading = orderedReadings[0];
+    const lastReading = orderedReadings[orderedReadings.length - 1];
+    const elapsedDays = Math.max(1, (Number(lastReading.timestamp) - Number(firstReading.timestamp)) / DAY_MS);
+    const estimatedDailyUsageLiters = intervals.reduce((sum, interval) => sum + interval.decreaseLiters, 0) / elapsedDays;
+    const likelyRefillRiseThresholdLiters = estimatedDailyUsageLiters * LIKELY_REFILL_RISE_DAYS;
+
+    const hasRefill = intervals.some(interval => {
+        if (interval.addedLiters > 0) return true;
+        if (estimatedDailyUsageLiters <= 0) return false;
+        return interval.riseLiters >= likelyRefillRiseThresholdLiters;
+    });
+
+    if (!hasRefill) {
+        return {
+            value: toKg(getVolume(firstReading) - getVolume(lastReading), lastReading),
+            hasEnoughData: true
+        };
+    }
+
+    const value = intervals.reduce((sum, interval) => {
+        const isImplicitRefill = estimatedDailyUsageLiters > 0 && interval.riseLiters >= likelyRefillRiseThresholdLiters;
+        const intervalUsageLiters = interval.addedLiters > 0
+            ? Math.max(0, (interval.prevVolume + interval.addedLiters) - interval.currVolume)
+            : isImplicitRefill
+                ? 0
+                : interval.decreaseLiters;
+
+        return sum + toKg(intervalUsageLiters, interval.curr);
+    }, 0);
+
+    return { value, hasEnoughData: true };
+};
+
+const findWeeklyParamForDay = (paramsHistory, dayTimestamp) => {
+    return paramsHistory.find(p => {
+        const pDate = normalizeTimestampToTaipeiDayStart(p.date);
+        return dayTimestamp >= pDate && dayTimestamp < pDate + 7 * DAY_MS;
+    });
+};
+
+const calculateTheoreticalUsageKg = (tank, supplies, cwsHistory, bwsHistory, startTime, endTime) => {
+    let total = 0;
+    let hasMissingTheoretical = false;
+
+    for (let dayTs = startTime; dayTs <= endTime; dayTs += DAY_MS) {
+        const activeSupply = getActiveSupplyAt(dayTs, supplies);
+        const targetPpm = Number(activeSupply?.target_ppm || 0);
+        if (!targetPpm) {
+            hasMissingTheoretical = true;
+            continue;
+        }
+
+        if (tank.system_type && tank.system_type.includes('冷卻')) {
+            const param = findWeeklyParamForDay(cwsHistory, dayTs);
+            if (param && Number(param.circulation_rate || 0) > 0) {
+                let concentrationCycles = 8;
+                if (param.cws_hardness && param.makeup_hardness && Number(param.makeup_hardness) > 0) {
+                    concentrationCycles = Number(param.cws_hardness) / Number(param.makeup_hardness);
+                } else if (param.concentration_cycles && Number(param.concentration_cycles) > 1) {
+                    concentrationCycles = Number(param.concentration_cycles);
+                }
+
+                total += backendUtils.calculateCWSUsage(
+                    Number(param.circulation_rate || 0),
+                    Number(param.temp_diff || 0),
+                    concentrationCycles,
+                    targetPpm,
+                    1
+                );
+            } else {
+                hasMissingTheoretical = true;
+            }
+        } else if (tank.system_type && tank.system_type.includes('鍋爐')) {
+            const param = findWeeklyParamForDay(bwsHistory, dayTs);
+            if (param && Number(param.steam_production || 0) > 0) {
+                total += ((Number(param.steam_production) / 7) * targetPpm) / 1000;
+            } else {
+                hasMissingTheoretical = true;
+            }
+        } else {
+            hasMissingTheoretical = true;
+        }
+    }
+
+    return { value: total, hasMissingTheoretical };
+};
+
 // MCP 連線儲存
 const mcpTransports = new Map();
 const mcpServers = new Map();
@@ -2313,21 +2448,8 @@ app.get('/api/weekly-usage-report', async (req, res) => {
     try {
         // === 時區修正：所有日期計算改用台北時間 (UTC+8) ===
         const refDate = req.query.date ? new Date(req.query.date) : new Date();
-        // 台北時間相對 UTC 的偏移量
-        const TZ_OFFSET_MS = 8 * 60 * 60 * 1000;
-
-        // 將 UTC timestamp 轉換為台北時間的「天」（年/月/日）
-        const toTaipeiDate = (ts) => {
-            const d = new Date(Number(ts) + TZ_OFFSET_MS);
-            return { Y: d.getUTCFullYear(), M: d.getUTCMonth(), D: d.getUTCDate() };
-        };
-        const toTaipeiDateKey = (ts) => {
-            const { Y, M, D } = toTaipeiDate(ts);
-            return `${Y}-${String(M + 1).padStart(2, '0')}-${String(D).padStart(2, '0')}`;
-        };
-
         // 取得台北時間今天的「週一 00:00 台北」的 UTC timestamp
-        const refDateTaipei = new Date(Number(refDate) + TZ_OFFSET_MS);
+        const refDateTaipei = new Date(Number(refDate) + TAIPEI_OFFSET_MS);
         const dayOfWeekTW = refDateTaipei.getUTCDay(); // 0=Sun, 1=Mon...
         const diffToMondayTW = dayOfWeekTW === 0 ? -6 : 1 - dayOfWeekTW;
 
@@ -2336,9 +2458,9 @@ app.get('/api/weekly-usage-report', async (req, res) => {
             refDateTaipei.getUTCFullYear(),
             refDateTaipei.getUTCMonth(),
             refDateTaipei.getUTCDate()
-        ) - TZ_OFFSET_MS; // 換回 UTC
-        const thisMondayUTC = refDayStartTaipei + diffToMondayTW * 24 * 60 * 60 * 1000;
-        const lastMondayUTC = thisMondayUTC - 7 * 24 * 60 * 60 * 1000;
+        ) - TAIPEI_OFFSET_MS; // 換回 UTC
+        const thisMondayUTC = refDayStartTaipei + diffToMondayTW * DAY_MS;
+        const lastMondayUTC = thisMondayUTC - 7 * DAY_MS;
         const lastSundayEndUTC = thisMondayUTC - 1; // 週日最後一毫秒
 
         const startTime = lastMondayUTC;
@@ -2366,168 +2488,44 @@ app.get('/api/weekly-usage-report', async (req, res) => {
             }
 
             const suppliesRes = await pool.query('SELECT * FROM chemical_supplies WHERE tank_id = $1 ORDER BY start_date DESC', [tank.id]);
-            const activeSupply = backendUtils.getActiveSupplyForDate(startTime, suppliesRes.rows);
+            const activeSupply = getActiveSupplyAt(startTime, suppliesRes.rows);
 
             // Only process tanks that have an active supply WITH a target_ppm defined
             if (!activeSupply || !activeSupply.target_ppm || Number(activeSupply.target_ppm) === 0) continue;
-            const targetPpm = Number(activeSupply.target_ppm);
+            if (!(tank.system_type && (tank.system_type.includes('冷卻') || tank.system_type.includes('鍋爐')))) continue;
 
-            // 分兩步取讀數，確保不受加藥週期長短影響：
-            // Step 1: 找本週開始前「最後一筆」讀數（作為區間起點）
-            const prevReadingRes = await pool.query(
-                "SELECT * FROM readings WHERE tank_id = $1 AND timestamp < $2 ORDER BY timestamp DESC LIMIT 1",
-                [tank.id, startTime]
-            );
-            // Step 2: 取本週（含下週一第一天）的所有讀數
-            const searchEnd = endTime + (24 * 60 * 60 * 1000);
             const weekReadingsRes = await pool.query(
                 "SELECT * FROM readings WHERE tank_id = $1 AND timestamp >= $2 AND timestamp <= $3 ORDER BY timestamp ASC",
-                [tank.id, startTime, searchEnd]
+                [tank.id, startTime, endTime]
             );
-            // 合併：[上週最後一筆] + [本週所有], 若前者沒資料則不影響
-            const allReadings = [...prevReadingRes.rows, ...weekReadingsRes.rows];
-
-            // 採用與前端 AnalysisView/AnnualDataView 完全相同的「每日均攤算法」
-            // 公式：(前次重量KG + 補充KG) - 本次重量KG = 區間總用量；再按天均攤後加總目標週內的天數
-            const dailyActualMap = new Map();
-
-            for (let i = 1; i < allReadings.length; i++) {
-                const curr = allReadings[i];
-                const prev = allReadings[i - 1];
-
-                const diffMs = Number(curr.timestamp) - Number(prev.timestamp);
-                const diffDays = diffMs / (1000 * 60 * 60 * 24);
-                if (diffDays <= 0) continue;
-
-                // 讀取重量KG：優先使用 calculated_weight_kg；若為 null/0 則 fallback 到 calculated_volume * applied_sg
-                const prevWeightKg = Number(prev.calculated_weight_kg) || (Number(prev.calculated_volume || 0) * Number(prev.applied_sg || 1));
-                const currWeightKg = Number(curr.calculated_weight_kg) || (Number(curr.calculated_volume || 0) * Number(curr.applied_sg || 1));
-
-                // 補充量換算KG (與前端一致：addedAmountLiters * appliedSpecificGravity)
-                const addedKg = Number(curr.added_amount_liters || 0) * Number(curr.applied_sg || 1);
-                const intervalUsageKg = (prevWeightKg + addedKg) - currWeightKg;
-                const dailyUsageKg = intervalUsageKg / diffDays;
-
-                // 從 prev 日期迭代到 curr 日期，將每日用量寫入 Map（只寫第一次，不覆蓋）
-                let iterDate = new Date(Number(prev.timestamp) + TZ_OFFSET_MS); // 轉為台北時間
-                const endIterDate = new Date(Number(curr.timestamp) + TZ_OFFSET_MS);
-                while (iterDate < endIterDate) {
-                    // 使用 UTC 方法讀台北時間日期
-                    const Y = iterDate.getUTCFullYear();
-                    const M = String(iterDate.getUTCMonth() + 1).padStart(2, '0');
-                    const D = String(iterDate.getUTCDate()).padStart(2, '0');
-                    const dateKey = `${Y}-${M}-${D}`;
-                    if (!dailyActualMap.has(dateKey)) {
-                        dailyActualMap.set(dateKey, dailyUsageKg);
-                    }
-                    iterDate.setUTCDate(iterDate.getUTCDate() + 1);
-                }
-            }
-
-            // 加總本週（Monday ~ Sunday 台北時間）每天的用量
-            let actualUsageKg = 0;
-            let hasMissingActual = false;
-            for (let dMs = startTime; dMs <= endTime; dMs += 24 * 60 * 60 * 1000) {
-                const dateKey = toTaipeiDateKey(dMs);
-                const val = dailyActualMap.get(dateKey);
-                if (val === undefined) {
-                    hasMissingActual = true;
-                }
-                actualUsageKg += val || 0;
-            }
-            if (hasMissingActual) missingActualTanks.push(tank.name);
-
-            let theoreticalUsageKg = 0;
-            // 無論 method 是什麼，只要是 COOLING system 就嘗試從 cws_parameters 抓，BOILER 從 bws_parameters 抓，並進行計算
-            // 注意 DB 欄位為 system_type，值可能包含 '冷卻' 或 '鍋爐'
-            if (tank.system_type && tank.system_type.includes('冷卻')) {
-                // Determine Area (CT-1 or CT-2)
-                const isCt1 = tank.name.includes('CWS-1') || tank.name.includes('CT-1') || (tank.description || '').includes('一階');
-                const areaPattern = isCt1 ? '%CT-1%' : '%CT-2%';
-                const areaDescPattern = isCt1 ? '%一階%' : '%二階%';
-
-                const cwsRes = await pool.query(
-                    "SELECT * FROM cws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 AND circulation_rate IS NOT NULL ORDER BY date ASC",
-                    [tank.id, startTime - (7 * 24 * 60 * 60 * 1000), endTime]
+            const periodReadings = [...weekReadingsRes.rows]
+                .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
+                .sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
+            const lastReading = periodReadings[periodReadings.length - 1];
+            if (lastReading && normalizeTimestampToTaipeiDayStart(lastReading.timestamp) !== normalizeTimestampToTaipeiDayStart(endTime)) {
+                const nextReadingRes = await pool.query(
+                    "SELECT * FROM readings WHERE tank_id = $1 AND timestamp > $2 ORDER BY timestamp ASC LIMIT 1",
+                    [tank.id, endTime]
                 );
-                let paramsHistory = cwsRes.rows;
-
-                // Fallback: If no parameters for THIS tank, find any parameters for tanks in the SAME AREA
-                if (paramsHistory.length === 0) {
-                    const fallbackRes = await pool.query(
-                        `SELECT p.* FROM cws_parameters p 
-                         JOIN tanks t ON p.tank_id = t.id 
-                         WHERE (t.name LIKE $1 OR t.description LIKE $2) 
-                         AND p.date >= $3 AND p.date <= $4 
-                         ORDER BY p.date DESC LIMIT 50`,
-                        [areaPattern, areaDescPattern, startTime - (14 * 24 * 60 * 60 * 1000), endTime]
-                    );
-                    paramsHistory = fallbackRes.rows;
+                if (nextReadingRes.rows[0]) {
+                    periodReadings.push(nextReadingRes.rows[0]);
                 }
-
-                let hasMissingTheoretical = false;
-                // 有效參數：circulation_rate 不為 null（已在 SQL 層過濾），再依 date ASC 排序取最近記錄
-                const validParamsHistory = paramsHistory.filter(p => p.circulation_rate != null && Number(p.circulation_rate) > 0);
-                for (let dTs = startTime; dTs <= endTime; dTs += 24 * 60 * 60 * 1000) {
-                    // 優先找：此筆記錄的有效週窗口（date <= dTs < date+7天）
-                    const validParam = validParamsHistory.find(p => {
-                        const pTs = Number(p.date);
-                        return dTs >= pTs && dTs < (pTs + 7 * 24 * 60 * 60 * 1000);
-                    }) || validParamsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
-
-                    if (validParam) {
-                        theoreticalUsageKg += backendUtils.calculateCWSUsage(
-                            validParam.circulation_rate || 0,
-                            validParam.temp_diff || 0,
-                            validParam.concentration_cycles || (validParam.cws_hardness && validParam.makeup_hardness && validParam.makeup_hardness > 0 ? validParam.cws_hardness / validParam.makeup_hardness : 8),
-                            targetPpm,
-                            1
-                        );
-                    } else {
-                        hasMissingTheoretical = true;
-                    }
-                }
-                if (hasMissingTheoretical) missingTheoreticalTanks.push(tank.name);
-            } else if (tank.system_type && tank.system_type.includes('鍋爐')) {
-                const bwsRes = await pool.query(
-                    "SELECT * FROM bws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 AND steam_production IS NOT NULL ORDER BY date ASC",
-                    [tank.id, startTime - (7 * 24 * 60 * 60 * 1000), endTime]
-                );
-                // 有效參數：steam_production 不為 null（已在 SQL 層過濾）
-                let validBwsHistory = bwsRes.rows.filter(p => p.steam_production != null && Number(p.steam_production) > 0);
-
-                // Fallback: If no parameters for THIS tank, find any for OTHER boiler tanks
-                if (validBwsHistory.length === 0) {
-                    const fallbackRes = await pool.query(
-                        `SELECT p.* FROM bws_parameters p 
-                         JOIN tanks t ON p.tank_id = t.id 
-                         WHERE t.system_type LIKE '%鍋爐%' 
-                         AND p.date >= $1 AND p.date <= $2
-                         AND p.steam_production IS NOT NULL
-                         ORDER BY p.date ASC`,
-                        [startTime - (14 * 24 * 60 * 60 * 1000), endTime]
-                    );
-                    validBwsHistory = fallbackRes.rows.filter(p => p.steam_production != null && Number(p.steam_production) > 0);
-                }
-
-                let hasMissingTheoretical = false;
-                for (let dTs = startTime; dTs <= endTime; dTs += 24 * 60 * 60 * 1000) {
-                    // 優先找：此筆記錄的有效週窗口（date <= dTs < date+7天）
-                    const validParam = validBwsHistory.find(p => {
-                        const pTs = Number(p.date);
-                        return dTs >= pTs && dTs < (pTs + 7 * 24 * 60 * 60 * 1000);
-                    }) || validBwsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
-
-                    if (validParam) {
-                        theoreticalUsageKg += ((Number(validParam.steam_production || 0) / 7) * targetPpm) / 1000;
-                    } else {
-                        hasMissingTheoretical = true;
-                    }
-                }
-                if (hasMissingTheoretical) missingTheoreticalTanks.push(tank.name);
-            } else {
-                continue;
             }
+            const actualResult = calculateActualUsageKgFromLevel(tank, periodReadings, suppliesRes.rows);
+            const actualUsageKg = actualResult.value;
+            if (!actualResult.hasEnoughData) missingActualTanks.push(tank.name);
+
+            const cwsRes = await pool.query(
+                "SELECT * FROM cws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 ORDER BY date ASC",
+                [tank.id, startTime - DAY_MS * 7, endTime]
+            );
+            const bwsRes = await pool.query(
+                "SELECT * FROM bws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 ORDER BY date ASC",
+                [tank.id, startTime - DAY_MS * 7, endTime]
+            );
+            const theoreticalResult = calculateTheoreticalUsageKg(tank, suppliesRes.rows, cwsRes.rows, bwsRes.rows, startTime, endTime);
+            const theoreticalUsageKg = theoreticalResult.value;
+            if (theoreticalResult.hasMissingTheoretical) missingTheoreticalTanks.push(tank.name);
 
             const diff = actualUsageKg - theoreticalUsageKg;
             const diffPercent = theoreticalUsageKg > 0 ? (Math.abs(diff) / theoreticalUsageKg) * 100 : 0;
@@ -2590,18 +2588,8 @@ app.get('/api/monthly-usage-report', async (req, res) => {
     try {
         // === 時區修正：所有日期計算改用台北時間 (UTC+8) ===
         const refDate = req.query.date ? new Date(req.query.date) : new Date();
-        const TZ_OFFSET_MS = 8 * 60 * 60 * 1000;
-
-        const toTaipeiDateKey = (ts) => {
-            const d = new Date(Number(ts) + TZ_OFFSET_MS);
-            const Y = d.getUTCFullYear();
-            const M = String(d.getUTCMonth() + 1).padStart(2, '0');
-            const D = String(d.getUTCDate()).padStart(2, '0');
-            return `${Y}-${M}-${D}`;
-        };
-
         // 計算「上個月」的台北時間起迄（1日00:00 ~ 月底23:59:59.999）
-        const refDateTaipei = new Date(Number(refDate) + TZ_OFFSET_MS);
+        const refDateTaipei = new Date(Number(refDate) + TAIPEI_OFFSET_MS);
         const thisYear = refDateTaipei.getUTCFullYear();
         const thisMonth = refDateTaipei.getUTCMonth(); // 0-indexed，當月
 
@@ -2610,13 +2598,13 @@ app.get('/api/monthly-usage-report', async (req, res) => {
         const targetMonth = thisMonth === 0 ? 11 : thisMonth - 1; // 0-indexed
 
         // 上個月 1 日 00:00 台北時間 → UTC
-        const startTime = Date.UTC(targetYear, targetMonth, 1) - TZ_OFFSET_MS;
+        const startTime = Date.UTC(targetYear, targetMonth, 1) - TAIPEI_OFFSET_MS;
         // 上個月最後一天 23:59:59.999 台北時間 → UTC
-        const endTime = Date.UTC(targetYear, targetMonth + 1, 1) - TZ_OFFSET_MS - 1;
+        const endTime = Date.UTC(targetYear, targetMonth + 1, 1) - TAIPEI_OFFSET_MS - 1;
 
         // 顯示用字串
         const startDisplay = `${targetYear}/${targetMonth + 1}/1`;
-        const endDay = new Date(endTime + TZ_OFFSET_MS).getUTCDate();
+        const endDay = new Date(endTime + TAIPEI_OFFSET_MS).getUTCDate();
         const endDisplay = `${targetYear}/${targetMonth + 1}/${endDay}`;
         const periodStr = `${startDisplay} ~ ${endDisplay}`;
 
@@ -2635,117 +2623,34 @@ app.get('/api/monthly-usage-report', async (req, res) => {
             }
 
             const suppliesRes = await pool.query('SELECT * FROM chemical_supplies WHERE tank_id = $1 ORDER BY start_date DESC', [tank.id]);
-            const activeSupply = backendUtils.getActiveSupplyForDate(startTime, suppliesRes.rows);
+            const activeSupply = getActiveSupplyAt(startTime, suppliesRes.rows);
 
             if (!activeSupply || !activeSupply.target_ppm || Number(activeSupply.target_ppm) === 0) continue;
-            const targetPpm = Number(activeSupply.target_ppm);
+            if (!(tank.system_type && (tank.system_type.includes('冷卻') || tank.system_type.includes('鍋爐')))) continue;
 
-            // 讀取讀數（起點前最後一筆 + 當月所有讀數）
-            const prevReadingRes = await pool.query(
-                "SELECT * FROM readings WHERE tank_id = $1 AND timestamp < $2 ORDER BY timestamp DESC LIMIT 1",
-                [tank.id, startTime]
-            );
-            const searchEnd = endTime + (24 * 60 * 60 * 1000);
             const monthReadingsRes = await pool.query(
                 "SELECT * FROM readings WHERE tank_id = $1 AND timestamp >= $2 AND timestamp <= $3 ORDER BY timestamp ASC",
-                [tank.id, startTime, searchEnd]
+                [tank.id, startTime, endTime]
             );
-            const allReadings = [...prevReadingRes.rows, ...monthReadingsRes.rows];
+            const periodReadings = monthReadingsRes.rows
+                .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
+                .sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
+            const actualResult = calculateActualUsageKgFromLevel(tank, periodReadings, suppliesRes.rows);
+            const actualUsageKg = actualResult.value;
+            if (!actualResult.hasEnoughData) missingActualTanks.push(tank.name);
 
-            // 每日均攤算法（與週報完全相同）
-            const dailyActualMap = new Map();
-            for (let i = 1; i < allReadings.length; i++) {
-                const curr = allReadings[i];
-                const prev = allReadings[i - 1];
-                const diffMs = Number(curr.timestamp) - Number(prev.timestamp);
-                const diffDays = diffMs / (1000 * 60 * 60 * 24);
-                if (diffDays <= 0) continue;
-
-                const prevWeightKg = Number(prev.calculated_weight_kg) || (Number(prev.calculated_volume || 0) * Number(prev.applied_sg || 1));
-                const currWeightKg = Number(curr.calculated_weight_kg) || (Number(curr.calculated_volume || 0) * Number(curr.applied_sg || 1));
-                const addedKg = Number(curr.added_amount_liters || 0) * Number(curr.applied_sg || 1);
-                const intervalUsageKg = (prevWeightKg + addedKg) - currWeightKg;
-                const dailyUsageKg = intervalUsageKg / diffDays;
-
-                let iterDate = new Date(Number(prev.timestamp) + TZ_OFFSET_MS);
-                const endIterDate = new Date(Number(curr.timestamp) + TZ_OFFSET_MS);
-                while (iterDate < endIterDate) {
-                    const Y = iterDate.getUTCFullYear();
-                    const M = String(iterDate.getUTCMonth() + 1).padStart(2, '0');
-                    const D = String(iterDate.getUTCDate()).padStart(2, '0');
-                    const dateKey = `${Y}-${M}-${D}`;
-                    if (!dailyActualMap.has(dateKey)) {
-                        dailyActualMap.set(dateKey, dailyUsageKg);
-                    }
-                    iterDate.setUTCDate(iterDate.getUTCDate() + 1);
-                }
-            }
-
-            // 加總當月每天的實際用量
-            let actualUsageKg = 0;
-            let hasMissingActual = false;
-            for (let dMs = startTime; dMs <= endTime; dMs += 24 * 60 * 60 * 1000) {
-                const dateKey = toTaipeiDateKey(dMs);
-                const val = dailyActualMap.get(dateKey);
-                if (val === undefined) hasMissingActual = true;
-                actualUsageKg += val || 0;
-            }
-            if (hasMissingActual) missingActualTanks.push(tank.name);
-
-            // 理論用量計算（冷卻水 / 鍋爐水）
-            let theoreticalUsageKg = 0;
-            const lookbackStart = startTime - (35 * 24 * 60 * 60 * 1000); // 多回溯 5 週
-
-            if (tank.system_type && tank.system_type.includes('冷卻')) {
-                const cwsRes = await pool.query(
-                    "SELECT * FROM cws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 AND circulation_rate IS NOT NULL ORDER BY date ASC",
-                    [tank.id, lookbackStart, endTime]
-                );
-                // 有效參數：circulation_rate 不為 null（已在 SQL 層過濾）
-                const validParamsHistoryM = cwsRes.rows.filter(p => p.circulation_rate != null && Number(p.circulation_rate) > 0);
-                let hasMissingTheoretical = false;
-                for (let dTs = startTime; dTs <= endTime; dTs += 24 * 60 * 60 * 1000) {
-                    const validParam = validParamsHistoryM.find(p => {
-                        const pTs = Number(p.date);
-                        return dTs >= pTs && dTs < (pTs + 7 * 24 * 60 * 60 * 1000);
-                    }) || validParamsHistoryM.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
-
-                    if (validParam) {
-                        theoreticalUsageKg += backendUtils.calculateCWSUsage(
-                            validParam.circulation_rate || 0,
-                            validParam.temp_diff || 0,
-                            validParam.concentration_cycles || (validParam.cws_hardness && validParam.makeup_hardness && validParam.makeup_hardness > 0 ? validParam.cws_hardness / validParam.makeup_hardness : 8),
-                            targetPpm,
-                            1
-                        );
-                    } else {
-                        hasMissingTheoretical = true;
-                    }
-                }
-                if (hasMissingTheoretical) missingTheoreticalTanks.push(tank.name);
-            } else if (tank.system_type && tank.system_type.includes('鍋爐')) {
-                const bwsRes = await pool.query(
-                    "SELECT * FROM bws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3",
-                    [tank.id, lookbackStart, endTime]
-                );
-                const paramsHistory = bwsRes.rows;
-                let hasMissingTheoretical = false;
-                for (let dTs = startTime; dTs <= endTime; dTs += 24 * 60 * 60 * 1000) {
-                    const validParam = paramsHistory.find(p => {
-                        const pTs = Number(p.date);
-                        return dTs >= pTs && dTs < (pTs + 7 * 24 * 60 * 60 * 1000);
-                    }) || paramsHistory.filter(p => Number(p.date) < dTs).sort((a, b) => Number(b.date) - Number(a.date))[0];
-
-                    if (validParam) {
-                        theoreticalUsageKg += ((Number(validParam.steam_production || 0) / 7) * targetPpm) / 1000;
-                    } else {
-                        hasMissingTheoretical = true;
-                    }
-                }
-                if (hasMissingTheoretical) missingTheoreticalTanks.push(tank.name);
-            } else {
-                continue;
-            }
+            const lookbackStart = startTime - DAY_MS * 35; // 多回溯 5 週，讓月初可套用前一週資料
+            const cwsRes = await pool.query(
+                "SELECT * FROM cws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 ORDER BY date ASC",
+                [tank.id, lookbackStart, endTime]
+            );
+            const bwsRes = await pool.query(
+                "SELECT * FROM bws_parameters WHERE tank_id = $1 AND date >= $2 AND date <= $3 ORDER BY date ASC",
+                [tank.id, lookbackStart, endTime]
+            );
+            const theoreticalResult = calculateTheoreticalUsageKg(tank, suppliesRes.rows, cwsRes.rows, bwsRes.rows, startTime, endTime);
+            const theoreticalUsageKg = theoreticalResult.value;
+            if (theoreticalResult.hasMissingTheoretical) missingTheoreticalTanks.push(tank.name);
 
             const diff = actualUsageKg - theoreticalUsageKg;
             const diffPercent = theoreticalUsageKg > 0 ? (Math.abs(diff) / theoreticalUsageKg) * 100 : 0;

@@ -180,6 +180,14 @@ const getNormalizedTimestamp = (dateStr: string | Date | number): number | null 
     return d.getTime();
 };
 
+const normalizeTimestampToLocalDayStart = (timestamp?: number): number => {
+    if (!timestamp) return 0;
+    const d = new Date(timestamp);
+    if (isNaN(d.getTime())) return 0;
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+};
+
 type UsageMetric = 'KG' | 'L' | '$';
 
 type LevelRiseWarning = {
@@ -4756,7 +4764,7 @@ const AnalysisView: React.FC<{
 
                     // Re-finding strictly without fallback to match AnnualDataView's latest logic
                     const strictCwsParam = cwsParamsHistory.find(p => {
-                        const pDate = p.date || 0;
+                        const pDate = normalizeTimestampToLocalDayStart(p.date);
                         const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
                         return dayTime >= pDate && dayTime < pEnd;
                     });
@@ -4785,7 +4793,7 @@ const AnalysisView: React.FC<{
 
                     // Strict find
                     const strictBwsParam = bwsParamsHistory.find(p => {
-                        const pDate = p.date || 0;
+                        const pDate = normalizeTimestampToLocalDayStart(p.date);
                         const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
                         return dayTime >= pDate && dayTime < pEnd;
                     });

@@ -22,14 +22,16 @@ export const calculateTankVolume = (tank, levelCm) => {
         try { dimensions = JSON.parse(dimensions); } catch (e) { }
     }
 
+    const factor = Number(tank.factor ?? tank.geo_factor ?? 0);
+
     if (!tank.shape_type || tank.shape_type === 'VERTICAL_CYLINDER') {
-        if (!dimensions?.diameter && tank.factor) {
-            return levelCm * tank.factor;
+        if (!dimensions?.diameter && factor) {
+            return levelCm * factor;
         }
     }
 
     if (!dimensions) {
-        return tank.factor ? levelCm * tank.factor : 0;
+        return factor ? levelCm * factor : 0;
     }
 
     const diameter = Number(dimensions.diameter) || 0;
@@ -46,20 +48,20 @@ export const calculateTankVolume = (tank, levelCm) => {
     if (height && h > height) h = height;
 
     if (tank.shape_type === 'VERTICAL_CYLINDER') {
-        if (!diameter) return tank.factor ? levelCm * tank.factor : 0;
+        if (!diameter) return factor ? levelCm * factor : 0;
         const r = diameter / 2;
         const volCm3 = Math.PI * Math.pow(r, 2) * h;
         return volCm3 / 1000;
     }
 
     if (tank.shape_type === 'RECTANGULAR') {
-        if (!width || !length) return tank.factor ? levelCm * tank.factor : 0;
+        if (!width || !length) return factor ? levelCm * factor : 0;
         const volCm3 = length * width * h;
         return volCm3 / 1000;
     }
 
     if (tank.shape_type === 'HORIZONTAL_CYLINDER') {
-        if (!diameter || !length) return tank.factor ? levelCm * tank.factor : 0;
+        if (!diameter || !length) return factor ? levelCm * factor : 0;
         const r = diameter / 2;
         const hCalc = Math.min(h, diameter);
 
