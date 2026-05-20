@@ -180,6 +180,206 @@ const getNormalizedTimestamp = (dateStr: string | Date | number): number | null 
     return d.getTime();
 };
 
+type UsageMetric = 'KG' | 'L' | '$';
+
+type LevelRiseWarning = {
+    kind: 'SUSPICIOUS_RISE' | 'MULTIPLE_REFILL_RISE';
+    dateStr: string;
+    riseLiters: number;
+    dailyEquivalent: number;
+    previousLevelCm: number;
+    currentLevelCm: number;
+};
+
+const SUSPICIOUS_RISE_DAYS = 5;
+const LIKELY_REFILL_RISE_DAYS = 16;
+
+const getLocalDateKey = (timestamp: number): string => {
+    const d = new Date(timestamp);
+    const Y = d.getFullYear();
+    const M = String(d.getMonth() + 1).padStart(2, '0');
+    const D = String(d.getDate()).padStart(2, '0');
+    return `${Y}-${M}-${D}`;
+};
+
+const getActiveSupplyAt = (timestamp: number, suppliesHistory: ChemicalSupply[]): ChemicalSupply | undefined => {
+    return suppliesHistory
+        .filter(s => s.startDate <= timestamp)
+        .sort((a, b) => b.startDate - a.startDate)[0];
+};
+
+const getReadingsForUsagePeriod = (
+    readings: Reading[],
+    tankId: string,
+    periodStart: number,
+    periodEnd: number,
+    includeNextBoundaryReading = false
+): Reading[] => {
+    const periodReadings = readings
+        .filter(r => r.tankId === tankId && r.timestamp >= periodStart && r.timestamp <= periodEnd)
+        .sort((a, b) => a.timestamp - b.timestamp);
+
+    const lastReading = periodReadings[periodReadings.length - 1];
+    if (includeNextBoundaryReading && lastReading && getLocalDateKey(lastReading.timestamp) !== getLocalDateKey(periodEnd)) {
+        const nextBoundaryReading = readings
+            .filter(r => r.tankId === tankId && r.timestamp > periodEnd)
+            .sort((a, b) => a.timestamp - b.timestamp)[0];
+
+        if (nextBoundaryReading) {
+            periodReadings.push(nextBoundaryReading);
+        }
+    }
+
+    return periodReadings
+        .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
+        .sort((a, b) => a.timestamp - b.timestamp);
+};
+
+const calculateActualUsageFromLevel = (
+    tank: Tank,
+    periodReadings: Reading[],
+    metric: UsageMetric,
+    suppliesHistory: ChemicalSupply[]
+): number => {
+    const orderedReadings = [...periodReadings].sort((a, b) => a.timestamp - b.timestamp);
+    if (orderedReadings.length < 2) return 0;
+
+    const getVolume = (reading: Reading): number => {
+        const volume = calculateTankVolume(tank, reading.levelCm);
+        if (Number.isFinite(volume) && volume >= 0) return volume;
+        return reading.calculatedVolume || 0;
+    };
+
+    const toMetric = (liters: number, readingForContract: Reading): number => {
+        if (liters <= 0) return 0;
+        if (metric === 'L') return liters;
+
+        const activeSupply = getActiveSupplyAt(readingForContract.timestamp, suppliesHistory);
+        const sg = activeSupply?.specificGravity || readingForContract.appliedSpecificGravity || 1;
+        const kg = liters * sg;
+
+        if (metric === '$') {
+            return kg * (activeSupply?.price || 0);
+        }
+
+        return kg;
+    };
+
+    const intervals = orderedReadings.slice(1).map((curr, index) => {
+        const prev = orderedReadings[index];
+        const prevVolume = getVolume(prev);
+        const currVolume = getVolume(curr);
+
+        return {
+            curr,
+            prevVolume,
+            currVolume,
+            addedLiters: curr.addedAmountLiters || 0,
+            decreaseLiters: Math.max(0, prevVolume - currVolume),
+            riseLiters: Math.max(0, currVolume - prevVolume)
+        };
+    });
+
+    const firstReading = orderedReadings[0];
+    const lastReading = orderedReadings[orderedReadings.length - 1];
+    const elapsedDays = Math.max(1, (lastReading.timestamp - firstReading.timestamp) / (1000 * 60 * 60 * 24));
+    const estimatedDailyUsageLiters = intervals.reduce((sum, interval) => sum + interval.decreaseLiters, 0) / elapsedDays;
+    const refillRiseThresholdLiters = estimatedDailyUsageLiters * SUSPICIOUS_RISE_DAYS;
+    const likelyRefillRiseThresholdLiters = estimatedDailyUsageLiters * LIKELY_REFILL_RISE_DAYS;
+
+    const hasRefill = intervals.some(interval => {
+        if (interval.addedLiters > 0) return true;
+        if (estimatedDailyUsageLiters <= 0) return false;
+        return interval.riseLiters >= likelyRefillRiseThresholdLiters;
+    });
+
+    if (!hasRefill) {
+        return toMetric(getVolume(firstReading) - getVolume(lastReading), lastReading);
+    }
+
+    return intervals.reduce((sum, interval) => {
+        const isImplicitRefill = estimatedDailyUsageLiters > 0 && interval.riseLiters >= likelyRefillRiseThresholdLiters;
+        const intervalUsageLiters = interval.addedLiters > 0
+            ? Math.max(0, (interval.prevVolume + interval.addedLiters) - interval.currVolume)
+            : isImplicitRefill
+                ? 0
+                : interval.decreaseLiters;
+
+        return sum + toMetric(intervalUsageLiters, interval.curr);
+    }, 0);
+};
+
+const getSuspiciousLevelRiseWarnings = (
+    tank: Tank,
+    periodReadings: Reading[]
+): LevelRiseWarning[] => {
+    const orderedReadings = [...periodReadings].sort((a, b) => a.timestamp - b.timestamp);
+    if (orderedReadings.length < 2) return [];
+
+    const getVolume = (reading: Reading): number => {
+        const volume = calculateTankVolume(tank, reading.levelCm);
+        if (Number.isFinite(volume) && volume >= 0) return volume;
+        return reading.calculatedVolume || 0;
+    };
+
+    const intervals = orderedReadings.slice(1).map((curr, index) => {
+        const prev = orderedReadings[index];
+        const prevVolume = getVolume(prev);
+        const currVolume = getVolume(curr);
+
+        return {
+            curr,
+            prev,
+            decreaseLiters: Math.max(0, prevVolume - currVolume),
+            riseLiters: Math.max(0, currVolume - prevVolume)
+        };
+    });
+
+    const firstReading = orderedReadings[0];
+    const lastReading = orderedReadings[orderedReadings.length - 1];
+    const elapsedDays = Math.max(1, (lastReading.timestamp - firstReading.timestamp) / (1000 * 60 * 60 * 24));
+    const estimatedDailyUsageLiters = intervals.reduce((sum, interval) => sum + interval.decreaseLiters, 0) / elapsedDays;
+
+    if (estimatedDailyUsageLiters <= 0) return [];
+
+    const minSuspiciousRiseLiters = estimatedDailyUsageLiters * SUSPICIOUS_RISE_DAYS;
+    const likelyRefillRiseLiters = estimatedDailyUsageLiters * LIKELY_REFILL_RISE_DAYS;
+
+    const suspiciousRiseWarnings = intervals
+        .filter(interval =>
+            (interval.curr.addedAmountLiters || 0) <= 0 &&
+            interval.riseLiters > minSuspiciousRiseLiters &&
+            interval.riseLiters < likelyRefillRiseLiters
+        )
+        .map(interval => ({
+            kind: 'SUSPICIOUS_RISE' as const,
+            dateStr: getLocalDateKey(interval.curr.timestamp),
+            riseLiters: interval.riseLiters,
+            dailyEquivalent: interval.riseLiters / estimatedDailyUsageLiters,
+            previousLevelCm: interval.prev.levelCm,
+            currentLevelCm: interval.curr.levelCm
+        }));
+
+    const likelyRefillEvents = intervals
+        .filter(interval =>
+            (interval.curr.addedAmountLiters || 0) <= 0 &&
+            interval.riseLiters >= likelyRefillRiseLiters
+        );
+
+    const multipleRefillWarnings = likelyRefillEvents.length >= 2
+        ? likelyRefillEvents.map(interval => ({
+            kind: 'MULTIPLE_REFILL_RISE' as const,
+            dateStr: getLocalDateKey(interval.curr.timestamp),
+            riseLiters: interval.riseLiters,
+            dailyEquivalent: interval.riseLiters / estimatedDailyUsageLiters,
+            previousLevelCm: interval.prev.levelCm,
+            currentLevelCm: interval.curr.levelCm
+        }))
+        : [];
+
+    return [...suspiciousRiseWarnings, ...multipleRefillWarnings];
+};
+
 const parseDateKey = (key: string): Date | null => {
     // 0. Check if key contains a 4-digit year (YYYY) - PRIORITY 1 (Western Date)
     const hasYear = /\d{4}/.test(key);
@@ -4432,11 +4632,22 @@ const AnalysisView: React.FC<{
             w.count += 1;
         });
 
-        return Array.from(weeklyMap.values()).map(w => ({
-            ...w,
-            level: w.avgLevel / (w.count || 1)
-        })).sort((a, b) => a.date.getTime() - b.date.getTime());
-    }, [dailyData]);
+        return Array.from(weeklyMap.values()).map(w => {
+            const weekStartTime = w.date.getTime();
+            const weekEndTime = weekStartTime + (7 * 24 * 60 * 60 * 1000) - 1;
+            const periodReadings = selectedTank
+                ? getReadingsForUsagePeriod(readings, selectedTank.id, weekStartTime, weekEndTime, true)
+                : [];
+
+            return {
+                ...w,
+                usage: selectedTank
+                    ? calculateActualUsageFromLevel(selectedTank, periodReadings, metric, suppliesHistory)
+                    : 0,
+                level: w.avgLevel / (w.count || 1)
+            };
+        }).sort((a, b) => a.date.getTime() - b.date.getTime());
+    }, [dailyData, readings, selectedTank, metric, suppliesHistory]);
 
     // 3. Monthly Comparison Data (Actual vs Theoretical)
     const monthlyComparisonData = useMemo(() => {
@@ -4600,8 +4811,12 @@ const AnalysisView: React.FC<{
         return Array.from(monthlyMap.values()).map(m => {
             // 取得該月最後一天有效的藥劑合約（而非逐日收集，避免舊合約干擾）
             const monthEnd = new Date(m.date.getFullYear(), m.date.getMonth() + 1, 0); // 該月最後一天
+            monthEnd.setHours(23, 59, 59, 999);
             const monthEndTime = monthEnd.getTime();
             const activeSupplyForMonth = suppliesHistory.find(s => s.startDate <= monthEndTime);
+            const periodReadings = getReadingsForUsagePeriod(readings, selectedTank.id, m.date.getTime(), monthEndTime);
+            const actual = calculateActualUsageFromLevel(selectedTank, periodReadings, metric, suppliesHistory);
+            const levelRiseWarnings = getSuspiciousLevelRiseWarnings(selectedTank, periodReadings);
 
             const specificGravity = activeSupplyForMonth?.specificGravity;
             const price = activeSupplyForMonth?.price;
@@ -4609,15 +4824,16 @@ const AnalysisView: React.FC<{
             return {
                 dateStr: m.dateStr,
                 date: m.date,
-                actual: m.actual,
+                actual,
                 theoretical: m.theoretical,
-                deviation: m.theoretical > 0 ? ((m.actual - m.theoretical) / m.theoretical) * 100 : 0,
+                deviation: m.theoretical > 0 ? ((actual - m.theoretical) / m.theoretical) * 100 : 0,
+                levelRiseWarnings,
                 specificGravity,
                 price
             };
         }).sort((a, b) => a.date.getTime() - b.date.getTime());
 
-    }, [dailyData, selectedTank, metric, suppliesHistory, cwsParamsHistory, bwsParamsHistory, appliedDateRange]);
+    }, [dailyData, selectedTank, metric, suppliesHistory, cwsParamsHistory, bwsParamsHistory, appliedDateRange, readings]);
 
     // 4. Weekly Comparison Data (Actual vs Theoretical)
     const weeklyComparisonData = useMemo(() => {
@@ -5286,8 +5502,14 @@ const AnalysisView: React.FC<{
                                             const data = monthlyComparisonData.find(d => d.dateStr === payload.value);
                                             const diff = data?.deviation || 0;
                                             const color = Math.abs(diff) > 20 ? '#dc2626' : Math.abs(diff) > 10 ? '#ca8a04' : '#16a34a';
+                                            const hasLevelRiseWarning = (data?.levelRiseWarnings?.length || 0) > 0;
                                             return (
                                                 <g transform={`translate(${x},${y})`}>
+                                                    {hasLevelRiseWarning && (
+                                                        <text x={0} y={-8} textAnchor="middle" fill="#d97706" fontSize={15} fontWeight="bold">
+                                                            ⚠
+                                                        </text>
+                                                    )}
                                                     <text x={0} y={0} dy={16} textAnchor="middle" fill="#666" fontSize={12}>
                                                         {payload.value}
                                                     </text>
@@ -5299,7 +5521,43 @@ const AnalysisView: React.FC<{
                                         }}
                                     />
                                     <YAxis />
-                                    <Tooltip formatter={(value: number) => value.toFixed(1)} />
+                                    <Tooltip
+                                        content={({ active, payload, label }: any) => {
+                                            if (!active || !payload?.length) return null;
+                                            const data = payload[0]?.payload;
+                                            const warnings: LevelRiseWarning[] = data?.levelRiseWarnings || [];
+
+                                            return (
+                                                <div className="bg-white border border-slate-200 shadow-lg rounded-md p-3 text-sm text-slate-700 min-w-48">
+                                                    <div className="font-semibold text-slate-900 mb-2">{label}</div>
+                                                    {payload.map((entry: any) => (
+                                                        <div key={entry.dataKey} className="flex justify-between gap-4">
+                                                            <span style={{ color: entry.color }}>{entry.name}</span>
+                                                            <span className="font-medium">{Number(entry.value).toFixed(1)}</span>
+                                                        </div>
+                                                    ))}
+                                                    {warnings.length > 0 && (
+                                                        <div className="mt-3 pt-2 border-t border-amber-100 space-y-1 text-xs">
+                                                            <div className="font-semibold text-amber-700 flex items-center gap-1">
+                                                                <Icons.Alert className="w-3.5 h-3.5" />
+                                                                液位上升警示
+                                                            </div>
+                                                            {warnings.map((warning, index) => (
+                                                                <div key={`${warning.dateStr}-${index}`} className="text-slate-600">
+                                                                    <span className="font-medium">{warning.dateStr}</span>
+                                                                    ：{warning.previousLevelCm} → {warning.currentLevelCm} cm，
+                                                                    約 {warning.dailyEquivalent.toFixed(1)} 天用量
+                                                                    {warning.kind === 'SUSPICIOUS_RISE'
+                                                                        ? '，未達補藥量，請確認是否為異常波動'
+                                                                        : '，本月大幅上升出現兩次以上，請確認補藥紀錄'}
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        }}
+                                    />
                                     <Legend verticalAlign="top" />
 
                                     {hasCalculation && metric === 'KG' && (

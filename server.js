@@ -2406,7 +2406,7 @@ app.get('/api/weekly-usage-report', async (req, res) => {
                 // 補充量換算KG (與前端一致：addedAmountLiters * appliedSpecificGravity)
                 const addedKg = Number(curr.added_amount_liters || 0) * Number(curr.applied_sg || 1);
                 const intervalUsageKg = (prevWeightKg + addedKg) - currWeightKg;
-                const dailyUsageKg = Math.max(0, intervalUsageKg / diffDays);
+                const dailyUsageKg = intervalUsageKg / diffDays;
 
                 // 從 prev 日期迭代到 curr 日期，將每日用量寫入 Map（只寫第一次，不覆蓋）
                 let iterDate = new Date(Number(prev.timestamp) + TZ_OFFSET_MS); // 轉為台北時間
@@ -2665,7 +2665,7 @@ app.get('/api/monthly-usage-report', async (req, res) => {
                 const currWeightKg = Number(curr.calculated_weight_kg) || (Number(curr.calculated_volume || 0) * Number(curr.applied_sg || 1));
                 const addedKg = Number(curr.added_amount_liters || 0) * Number(curr.applied_sg || 1);
                 const intervalUsageKg = (prevWeightKg + addedKg) - currWeightKg;
-                const dailyUsageKg = Math.max(0, intervalUsageKg / diffDays);
+                const dailyUsageKg = intervalUsageKg / diffDays;
 
                 let iterDate = new Date(Number(prev.timestamp) + TZ_OFFSET_MS);
                 const endIterDate = new Date(Number(curr.timestamp) + TZ_OFFSET_MS);

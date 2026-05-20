@@ -152,12 +152,12 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                 // 補充量記錄在「補充後」的那筆讀數(curr)上
                 // 公式：(前重量 + 本次補充量) - 後重量 = 區間用量
                 // 2. 嚴格計算 (Strict Calculation): 移除預設值，避免髒資料導致虛增 (與 AnalysisView 一致)
-                // 若 SG 為 undefined，則整個 addedKg 為 NaN -> totalUsageKg 為 NaN -> 下方 Math.max(0, NaN) = 0 (忽略此筆)
+                // 若 SG 為 undefined，則 addedKg 為 NaN -> totalUsageKg 為 NaN -> dailyUsage 為 NaN -> dailyMap 忽略此筆
                 const addedKg = (curr.addedAmountLiters) * (curr.appliedSpecificGravity);
                 const totalUsageKg = (prev.calculatedWeightKg + addedKg) - curr.calculatedWeightKg;
 
-                // 使用 Math.max(0, ...) 與 AnalysisView 一致
-                const dailyUsage = Math.max(0, totalUsageKg / diffDays);
+                // 移除 Math.max(0, ...)，允許負值參與加總，避免波動截斷導致月用量虛增
+                const dailyUsage = totalUsageKg / diffDays;
 
                 let iterDate = new Date(prev.timestamp);
                 const endDate = new Date(curr.timestamp);
