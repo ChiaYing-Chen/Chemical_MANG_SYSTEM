@@ -631,7 +631,7 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                                         x={ex + (cos >= 0 ? 1 : -1) * 8}
                                         y={ey}
                                         textAnchor={textAnchor}
-                                        fill="#333"
+                                        fill="#cbd5e1"
                                         fontSize={11}
                                         fontWeight="500"
                                         dy={4}
@@ -677,13 +677,14 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                                             /* Single Chemical: Show Line Chart */
                                             <ResponsiveContainer width="100%" height="100%">
                                                 <LineChart data={monthlyLineData} margin={{ top: 20, right: 30, left: 20, bottom: 5 }}>
-                                                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
-                                                    <XAxis dataKey="month" tick={{ fontSize: 11 }} />
+                                                    <CartesianGrid strokeDasharray="3 3" stroke="#2d3b55" />
+                                                    <XAxis dataKey="month" tick={{ fontSize: 11, fill: '#cbd5e1' }} />
                                                     <YAxis
                                                         tickFormatter={(value) => `$${(value / 1000).toFixed(0)}k`}
-                                                        tick={{ fontSize: 11 }}
+                                                        tick={{ fontSize: 11, fill: '#cbd5e1' }}
                                                     />
                                                     <RechartsTooltip
+                                                        contentStyle={{ backgroundColor: '#0f172a', borderColor: '#2d3b55', borderRadius: '8px', color: '#f8fafc' }}
                                                         formatter={(value: number) => [`$${value.toLocaleString('zh-TW', { maximumFractionDigits: 0 })}`, '金額']}
                                                     />
                                                     <Line
