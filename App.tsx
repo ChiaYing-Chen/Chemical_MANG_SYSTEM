@@ -35,7 +35,7 @@ export const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { 
     const variants = {
         primary: "bg-brand-600 text-white hover:bg-brand-700 focus:ring-brand-500",
         secondary: "bg-white text-slate-700 border border-slate-300 hover:bg-slate-50 focus:ring-slate-500",
-        danger: "bg-red-50 text-red-600 hover:bg-red-100 focus:ring-red-500",
+        danger: "danger-button focus:ring-red-500",
         ghost: "bg-transparent text-slate-600 hover:bg-slate-100"
     };
     return (
@@ -782,9 +782,10 @@ const LiquidLevelTrendModal: React.FC<{
     return (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
             <div className="bg-white rounded-xl shadow-2xl max-w-4xl w-full mx-4 overflow-hidden flex flex-col h-[70vh]" onClick={e => e.stopPropagation()}>
-                <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex justify-between items-center">
+                <div className="trend-modal-header px-6 py-4 border-b flex justify-between items-center">
                     <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
-                        📈 {tank.name} - 過去 60 天液位趨勢
+                        <Icons.Analysis className="w-5 h-5 text-sky-400" />
+                        {tank.name} - 過去 60 天液位趨勢
                     </h2>
                     <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-2xl font-semibold leading-none">&times;</button>
                 </div>
@@ -796,20 +797,29 @@ const LiquidLevelTrendModal: React.FC<{
                     )}
                     <ResponsiveContainer width="100%" height="100%">
                         <LineChart data={data} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+                            <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
                             <XAxis
                                 dataKey="date"
-                                tick={{ fontSize: 12, fill: '#64748b' }}
+                                tick={{ fontSize: 12, fill: '#94a3b8' }}
                                 tickMargin={10}
                                 minTickGap={20}
                             />
                             <YAxis
                                 domain={['auto', 'auto']}
-                                tick={{ fontSize: 12, fill: '#64748b' }}
-                                label={{ value: '液位 (cm)', angle: -90, position: 'insideLeft', offset: 15, style: { fill: '#64748b' } }}
+                                tick={{ fontSize: 12, fill: '#94a3b8' }}
+                                label={{ value: '液位 (cm)', angle: -90, position: 'insideLeft', offset: 15, style: { fill: '#94a3b8' } }}
                             />
                             <Tooltip
-                                contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                                contentStyle={{
+                                    backgroundColor: '#0b1220',
+                                    border: '1px solid #334155',
+                                    borderRadius: '8px',
+                                    boxShadow: '0 12px 28px rgba(0, 0, 0, 0.35)',
+                                    color: '#e2e8f0'
+                                }}
+                                labelStyle={{ color: '#94a3b8', marginBottom: '4px' }}
+                                itemStyle={{ color: '#60a5fa' }}
+                                cursor={{ stroke: '#64748b', strokeDasharray: '4 4' }}
                                 labelFormatter={(label, payload) => payload && payload.length > 0 ? payload[0].payload.fullDate : label}
                                 formatter={(value: number) => [`${value} cm`, '液位']}
                             />
@@ -968,15 +978,15 @@ const DailyUsageTrendModal: React.FC<{
                                 cursor={{ fill: '#f1f5f9' }}
                                 contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
                                 labelFormatter={(label, payload) => payload && payload.length > 0 ? payload[0].payload.fullDate : label}
-                                formatter={(value: number, name: string, props: { payload: any }) => {
-                                    const rawUsage = props.payload.rawUsage;
+                                formatter={(value, _name, item) => {
+                                    const rawUsage = item.payload?.rawUsage;
                                     if (rawUsage !== undefined && rawUsage < 0) {
                                         return ['液位上升', '日用量'];
                                     }
                                     if (rawUsage === 0) {
                                         return ['0.0 kg', '日用量'];
                                     }
-                                    return [`${value.toFixed(1)} kg`, '日用量'];
+                                    return [`${Number(value ?? 0).toFixed(1)} kg`, '日用量'];
                                 }}
                             />
                             <Bar
@@ -1252,8 +1262,8 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                 <section className="lg:col-span-2 bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                    <div className="bg-orange-50 px-6 py-4 border-b border-orange-100 flex items-center gap-3">
-                        <div className="p-2 bg-orange-200 rounded-lg text-orange-700">
+                    <div className="system-section-header system-section-header--boiler px-6 py-4 flex items-center gap-3">
+                        <div className="system-section-icon system-section-icon--boiler p-2 rounded-lg">
                             <Icons.Boiler className="w-6 h-6" />
                         </div>
                         <div>
@@ -1269,8 +1279,8 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                 </section>
 
                 <section className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                    <div className="bg-emerald-50 px-6 py-4 border-b border-emerald-100 flex items-center gap-3">
-                        <div className="p-2 bg-emerald-200 rounded-lg text-emerald-700">
+                    <div className="system-section-header system-section-header--denox px-6 py-4 flex items-center gap-3">
+                        <div className="system-section-icon system-section-icon--denox p-2 rounded-lg">
                             <Icons.DeNOx className="w-6 h-6" />
                         </div>
                         <div>
@@ -3069,13 +3079,11 @@ const DataEntryView: React.FC<{
                                 return groups.map(([key, groupName, groupTanks]) => {
                                     if (groupTanks.length === 0) return null;
 
-                                    const bgColor = key === 'stage1' ? 'bg-blue-50' : key === 'stage2' ? 'bg-green-50' : 'bg-slate-50';
                                     const borderColor = key === 'stage1' ? 'border-blue-200' : key === 'stage2' ? 'border-green-200' : 'border-slate-200';
-                                    const textColor = key === 'stage1' ? 'text-blue-800' : key === 'stage2' ? 'text-green-800' : 'text-slate-700';
 
                                     return (
                                         <div key={key} className={`border ${borderColor} rounded-lg overflow-hidden`}>
-                                            <div className={`${bgColor} px-4 py-2 border-b ${borderColor} font-bold ${textColor} text-sm`}>
+                                            <div className={`data-group-header data-group-header--${key} px-4 py-2 border-b font-bold text-sm`}>
                                                 {groupName}
                                             </div>
                                             <div className="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -3844,7 +3852,7 @@ const DataEntryView: React.FC<{
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-slate-700 mb-1">溫差 ΔT (°C) <span className="text-slate-400 text-xs">(自動計算)</span></label>
-                                    <div className={`${inputClassName} bg-slate-100 text-slate-600`}>
+                                    <div className={`${inputClassName} computed-output`}>
                                         {((cwsInput.tempOutlet || 0) - (cwsInput.tempReturn || 0)).toFixed(2) || '-'}
                                     </div>
                                 </div>
@@ -3858,7 +3866,7 @@ const DataEntryView: React.FC<{
                                 </div>
                                 <div className="col-span-2">
                                     <label className="block text-sm font-medium text-slate-700 mb-1">濃縮倍數 N <span className="text-slate-400 text-xs">(自動計算: 冷卻水硬度 / 補水硬度)</span></label>
-                                    <div className={`${inputClassName} bg-slate-100 text-slate-600`}>
+                                    <div className={`${inputClassName} computed-output`}>
                                         {(cwsInput.cwsHardness && cwsInput.makeupHardness && cwsInput.makeupHardness > 0)
                                             ? (cwsInput.cwsHardness / cwsInput.makeupHardness).toFixed(2)
                                             : '-'}
@@ -5424,17 +5432,17 @@ const AnalysisView: React.FC<{
                         {weeklyComparisonData.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%" minHeight={280}>
                                 <ComposedChart data={weeklyComparisonData} margin={{ top: 20, right: 30, left: 20, bottom: 50 }}>
-                                    <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#2d3b55" />
                                     <XAxis
                                         dataKey="dateStr"
                                         tick={(props) => {
                                             const { x, y, payload } = props;
                                             const data = weeklyComparisonData.find(d => d.dateStr === payload.value);
                                             const diff = data?.deviation || 0;
-                                            const color = Math.abs(diff) > 20 ? '#dc2626' : Math.abs(diff) > 10 ? '#ca8a04' : '#16a34a';
+                                            const color = Math.abs(diff) > 20 ? '#f87171' : Math.abs(diff) > 10 ? '#fbbf24' : '#4ade80';
                                             return (
                                                 <g transform={`translate(${x},${y})`}>
-                                                    <text x={0} y={0} dy={16} textAnchor="middle" fill="#666" fontSize={12}>
+                                                    <text x={0} y={0} dy={16} textAnchor="middle" fill="#cbd5e1" fontSize={12}>
                                                         {payload.value}
                                                     </text>
                                                     <text x={0} y={20} dy={16} textAnchor="middle" fill={color} fontSize={11} fontWeight="bold">
@@ -5444,12 +5452,15 @@ const AnalysisView: React.FC<{
                                             );
                                         }}
                                     />
-                                    <YAxis />
-                                    <Tooltip formatter={(value: number) => value.toFixed(1)} />
+                                    <YAxis tick={{ fill: '#cbd5e1', fontSize: 11 }} />
+                                    <Tooltip
+                                        contentStyle={{ backgroundColor: '#0f172a', borderColor: '#2d3b55', borderRadius: '8px', color: '#f8fafc' }}
+                                        formatter={(value: number) => [value.toFixed(1), '用量']}
+                                    />
                                     <Legend verticalAlign="top" />
 
                                     {hasCalculation && metric === 'KG' && (
-                                        <Area type="monotone" dataKey="theoretical" fill="#e0f2fe" stroke="#0ea5e9" name="理論預估" />
+                                        <Area type="monotone" dataKey="theoretical" fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
                                     )}
                                     <Bar dataKey="actual" barSize={20} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
                                 </ComposedChart>
@@ -5502,23 +5513,23 @@ const AnalysisView: React.FC<{
                         {monthlyComparisonData.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%" minHeight={280}>
                                 <ComposedChart data={monthlyComparisonData} margin={{ top: 20, right: 30, left: 20, bottom: 50 }}>
-                                    <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#2d3b55" />
                                     <XAxis
                                         dataKey="dateStr"
                                         tick={(props) => {
                                             const { x, y, payload } = props;
                                             const data = monthlyComparisonData.find(d => d.dateStr === payload.value);
                                             const diff = data?.deviation || 0;
-                                            const color = Math.abs(diff) > 20 ? '#dc2626' : Math.abs(diff) > 10 ? '#ca8a04' : '#16a34a';
+                                            const color = Math.abs(diff) > 20 ? '#f87171' : Math.abs(diff) > 10 ? '#fbbf24' : '#4ade80';
                                             const hasLevelRiseWarning = (data?.levelRiseWarnings?.length || 0) > 0;
                                             return (
                                                 <g transform={`translate(${x},${y})`}>
                                                     {hasLevelRiseWarning && (
-                                                        <text x={0} y={-8} textAnchor="middle" fill="#d97706" fontSize={15} fontWeight="bold">
+                                                        <text x={0} y={-8} textAnchor="middle" fill="#fb923c" fontSize={15} fontWeight="bold">
                                                             ⚠
                                                         </text>
                                                     )}
-                                                    <text x={0} y={0} dy={16} textAnchor="middle" fill="#666" fontSize={12}>
+                                                    <text x={0} y={0} dy={16} textAnchor="middle" fill="#cbd5e1" fontSize={12}>
                                                         {payload.value}
                                                     </text>
                                                     <text x={0} y={20} dy={16} textAnchor="middle" fill={color} fontSize={11} fontWeight="bold">
@@ -5528,7 +5539,7 @@ const AnalysisView: React.FC<{
                                             );
                                         }}
                                     />
-                                    <YAxis />
+                                    <YAxis tick={{ fill: '#cbd5e1', fontSize: 11 }} />
                                     <Tooltip
                                         content={({ active, payload, label }: any) => {
                                             if (!active || !payload?.length) return null;
@@ -5569,7 +5580,7 @@ const AnalysisView: React.FC<{
                                     <Legend verticalAlign="top" />
 
                                     {hasCalculation && metric === 'KG' && (
-                                        <Area type="monotone" dataKey="theoretical" fill="#e0f2fe" stroke="#0ea5e9" name="理論預估" />
+                                        <Area type="monotone" dataKey="theoretical" fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
                                     )}
                                     <Bar dataKey="actual" barSize={20} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
                                 </ComposedChart>
@@ -6669,7 +6680,7 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                     </div>
                     {tank.calculationMethod && tank.calculationMethod !== 'NONE' && (
                         <div className="pt-1">
-                            <span className={`block text-center w-full px-1.5 py-1 rounded text-[10px] ${tank.calculationMethod === 'CWS_BLOWDOWN' ? 'bg-sky-50 text-sky-600' : 'bg-orange-50 text-orange-600'}`}>
+                            <span className={`calculation-badge calculation-badge--${tank.calculationMethod === 'CWS_BLOWDOWN' ? 'cws' : 'bws'} block text-center w-full px-1.5 py-1 rounded text-[10px]`}>
                                 {tank.calculationMethod === 'CWS_BLOWDOWN' ? '自動計算: CWS' : '自動計算: BWS'}
                             </span>
                         </div>
@@ -6770,8 +6781,8 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                 {/* Boiler Section */}
                 <section className="lg:col-span-2 bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                    <div className="bg-orange-50 px-6 py-4 border-b border-orange-100 flex items-center gap-3">
-                        <div className="p-2 bg-orange-200 rounded-lg text-orange-700">
+                    <div className="system-section-header system-section-header--boiler px-6 py-4 flex items-center gap-3">
+                        <div className="system-section-icon system-section-icon--boiler p-2 rounded-lg">
                             <Icons.Boiler className="w-6 h-6" />
                         </div>
                         <div>
@@ -6789,8 +6800,8 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
 
                 {/* DeNOx Section */}
                 <section className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                    <div className="bg-emerald-50 px-6 py-4 border-b border-emerald-100 flex items-center gap-3">
-                        <div className="p-2 bg-emerald-200 rounded-lg text-emerald-700">
+                    <div className="system-section-header system-section-header--denox px-6 py-4 flex items-center gap-3">
+                        <div className="system-section-icon system-section-icon--denox p-2 rounded-lg">
                             <Icons.DeNOx className="w-6 h-6" />
                         </div>
                         <div>

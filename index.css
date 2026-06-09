@@ -1,10 +1,284 @@
 @import "tailwindcss";
 
 @theme {
-  --color-brand-50: #f0f9ff;
-  --color-brand-100: #e0f2fe;
+  /* 品牌色 - 調整為高質感科技藍 */
+  --color-brand-50: #0f172a;
+  --color-brand-100: #1e293b;
   --color-brand-500: #0ea5e9;
   --color-brand-600: #0284c7;
   --color-brand-700: #0369a1;
-  --color-brand-900: #0c4a6e;
+  --color-brand-900: #38bdf8;
+
+  /* 基礎背景與容器 (將原本白/淺灰轉化為深色板岩灰) */
+  --color-white: #121a2e; /* 提升卡片背景對比 */
+  --color-slate-50: #090d16;
+  --color-slate-100: #1e293b;
+  --color-slate-200: #2d3b55; /* 邊框 */
+  --color-slate-300: #475569;
+  --color-slate-400: #64748b;
+
+  /* 基礎文字顏色 (將原本深色字體轉化為高對比亮色) */
+  --color-slate-500: #94a3b8;
+  --color-slate-600: #cbd5e1;
+  --color-slate-700: #e2e8f0;
+  --color-slate-800: #f8fafc;
+  --color-slate-900: #ffffff;
+
+  /* Gray 色系翻轉，對應 index.html bg-gray-50 容器 */
+  --color-gray-50: #090d16;
+  --color-gray-100: #1e293b;
+  --color-gray-200: #2d3b55;
+  --color-gray-300: #475569;
+  --color-gray-400: #64748b;
+  --color-gray-500: #94a3b8;
+  --color-gray-600: #cbd5e1;
+  --color-gray-700: #e2e8f0;
+  --color-gray-800: #f8fafc;
+  --color-gray-900: #ffffff;
+
+  /* Sky / Blue 微背景翻轉 (避免 hover 出現刺眼亮色) */
+  --color-sky-50: #1e293b;
+  --color-sky-100: #334155;
+  --color-blue-50: #0c192c;
+  --color-blue-100: #122b4f;
+  --color-blue-200: #1a3e6f;
+  --color-indigo-50: #1e293b;
+  --color-indigo-100: #334155;
+
+  /* 系統狀態與數據文字 (覆寫為高對比亮色，在黑底上更加明亮清晰) */
+  --color-red-500: #f87171;
+  --color-red-600: #f87171;
+  --color-red-700: #fca5a5;
+  --color-red-800: #fee2e2;
+
+  --color-blue-500: #60a5fa;
+  --color-blue-600: #60a5fa;
+  --color-blue-700: #93c5fd;
+  --color-blue-800: #bfdbfe;
+
+  --color-emerald-500: #34d399;
+  --color-emerald-600: #34d399;
+  --color-emerald-700: #6ee7b7;
+  --color-emerald-800: #a7f3d0;
+
+  --color-amber-500: #fbbf24;
+  --color-amber-600: #fbbf24;
+  --color-amber-700: #fcd34d;
+  --color-amber-800: #fde68a;
+
+  /* 漸層與背景微調 (用於年度數據卡片，避免預設亮色) */
+  --color-emerald-50: #06221c;
+  --color-emerald-100: #0b3b30;
+  --color-emerald-200: #0f5243;
+
+  --color-amber-50: #291a05;
+  --color-amber-100: #472c08;
+  --color-amber-200: #663e0a;
+
+  /* Green 漸層與背景微調 (用於二階標題等，避免預設亮色) */
+  --color-green-50: #062214;
+  --color-green-100: #0b3b22;
+  --color-green-200: #0f5230;
+  --color-green-600: #34d399;
+  --color-green-700: #4ade80;
+  --color-green-800: #a7f3d0;
+  --color-green-900: #d1fae5;
+
+  /* Orange 漸層與背景微調 (用於鍋爐水系統標題等，避免預設亮色) */
+  --color-orange-50: #261204;
+  --color-orange-100: #401e07;
+  --color-orange-200: #5c2b0b;
+  --color-orange-600: #fb923c;
+  --color-orange-700: #fdba74;
+  --color-orange-800: #fed7aa;
+  --color-orange-900: #ffedd5;
+}
+
+/* 預設全域樣式與表單元素 Dark 降級適配 */
+body {
+  background-color: #090d16 !important;
+  color: #f8fafc !important;
+}
+
+/* 讓預設表單控制項在暗色模式下合適顯示 */
+input, select, textarea, button {
+  color-scheme: dark;
+}
+
+input:not([type="submit"]):not([type="button"]):not([type="reset"]),
+select,
+textarea {
+  background-color: #0f172a !important;
+  color: #f8fafc !important;
+  border-color: #334155 !important;
+}
+
+/* 修正下拉選單選項的底色與字體色 */
+select option {
+  background-color: #0f172a;
+  color: #f8fafc;
+}
+
+/* --- 視覺體驗優化 (Rich Aesthetics & Premium Design) --- */
+
+/* 增強 bg-white 元素 (例如桶槽卡片、彈出視窗) 的對比與發光陰影 */
+.bg-white {
+  background-color: #121a2e !important; /* 卡片底色改為高質感深藍灰 */
+  border-color: #222f4b !important;    /* 微妙的科技感邊框 */
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.5) !important;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+/* 桶槽卡片 Hover 效果：微升起、發光邊框與淡藍色微光陰影 */
+.bg-white:hover {
+  border-color: #0ea5e9 !important;
+  box-shadow: 0 0 25px rgba(14, 165, 233, 0.25) !important;
+  transform: translateY(-2px);
+}
+
+/* 用量分析/年度數據的表格視覺美化 */
+table {
+  background-color: #0c1220 !important;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+thead tr {
+  background-color: #162238 !important; /* Header 深色對比 */
+  border-bottom: 2px solid #233554 !important;
+}
+
+thead th {
+  color: #38bdf8 !important; /* 科技藍文字 */
+  font-weight: 700 !important;
+  padding: 12px 8px !important;
+}
+
+tbody tr {
+  border-bottom: 1px solid #1a263e !important;
+}
+
+/* 斑馬紋交替背景 */
+tbody tr:nth-child(even) {
+  background-color: #0f172a !important;
+}
+
+tbody tr:nth-child(odd) {
+  background-color: #141d33 !important;
+}
+
+tbody tr:hover {
+  background-color: #1c2b4d !important; /* Hover 行發亮 */
+}
+
+/* 彈出視窗與 Modal 內部微調 */
+.bg-slate-50 {
+  background-color: #0d1322 !important;
+}
+
+.border-slate-50 {
+  border-color: #1a263e !important;
+}
+
+.border-slate-100 {
+  border-color: #1e293b !important;
+}
+
+.border-slate-200 {
+  border-color: #2d3b55 !important;
+}
+
+/* 系統區塊標題：使用低飽和色彩，保留系統辨識度但不脫離深色主題。 */
+.system-section-header {
+  border-bottom: 1px solid #2d3b55;
+}
+
+.system-section-header--boiler {
+  background: linear-gradient(90deg, #25170d 0%, #1a1820 100%);
+  border-bottom-color: #5c351d;
+}
+
+.system-section-header--denox {
+  background: linear-gradient(90deg, #08251f 0%, #101c25 100%);
+  border-bottom-color: #175444;
+}
+
+.system-section-icon {
+  border: 1px solid;
+}
+
+.system-section-icon--boiler {
+  background-color: #3a210f;
+  border-color: #75401d;
+  color: #fb923c;
+}
+
+.system-section-icon--denox {
+  background-color: #0b392f;
+  border-color: #176554;
+  color: #34d399;
+}
+
+/* 批次輸入分組標題。 */
+.data-group-header {
+  color: #cbd5e1;
+}
+
+.data-group-header--stage1 {
+  background-color: #10233d;
+  border-color: #234a73;
+  color: #93c5fd;
+}
+
+.data-group-header--stage2 {
+  background-color: #0b2926;
+  border-color: #1d5a50;
+  color: #6ee7b7;
+}
+
+.data-group-header--other {
+  background-color: #172033;
+  border-color: #334155;
+}
+
+/* 趨勢圖與自動計算欄位。 */
+.trend-modal-header {
+  background: linear-gradient(90deg, #0d1729 0%, #111b30 100%);
+  border-color: #2d3b55;
+}
+
+.computed-output {
+  background-color: #111c30 !important;
+  border-color: #34445f !important;
+  color: #cbd5e1 !important;
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.04);
+}
+
+/* 設定卡片中的計算標籤與刪除操作。 */
+.calculation-badge {
+  border: 1px solid;
+}
+
+.calculation-badge--cws {
+  background-color: #0b2538;
+  border-color: #164e70;
+  color: #7dd3fc;
+}
+
+.calculation-badge--bws {
+  background-color: #2b1b10;
+  border-color: #69381c;
+  color: #fdba74;
+}
+
+.danger-button {
+  background-color: #32161d;
+  border: 1px solid #71303d;
+  color: #fda4af;
+}
+
+.danger-button:hover {
+  background-color: #4a1d28;
+  border-color: #9f4455;
+  color: #fecdd3;
 }
