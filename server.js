@@ -1831,9 +1831,81 @@ app.delete('/api/bws-params/:id', async (req, res) => {
 
 // ==================== MCP Server Endpoints ====================
 
+const sanitizeAuthor = (name) => {
+  if (!name || typeof name !== 'string') return null;
+  if (name.includes('\uFFFD')) return null;
+  const qMarks = (name.match(/\?/g) || []).length;
+  if (qMarks > 0 && qMarks >= name.length / 2) return null;
+  if (name.includes('?踹?')) return null;
+  return name.trim();
+};
+
+const getAuthorName = (req) => {
+  const rawUser = req.headers['x-remote-user'] ||
+    req.headers['x-auth-user'] ||
+    req.headers['x-iisnode-logon_user'] ||
+    '';
+
+  const sanitized = sanitizeAuthor(rawUser);
+  if (!sanitized) return '匿名';
+
+  const parts = sanitized.split('\\');
+  return parts.length > 1 ? parts[parts.length - 1] : sanitized;
+};
+
+const checkMcpAccess = async (req) => {
+  const iisUser = getAuthorName(req) || '匿名';
+
+  let rawIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  if (Array.isArray(rawIp)) rawIp = rawIp[0];
+
+  let clientIp = String(rawIp || "").replace(/^::ffff:/, '');
+  if (clientIp.includes(':') && !clientIp.includes('[')) {
+    const parts = clientIp.split(':');
+    if (parts.length === 2) {
+      clientIp = parts[0];
+    }
+  }
+
+  const PIMCP_URL = process.env.PIMCP_API_URL || 'http://localhost:3011';
+  try {
+    const response = await fetch(`${PIMCP_URL}/api/agent/check-permission`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: iisUser,
+        clientIp: clientIp,
+        requestedTool: 'connect' // 連線階段特殊 IP 放行檢驗
+      })
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      if (result.allowed) {
+        return { allowed: true, identity: iisUser, clientIp, source: 'PIMCP-IPFilter' };
+      } else {
+        return { allowed: false, identity: '匿名', source: 'PIMCP', message: result.message };
+      }
+    }
+  } catch (err) {
+    console.error('[WTCA PIMCP Connect Check Error]', err.message);
+  }
+
+  return { allowed: false, identity: '匿名', source: 'None', message: '無法連接權限伺服器。' };
+};
+
 // MCP SSE 連線端點 (IIS 相容版本)
 app.get('/mcp-connect/:token', async (req, res) => {
     const token = req.params.token;
+
+    // ACCESS CONTROL CHECK
+    const access = await checkMcpAccess(req);
+    if (!access.allowed) {
+        return res.status(403).send(`Access Denied: ${access.message || "Your IP is not authorized."}`);
+    }
+
+    const mcpUserIdentity = access.identity;
+    const mcpClientIp = access.clientIp || '127.0.0.1';
     console.log(`[MCP] 連接請求: ${token}`);
 
     // 1. 立即設置 SSE Headers
@@ -1874,6 +1946,27 @@ app.get('/mcp-connect/:token', async (req, res) => {
         version: "1.0.0"
     });
 
+    const checkToolPermission = async (toolName) => {
+        const PIMCP_URL = process.env.PIMCP_API_URL || 'http://localhost:3011';
+        try {
+            const response = await fetch(`${PIMCP_URL}/api/agent/check-permission`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    userId: mcpUserIdentity,
+                    clientIp: mcpClientIp,
+                    requestedTool: toolName
+                })
+            });
+            if (response.ok) {
+                return await response.json();
+            }
+        } catch (err) {
+            console.error(`[checkToolPermission Error]`, err.message);
+        }
+        return { allowed: false, message: '無法連接權限伺服器，出於安全考量已阻斷請求。' };
+    };
+
     // ==================== MCP Tools 定義 ====================
 
     // Tool 1: 查詢儲槽資料
@@ -1884,6 +1977,16 @@ app.get('/mcp-connect/:token', async (req, res) => {
         },
         async ({ tankId }) => {
             try {
+                const checkRes = await checkToolPermission('WTCA/query-tanks');
+                if (!checkRes.allowed) {
+                    return {
+                        content: [{
+                            type: 'text',
+                            text: `錯誤: 權限遭拒。${checkRes.message}`
+                        }],
+                        isError: true
+                    };
+                }
                 let query = `
                     SELECT t.*, 
                            row_to_json(cws.*) as cws_params,
@@ -1930,6 +2033,16 @@ app.get('/mcp-connect/:token', async (req, res) => {
         },
         async ({ tankId, limit }) => {
             try {
+                const checkRes = await checkToolPermission('WTCA/query-readings');
+                if (!checkRes.allowed) {
+                    return {
+                        content: [{
+                            type: 'text',
+                            text: `錯誤: 權限遭拒。${checkRes.message}`
+                        }],
+                        isError: true
+                    };
+                }
                 let query = 'SELECT * FROM readings';
                 const params = [];
 
@@ -1969,6 +2082,16 @@ app.get('/mcp-connect/:token', async (req, res) => {
         },
         async ({ tankId }) => {
             try {
+                const checkRes = await checkToolPermission('WTCA/query-supplies');
+                if (!checkRes.allowed) {
+                    return {
+                        content: [{
+                            type: 'text',
+                            text: `錯誤: 權限遭拒。${checkRes.message}`
+                        }],
+                        isError: true
+                    };
+                }
                 let query = 'SELECT * FROM chemical_supplies';
                 const params = [];
 
@@ -2007,6 +2130,16 @@ app.get('/mcp-connect/:token', async (req, res) => {
         },
         async ({ sql }) => {
             try {
+                const checkRes = await checkToolPermission('WTCA/execute-sql');
+                if (!checkRes.allowed) {
+                    return {
+                        content: [{
+                            type: 'text',
+                            text: `錯誤: 權限遭拒。${checkRes.message}`
+                        }],
+                        isError: true
+                    };
+                }
                 // 安全檢查：僅允許 SELECT
                 const trimmedSql = sql.trim().toUpperCase();
                 if (!trimmedSql.startsWith('SELECT')) {
@@ -2048,6 +2181,16 @@ app.get('/mcp-connect/:token', async (req, res) => {
         {},
         async () => {
             try {
+                const checkRes = await checkToolPermission('WTCA/get-database-stats');
+                if (!checkRes.allowed) {
+                    return {
+                        content: [{
+                            type: 'text',
+                            text: `錯誤: 權限遭拒。${checkRes.message}`
+                        }],
+                        isError: true
+                    };
+                }
                 const tanksCount = await pool.query('SELECT COUNT(*) FROM tanks');
                 const readingsCount = await pool.query('SELECT COUNT(*) FROM readings');
                 const suppliesCount = await pool.query('SELECT COUNT(*) FROM chemical_supplies');
