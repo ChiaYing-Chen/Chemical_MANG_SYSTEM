@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import express from 'express';
 import pg from 'pg';
 import cors from 'cors';
@@ -7,17 +9,31 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
 import crypto from 'crypto';
 import * as backendUtils from './backendUtils.js';
-// ... (skip down to proxy imports/setup if needed, but cleanest to add import at top)
 
-// ...
-
-
+// 本地開發環境原生載入 .env 配置
+try {
+    const envPath = path.resolve(process.cwd(), '.env');
+    if (fs.existsSync(envPath)) {
+        fs.readFileSync(envPath, 'utf-8')
+            .split(/\r?\n/)
+            .forEach(line => {
+                const trimmed = line.trim();
+                if (trimmed && !trimmed.startsWith('#')) {
+                    const parts = trimmed.split('=');
+                    if (parts.length >= 2) {
+                        const key = parts[0].trim();
+                        const val = parts.slice(1).join('=').trim().replace(/^['"]|['"]$/g, '');
+                        process.env[key] = val;
+                    }
+                }
+            });
+    }
+} catch (err) {}
 
 const { Pool } = pg;
 const app = express();
 const PORT = 3003;
 
-// 中介軟體
 app.use(cors());
 app.use(express.json());
 
@@ -1322,7 +1338,13 @@ app.post('/api/readings/batch', async (req, res) => {
 
 // ==================== Database Schema Migration ====================
 const migrateDatabase = async () => {
-    const client = await pool.connect();
+    let client;
+    try {
+        client = await pool.connect();
+    } catch (dbErr) {
+        console.warn('⚠️ [PostgreSQL] 開發環境無法連線資料庫，跳過 Migration 流程。錯誤原因:', dbErr.message);
+        return;
+    }
     try {
         await client.query('BEGIN');
         console.log('Checking database schema for history support...');
@@ -2215,6 +2237,50 @@ app.post('/api/alerts/batch', async (req, res) => {
 
         await client.query('COMMIT');
         console.log(`[POST /api/alerts/batch] 成功插入 ${results.length} 筆`);
+
+        // 💡 自動同步推送警報至訊息中心 (PIMCP)
+        if (results.length > 0) {
+            try {
+                // 1. 優先使用警報資料本身的日期，避免跨日匯入時顯示成推送當天
+                const alertDates = [...new Set(results.map(r => r.date_str).filter(Boolean))];
+                const reportDateStr = alertDates.length === 1
+                    ? alertDates[0]
+                    : new Date(Date.now() + TAIPEI_OFFSET_MS).toISOString().split('T')[0];
+
+                // 2. 格式化警報內容
+                const detailsStr = results
+                    .map(r => `· ${r.tank_name || '未知儲槽'}：${r.reason || '液位變動異常'}`)
+                    .join('\n');
+
+                const title = "WTCA液位變動檢查";
+                const message = `${reportDateStr} 液位變動警報查詢\n共 ${results.length} 筆警報 (未處理 ${results.length} 筆，已備註 0 筆)\n\n【未處理】\n${detailsStr}`;
+
+                // 3. 向同台伺服器上的訊息中心 (PIMCP) 發送 Webhook 請求
+                // 透過傳入 subscriptionId，實現「公用警報廣播」，讓大家自由訂閱
+                const pimcpSubscriptionId = process.env.PIMCP_SUBSCRIPTION_ID
+                    ? parseInt(process.env.PIMCP_SUBSCRIPTION_ID, 10)
+                    : 5;
+
+                fetch('http://localhost:3011/api/notifications/external-api', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        subscriptionId: pimcpSubscriptionId,
+                        title,
+                        message,
+                        status: 'warning'
+                    })
+                })
+                .then(response => response.json())
+                .then(data => console.log(`[PIMCP Push success] 已成功透過公用訂閱 #${pimcpSubscriptionId} 廣播警報:`, data))
+                .catch(fetchErr => console.error('[PIMCP Push failed] 發送 HTTP 請求失敗:', fetchErr.message));
+
+            } catch (formatErr) {
+                console.error('[PIMCP Push error] 格式化或發送警報失敗:', formatErr.message);
+            }
+        }
         res.status(201).json({ count: results.length, data: results });
     } catch (err) {
         await client.query('ROLLBACK');

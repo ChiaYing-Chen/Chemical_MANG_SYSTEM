@@ -2,10 +2,90 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts';
 import { Tank, Reading, ChemicalSupply, SystemType, CWSParameterRecord, BWSParameterRecord, ImportantNote } from '../types';
 import { StorageService } from '../services/storageService';
-import { calculateCWSUsage } from '../utils/calculationUtils';
+import { calculateTankVolume } from '../utils/calculationUtils';
 import { Icons } from '../components/Icons';
 
 const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#82ca9d', '#a4de6c', '#d0ed57', '#ffc658'];
+const DAY_MS = 24 * 60 * 60 * 1000;
+const LIKELY_REFILL_RISE_DAYS = 16;
+
+const normalizeTimestampToLocalDayStart = (timestamp?: number): number => {
+    if (!timestamp) return 0;
+    const d = new Date(timestamp);
+    if (isNaN(d.getTime())) return 0;
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+};
+
+const getActiveSupplyAt = (timestamp: number, suppliesHistory: ChemicalSupply[]): ChemicalSupply | undefined => {
+    return suppliesHistory
+        .filter(s => s.startDate <= timestamp)
+        .sort((a, b) => b.startDate - a.startDate)[0];
+};
+
+const calculateActualUsageKgFromLevel = (
+    tank: Tank,
+    periodReadings: Reading[],
+    suppliesHistory: ChemicalSupply[]
+): number => {
+    const orderedReadings = [...periodReadings].sort((a, b) => a.timestamp - b.timestamp);
+    if (orderedReadings.length < 2) return 0;
+
+    const getVolume = (reading: Reading): number => {
+        const volume = calculateTankVolume(tank, reading.levelCm);
+        if (Number.isFinite(volume) && volume >= 0) return volume;
+        return reading.calculatedVolume || 0;
+    };
+
+    const toKg = (liters: number, readingForContract: Reading): number => {
+        if (liters <= 0) return 0;
+        const activeSupply = getActiveSupplyAt(readingForContract.timestamp, suppliesHistory);
+        const sg = activeSupply?.specificGravity || readingForContract.appliedSpecificGravity || 1;
+        return liters * sg;
+    };
+
+    const intervals = orderedReadings.slice(1).map((curr, index) => {
+        const prev = orderedReadings[index];
+        const prevVolume = getVolume(prev);
+        const currVolume = getVolume(curr);
+
+        return {
+            curr,
+            prevVolume,
+            currVolume,
+            addedLiters: curr.addedAmountLiters || 0,
+            decreaseLiters: Math.max(0, prevVolume - currVolume),
+            riseLiters: Math.max(0, currVolume - prevVolume)
+        };
+    });
+
+    const firstReading = orderedReadings[0];
+    const lastReading = orderedReadings[orderedReadings.length - 1];
+    const elapsedDays = Math.max(1, (lastReading.timestamp - firstReading.timestamp) / DAY_MS);
+    const estimatedDailyUsageLiters = intervals.reduce((sum, interval) => sum + interval.decreaseLiters, 0) / elapsedDays;
+    const likelyRefillRiseThresholdLiters = estimatedDailyUsageLiters * LIKELY_REFILL_RISE_DAYS;
+
+    const hasRefill = intervals.some(interval => {
+        if (interval.addedLiters > 0) return true;
+        if (estimatedDailyUsageLiters <= 0) return false;
+        return interval.riseLiters >= likelyRefillRiseThresholdLiters;
+    });
+
+    if (!hasRefill) {
+        return toKg(getVolume(firstReading) - getVolume(lastReading), lastReading);
+    }
+
+    return intervals.reduce((sum, interval) => {
+        const isImplicitRefill = estimatedDailyUsageLiters > 0 && interval.riseLiters >= likelyRefillRiseThresholdLiters;
+        const intervalUsageLiters = interval.addedLiters > 0
+            ? Math.max(0, (interval.prevVolume + interval.addedLiters) - interval.currVolume)
+            : isImplicitRefill
+                ? 0
+                : interval.decreaseLiters;
+
+        return sum + toKg(intervalUsageLiters, interval.curr);
+    }, 0);
+};
 
 interface AnnualDataViewProps {
     tanks: Tank[];
@@ -124,88 +204,21 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
             tankMap.set(tank.id, { tank, months });
         });
 
-        // 1. Fill Actual Usage (採用逐日分攤計算，與 AnalysisView 一致)
+        // 1. Fill Actual Usage (採用每月液位差計算，與用量分析一致)
         tanks.forEach(tank => {
             const tData = tankMap.get(tank.id);
             if (!tData) return;
 
-            // Get all readings for this tank (forever)
             const tankReadings = readings
                 .filter(r => r.tankId === tank.id)
-                // 1. 去重 (Deduplication): 避免相同 ID 的讀數重複計算 (與 AnalysisView 一致)
                 .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
                 .sort((a, b) => a.timestamp - b.timestamp);
 
-            // 建立每日用量 Map (YYYY-MM-DD -> KG)
-            const dailyActualMap = new Map<string, number>();
-
-            for (let i = 1; i < tankReadings.length; i++) {
-                const curr = tankReadings[i];
-                const prev = tankReadings[i - 1];
-
-                const diffMs = curr.timestamp - prev.timestamp;
-                const diffDays = diffMs / (1000 * 60 * 60 * 24);
-
-                if (diffDays <= 0) continue;
-
-                // 計算區間總用量 (KG) - 與 AnalysisView 完全一致
-                // 補充量記錄在「補充後」的那筆讀數(curr)上
-                // 公式：(前重量 + 本次補充量) - 後重量 = 區間用量
-                // 2. 嚴格計算 (Strict Calculation): 移除預設值，避免髒資料導致虛增 (與 AnalysisView 一致)
-                // 若 SG 為 undefined，則 addedKg 為 NaN -> totalUsageKg 為 NaN -> dailyUsage 為 NaN -> dailyMap 忽略此筆
-                const addedKg = (curr.addedAmountLiters) * (curr.appliedSpecificGravity);
-                const totalUsageKg = (prev.calculatedWeightKg + addedKg) - curr.calculatedWeightKg;
-
-                // 移除 Math.max(0, ...)，允許負值參與加總，避免波動截斷導致月用量虛增
-                const dailyUsage = totalUsageKg / diffDays;
-
-                let iterDate = new Date(prev.timestamp);
-                const endDate = new Date(curr.timestamp);
-
-                // 從 prev 開始迭代到 curr (與 AnalysisView 一致)
-                while (iterDate < endDate) {
-                    // 使用本地時間手動建構 Key (YYYY-MM-DD)，確保與 lookup key 絕對一致且無 Locale 依賴
-                    const Y = iterDate.getFullYear();
-                    const M = String(iterDate.getMonth() + 1).padStart(2, '0');
-                    const D = String(iterDate.getDate()).padStart(2, '0');
-                    const dateKey = `${Y}-${M}-${D}`;
-
-                    // 只設定一次，不累加 (與 AnalysisView 一致)
-                    if (!dailyActualMap.has(dateKey)) {
-                        dailyActualMap.set(dateKey, dailyUsage);
-                    }
-
-                    // 加一天
-                    iterDate.setDate(iterDate.getDate() + 1);
-                }
-            }
-
-            // [Method B] 建立「當年有讀數的月份」集合
-            // 只有桶槽在該年度的某月內有實際抄表記錄，該月才計算實際用量。
-            // 原因：若最後一筆讀數在 4 月，而下一筆在隔年，spreading 邏輯會將用量
-            //       分攤至 5～12 月，造成沒有抄表的月份出現「幽靈數據」。
-            const monthsWithReadings = new Set<number>(); // 1-based (1=1月)
-            tankReadings.forEach(r => {
-                const d = new Date(r.timestamp);
-                if (d.getFullYear() === year) {
-                    monthsWithReadings.add(d.getMonth() + 1);
-                }
-            });
-
-            // 將每日用量匯總到對應月份（只有有讀數的月份才計入）
             tData.months.forEach(m => {
-                // 若該月在當年度無任何讀數，維持 actualUsage = 0 → 顯示 "-"
-                if (!monthsWithReadings.has(m.month)) return;
-
-                const daysInMonth = new Date(year, m.month, 0).getDate();
-                for (let d = 1; d <= daysInMonth; d++) {
-                    // 使用 ISO 格式的日期 key (YYYY-MM-DD)
-                    const dateKey = `${year}-${String(m.month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-                    const dailyVal = dailyActualMap.get(dateKey);
-                    if (dailyVal) {
-                        m.actualUsage += dailyVal;
-                    }
-                }
+                const monthStartTime = m.monthStart.getTime();
+                const monthEndTime = m.monthEnd.getTime() - 1;
+                const monthReadings = tankReadings.filter(r => r.timestamp >= monthStartTime && r.timestamp <= monthEndTime);
+                m.actualUsage = calculateActualUsageKgFromLevel(tank, monthReadings, supplies.filter(s => s.tankId === tank.id));
             });
         });
 
@@ -285,7 +298,7 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                         if (dayTime > todayTime) continue;
 
                         // 取得該日有效的藥劑合約
-                        const activeSupply = tankSupplies.find(s => s.startDate <= dayTime);
+                        const activeSupply = getActiveSupplyAt(dayTime, tankSupplies);
                         const targetPpm = activeSupply?.targetPpm || 0;
 
                         if (!targetPpm) continue; // 無 PPM 設定則跳過
@@ -296,8 +309,8 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                             // 查找覆蓋該日的週參數 (record.date <= dayTime < record.date + 7天)
                             // 不使用 fallback，確保只有真正有參數的日期才計算
                             const cwsParam = tankCwsHistory.find(p => {
-                                const pDate = p.date || 0;
-                                const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                                const pDate = normalizeTimestampToLocalDayStart(p.date);
+                                const pEnd = pDate + (7 * DAY_MS);
                                 return dayTime >= pDate && dayTime < pEnd;
                             });
 
@@ -305,9 +318,11 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                                 hasAnyParam = true;
                                 const R = cwsParam.circulationRate || 0;
                                 const dT = cwsParam.tempDiff || 0;
-                                let C = cwsParam.concentrationCycles || 1;
+                                let C = 8;
                                 if (cwsParam.cwsHardness && cwsParam.makeupHardness && cwsParam.makeupHardness > 0) {
                                     C = cwsParam.cwsHardness / cwsParam.makeupHardness;
+                                } else if (cwsParam.concentrationCycles && cwsParam.concentrationCycles > 1) {
+                                    C = cwsParam.concentrationCycles;
                                 }
                                 // 每日蒸發量
                                 const E = (R * dT * 1.8 * 24) / 1000;
@@ -319,8 +334,8 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
                         } else if (tank.calculationMethod === 'BWS_STEAM') {
                             // 查找覆蓋該日的週參數
                             const bwsParam = tankBwsHistory.find(p => {
-                                const pDate = p.date || 0;
-                                const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                                const pDate = normalizeTimestampToLocalDayStart(p.date);
+                                const pEnd = pDate + (7 * DAY_MS);
                                 return dayTime >= pDate && dayTime < pEnd;
                             });
 
