@@ -1,0 +1,42 @@
+[
+  {
+    "id": "pages",
+    "name": "文件協作平台",
+    "description": "團隊知識庫與文件協作",
+    "url": "/Pages/",
+    "gradient": "linear-gradient(135deg, #a855f7 0%, #3b82f6 100%)",
+    "icon": "FileText"
+  },
+  {
+    "id": "pimcp",
+    "name": "PI 監控平台",
+    "description": "PI 數據監控與診斷",
+    "url": "/PIMCP/",
+    "gradient": "linear-gradient(135deg, #6366f1 0%, #06b6d4 100%)",
+    "icon": "Activity"
+  },
+  {
+    "id": "condensor",
+    "name": "冷凝器熱力計算",
+    "description": "冷凝器運轉熱效率分析",
+    "url": "/Condensor/",
+    "gradient": "linear-gradient(135deg, #3b82f6 0%, #10b981 100%)",
+    "icon": "Calculator"
+  },
+  {
+    "id": "wtca",
+    "name": "藥劑水質管理",
+    "description": "加藥與水質監控管理",
+    "url": "/WTCA/",
+    "gradient": "linear-gradient(135deg, #10b981 0%, #84cc16 100%)",
+    "icon": "Droplets"
+  },
+  {
+    "id": "eucdb",
+    "name": "工單資料儀表板",
+    "description": "維護工單與統計視覺化",
+    "url": "/eucDB/",
+    "gradient": "linear-gradient(135deg, #f97316 0%, #ef4444 100%)",
+    "icon": "ClipboardList"
+  }
+]

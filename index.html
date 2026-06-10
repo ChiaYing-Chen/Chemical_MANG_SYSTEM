@@ -5,6 +5,19 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="icon" type="image/x-icon" href="favicon.ico" />
+  <script>
+    (function () {
+      var link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = '/PIMCP/header/header.css';
+      document.head.appendChild(link);
+
+      var script = document.createElement('script');
+      script.src = '/PIMCP/header/header.js';
+      script.defer = true;
+      document.head.appendChild(script);
+    })();
+  </script>
   <title>藥品管理系統</title>
 </head>
 

@@ -7068,6 +7068,18 @@ const App: React.FC = () => {
         fetchUser();
     }, []);
 
+    // 監聽統一組件的身份變更事件
+    useEffect(() => {
+        const handleUserChanged = (e: Event) => {
+            const customEvent = e as CustomEvent;
+            if (customEvent && customEvent.detail && customEvent.detail.username) {
+                setUserName(customEvent.detail.username);
+            }
+        };
+        window.addEventListener('unified-user-changed', handleUserChanged as EventListener);
+        return () => window.removeEventListener('unified-user-changed', handleUserChanged as EventListener);
+    }, []);
+
     const handleNameChange = () => {
         const newName = prompt("請輸入您的名稱 (顯示於右上角):", userName);
         if (newName && newName.trim()) {
@@ -7144,10 +7156,10 @@ const App: React.FC = () => {
     const NavItem = ({ view, icon: Icon, label }: { view: ViewType, icon: React.ElementType, label: string }) => (
         <button
             onClick={() => navigateTo(view)}
-            className={`w-full flex items-center px-3 py-2 text-sm font-medium transition-colors
+            className={`w-full flex items-center px-4 py-2.5 text-base font-medium transition-colors
           ${currentView === view ? 'bg-brand-50 text-brand-700 border-r-4 border-brand-500' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'}`}
         >
-            <Icon className={`w-5 h-5 mr-3 ${currentView === view ? 'text-brand-500' : 'text-slate-400'}`} />
+            <Icon className={`w-6 h-6 mr-4 ${currentView === view ? 'text-brand-500' : 'text-slate-400'}`} />
             {label}
         </button>
     );
@@ -7162,7 +7174,7 @@ const App: React.FC = () => {
                     <span className="font-bold text-lg text-slate-800 tracking-tight">藥劑管理</span>
                 </div>
 
-                <nav className="flex-1 overflow-y-auto py-4 space-y-1">
+                <nav className="flex-1 overflow-y-auto py-4 space-y-1.5">
                     <NavItem view="dashboard" icon={Icons.Dashboard} label="總覽看板" />
                     <NavItem view="analysis" icon={Icons.Analysis} label="用量分析" />
                     <NavItem view="annual" icon={Icons.Calendar} label="年度數據" />
@@ -7174,7 +7186,10 @@ const App: React.FC = () => {
                 </nav>
 
                 {/* User Info & Date at Bottom */}
-
+                <div className="p-4 border-t border-slate-100 flex items-center justify-around bg-slate-50/50">
+                    <div id="unified-app-launcher"></div>
+                    <div id="unified-user-avatar"></div>
+                </div>
             </aside>
 
             {/* Main Content */}
