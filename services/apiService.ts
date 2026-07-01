@@ -405,3 +405,81 @@ export const getActiveSupply = async (tankId: string, timestamp: number): Promis
         .sort((a: any, b: any) => b.start_date - a.start_date);
     return validSupplies.length > 0 ? validSupplies[0] : null;
 };
+
+// ==================== Manual Water Quality Readings ====================
+
+export const fetchManualWaterQualityReadings = async (waterType?: string): Promise<any[]> => {
+    try {
+        const url = waterType
+            ? `${API_BASE_URL}/manual-water-quality?waterType=${waterType}`
+            : `${API_BASE_URL}/manual-water-quality`;
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error('Failed to fetch manual water quality readings');
+        }
+        return await response.json();
+    } catch (error) {
+        console.error('API fetchManualWaterQualityReadings error:', error);
+        throw error;
+    }
+};
+
+// ==================== Manual Water Quality Limits & Aliases (SSO Auth) ====================
+
+// 取得控制標準
+export const fetchManualWaterQualityLimits = async (): Promise<any[]> => {
+    const response = await fetch(`${API_BASE_URL}/manual-water-quality/limits`);
+    if (!response.ok) throw new Error('Failed to fetch manual water quality limits');
+    return await response.json();
+};
+
+// 儲存/更新控制標準 (僅限管理者)
+export const updateManualWaterQualityLimits = async (limits: any[], userId?: string): Promise<any> => {
+    const url = userId
+        ? `${API_BASE_URL}/manual-water-quality/limits?userId=${encodeURIComponent(userId)}`
+        : `${API_BASE_URL}/manual-water-quality/limits`;
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(limits)
+    });
+    if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || 'Failed to update manual water quality limits');
+    }
+    return await response.json();
+};
+
+// 取得指標名稱顯示別名
+export const fetchManualWaterQualityAliases = async (): Promise<any[]> => {
+    const response = await fetch(`${API_BASE_URL}/manual-water-quality/metric-aliases`);
+    if (!response.ok) throw new Error('Failed to fetch manual water quality aliases');
+    return await response.json();
+};
+
+// 儲存/更新指標名稱顯示別名 (僅限管理者)
+export const updateManualWaterQualityAliases = async (aliases: any[], userId?: string): Promise<any> => {
+    const url = userId
+        ? `${API_BASE_URL}/manual-water-quality/metric-aliases?userId=${encodeURIComponent(userId)}`
+        : `${API_BASE_URL}/manual-water-quality/metric-aliases`;
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(aliases)
+    });
+    if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || 'Failed to update manual water quality aliases');
+    }
+    return await response.json();
+};
+
+// 檢查目前使用者是否為網站管理者 (PIMCP SSO 權限判定)
+export const checkManualWaterQualityAdmin = async (userId?: string): Promise<{ isAdmin: boolean, username: string }> => {
+    const url = userId
+        ? `${API_BASE_URL}/manual-water-quality/is-admin?userId=${encodeURIComponent(userId)}`
+        : `${API_BASE_URL}/manual-water-quality/is-admin`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Failed to check manual water quality admin status');
+    return await response.json();
+};

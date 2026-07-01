@@ -1442,6 +1442,56 @@ const migrateDatabase = async () => {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
+        await client.query(`
+            ALTER TABLE important_notes ADD COLUMN IF NOT EXISTS marked_water_type VARCHAR(10) DEFAULT NULL;
+        `);
+ 
+        // 7. Manual Water Quality Readings table
+        console.log('Ensuring manual_water_quality_readings table...');
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS manual_water_quality_readings (
+                id UUID PRIMARY KEY,
+                water_type VARCHAR(10) NOT NULL,
+                test_date DATE NOT NULL,
+                sample_point VARCHAR(50) NOT NULL,
+                data JSONB NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                CONSTRAINT uq_type_date_point UNIQUE (water_type, test_date, sample_point)
+            )
+        `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_mwqr_type_date ON manual_water_quality_readings(water_type, test_date)
+        `);
+ 
+        // 8. Manual Water Quality Limits table
+        console.log('Ensuring manual_water_quality_limits table...');
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS manual_water_quality_limits (
+                id SERIAL PRIMARY KEY,
+                water_type VARCHAR(10) NOT NULL,
+                sample_point VARCHAR(50) NOT NULL,
+                metric_name VARCHAR(100) NOT NULL,
+                min_value DOUBLE PRECISION,
+                max_value DOUBLE PRECISION,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                CONSTRAINT uq_limit_type_point_metric UNIQUE (water_type, sample_point, metric_name)
+            )
+        `);
+
+        // 9. Manual Water Quality Metric Aliases table
+        console.log('Ensuring manual_water_quality_metric_aliases table...');
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS manual_water_quality_metric_aliases (
+                id SERIAL PRIMARY KEY,
+                water_type VARCHAR(10) NOT NULL,
+                original_name VARCHAR(100) NOT NULL,
+                display_name VARCHAR(100) NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                CONSTRAINT uq_alias_type_original UNIQUE (water_type, original_name)
+            )
+        `);
 
         await client.query('COMMIT');
         console.log('Database migration completed.');
@@ -2316,6 +2366,344 @@ app.post('/messages/:token', async (req, res) => {
     }
 });
 
+// ==================== Manual Water Quality Readings APIs ====================
+
+// 取得人工檢驗水質數據 (可選 query 參數 waterType = 'CW' | 'BW')
+app.get('/api/manual-water-quality', async (req, res) => {
+    try {
+        const { waterType } = req.query;
+        let query = "SELECT id, water_type, TO_CHAR(test_date, 'YYYY-MM-DD') AS test_date, sample_point, data, created_at FROM manual_water_quality_readings";
+        let params = [];
+        
+        if (waterType) {
+            query += ' WHERE water_type = $1';
+            params.push(waterType);
+        }
+        
+        query += ' ORDER BY test_date DESC, sample_point ASC';
+        
+        const result = await pool.query(query, params);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/manual-water-quality error:', err);
+        if (err.code === '42P01') {
+            res.json([]);
+        } else {
+            res.status(500).json({ error: '取得水質數據失敗', details: err.message });
+        }
+    }
+});
+
+// PIMCP SSO 管理者權限判定 Helper
+const checkIsAdminByPimcp = async (req) => {
+    // 優先從前端傳入的 Query 參數、Body 或是 Header 獲取 userId
+    let user = req.query.userId || req.body?.userId || req.headers['x-user-id'];
+    
+    // 若前端未帶，則 fallback 嘗試使用與 checkMcpAccess 相同的 IIS 網域帳號提取邏輯
+    if (!user) {
+        user = getAuthorName(req) || '匿名';
+    }
+
+    if (user === '匿名' || !user) {
+        return { isAdmin: false, username: '匿名' };
+    }
+
+    let rawIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    if (Array.isArray(rawIp)) rawIp = rawIp[0];
+    let clientIp = String(rawIp || "").replace(/^::ffff:/, '');
+    if (clientIp.includes(':') && !clientIp.includes('[')) {
+        const parts = clientIp.split(':');
+        if (parts.length === 2) {
+            clientIp = parts[0];
+        }
+    }
+
+    const PIMCP_URL = process.env.PIMCP_API_URL || 'http://localhost:3011';
+    try {
+        const response = await fetch(`${PIMCP_URL}/api/agent/check-permission`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: user,
+                clientIp: clientIp,
+                requestedTool: 'WTCA/manage-limits' // 利用 PIMCP Admin 可任意呼叫該 requestedTool 的特性進行 Admin 身份判定
+            })
+        });
+
+        if (response.ok) {
+            const result = await response.json();
+            if (result.allowed) {
+                return { isAdmin: true, username: user };
+            }
+        }
+    } catch (err) {
+        console.error('[WTCA PIMCP Admin Check Error]', err.message);
+    }
+    return { isAdmin: false, username: user };
+};
+
+// 取得當前登入者是否為網站管理者 (對接 PIMCP SSO)
+app.get('/api/manual-water-quality/is-admin', async (req, res) => {
+    try {
+        const auth = await checkIsAdminByPimcp(req);
+        res.json(auth);
+    } catch (err) {
+        console.error('GET /api/manual-water-quality/is-admin error:', err);
+        res.status(500).json({ isAdmin: false, error: err.message });
+    }
+});
+
+// 預設控制限值定義 (基於最新一週 0623 工作表標準)
+const PRESET_WATER_LIMITS = [
+    // CW: 冷卻水
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'pH', min_value: 7.4, max_value: 7.8 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Calcium Hardness                             as CaCO3  ppm (鈣硬度)', min_value: 900.0, max_value: 1000.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Chloride                                   as Cl ppm(氯)', min_value: null, max_value: 300.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Silica                                        as SiO2 ppm (矽酸鹽)', min_value: null, max_value: 150.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Organic Phosphate                as  PO4  ppm (有機磷)', min_value: 1.0, max_value: 5.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Ortho Phosphate                           as  PO4  ppm (正磷酸鹽)', min_value: 1.0, max_value: 5.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2', 'TW'], metric_name: 'Total Iron as Fe, ppm (鐵)', min_value: null, max_value: 1.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Zinc as Zn+2, ppm (鋅)', min_value: 1.0, max_value: null },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'ppm TKC-3635', min_value: 45.0, max_value: 55.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'ppm 阻垢劑', min_value: 1.5, max_value: null },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2', 'TW'], metric_name: 'SS, ppm (懸浮物)', min_value: null, max_value: 10.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2', 'TW'], metric_name: '殘留氯 (R-Cl) ppm', min_value: 0.02, max_value: 0.15 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: '細菌數 (colonies/mL)', min_value: null, max_value: 10000.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2', 'TW'], metric_name: 'Turbidity, NTU  (渾濁度)', min_value: null, max_value: 10.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'LSI', min_value: null, max_value: 2.5 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'RSI', min_value: 5.5, max_value: 7.0 },
+
+    // BW: 鍋爐水
+    // 1. DMP (除礦水)
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'pH at 25°C', min_value: 6.5, max_value: 7.5 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 0.2 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Na+  ,ppb (鈉)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Copper as Cu, ppb (銅)', min_value: null, max_value: 10.0 },
+
+    // 2. LP (低壓)
+    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+
+    // 3. DEA (脫氣)
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'OS5613, ppm (脫氧劑)', min_value: 0.1, max_value: 0.5 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'DO ,ppb (溶氧)', min_value: null, max_value: 7.0 },
+
+    // 4. SS (飽和蒸汽)
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Na+  ,ppb (鈉)', min_value: null, max_value: 10.0 },
+
+    // 5. BFW (給水)
+    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 20.0 },
+
+    // 6. MS (主蒸汽)
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Na+  ,ppb (鈉)', min_value: null, max_value: 10.0 },
+
+    // 7. CBD (爐水)
+    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'pH at 25°C', min_value: 9.0, max_value: 9.5 },
+    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: 5.0, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 300.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'OPO4 as PO4 ,ppm (磷酸鹽)', min_value: 1.0, max_value: 4.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+
+    // 8. CD (冷凝水)
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'NH3 ,ppm (氨)', min_value: null, max_value: 0.3 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Copper as Cu, ppb (銅)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Total Hardness as CaCO3 ppb (總硬度)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'DO ,ppb (溶氧)', min_value: null, max_value: 7.0 }
+];
+
+// 取得控制標準 (若為空，後端會自動讀取 0623 預設限值進行寫入初始化)
+app.get('/api/manual-water-quality/limits', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT water_type, sample_point, metric_name, min_value, max_value FROM manual_water_quality_limits');
+        
+        // 若資料表為空，執行預設值批次寫入初始化
+        if (result.rows.length === 0) {
+            console.log('manual_water_quality_limits is empty. Initializing default preset limits from 0623 sheet...');
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                for (const item of PRESET_WATER_LIMITS) {
+                    for (const sp of item.sample_points) {
+                        await client.query(`
+                            INSERT INTO manual_water_quality_limits (water_type, sample_point, metric_name, min_value, max_value)
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT (water_type, sample_point, metric_name) DO UPDATE
+                            SET min_value = EXCLUDED.min_value, max_value = EXCLUDED.max_value
+                        `, [item.water_type, sp, item.metric_name, item.min_value, item.max_value]);
+                    }
+                }
+                await client.query('COMMIT');
+                
+                // 再次讀取寫入後的結果
+                const updatedResult = await pool.query('SELECT water_type, sample_point, metric_name, min_value, max_value FROM manual_water_quality_limits');
+                return res.json(updatedResult.rows);
+            } catch (err) {
+                await client.query('ROLLBACK');
+                throw err;
+            } finally {
+                client.release();
+            }
+        }
+        
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/manual-water-quality/limits error:', err);
+        res.status(500).json({ error: '取得水質控制標準失敗', details: err.message });
+    }
+});
+
+// 寫入/更新控制標準 (限網站管理者權限，整合 PIMCP SSO)
+app.post('/api/manual-water-quality/limits', async (req, res) => {
+    const auth = await checkIsAdminByPimcp(req);
+    if (!auth.isAdmin) {
+        return res.status(403).json({ error: '拒絕存取：您不具備網站管理者權限，無法變更水質控制標準！' });
+    }
+
+    const limits = req.body;
+    if (!Array.isArray(limits)) {
+        return res.status(400).json({ error: '請求 body 須為陣列' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (const limit of limits) {
+            const { water_type, sample_point, metric_name, min_value, max_value } = limit;
+            if (!water_type || !sample_point || !metric_name) {
+                continue;
+            }
+            await client.query(`
+                INSERT INTO manual_water_quality_limits (water_type, sample_point, metric_name, min_value, max_value, updated_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                ON CONFLICT (water_type, sample_point, metric_name) DO UPDATE
+                SET min_value = EXCLUDED.min_value, max_value = EXCLUDED.max_value, updated_at = NOW()
+            `, [water_type, sample_point, metric_name, min_value !== undefined ? min_value : null, max_value !== undefined ? max_value : null]);
+        }
+        await client.query('COMMIT');
+        res.json({ success: true, message: '成功更新水質控制標準！' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/manual-water-quality/limits error:', err);
+        res.status(500).json({ error: '儲存水質控制標準失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 取得指標名稱顯示別名
+app.get('/api/manual-water-quality/metric-aliases', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT water_type, original_name, display_name FROM manual_water_quality_metric_aliases');
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/manual-water-quality/metric-aliases error:', err);
+        res.status(500).json({ error: '取得水質指標名稱別名失敗', details: err.message });
+    }
+});
+
+// 寫入/更新指標名稱顯示別名 (限網站管理者權限，整合 PIMCP SSO)
+app.post('/api/manual-water-quality/metric-aliases', async (req, res) => {
+    const auth = await checkIsAdminByPimcp(req);
+    if (!auth.isAdmin) {
+        return res.status(403).json({ error: '拒絕存取：您不具備網站管理者權限，無法變更水質指標名稱！' });
+    }
+
+    const aliases = req.body;
+    if (!Array.isArray(aliases)) {
+        return res.status(400).json({ error: '請求 body 須為陣列' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (const aliasItem of aliases) {
+            const { water_type, original_name, display_name } = aliasItem;
+            if (!water_type || !original_name || !display_name) {
+                continue;
+            }
+            await client.query(`
+                INSERT INTO manual_water_quality_metric_aliases (water_type, original_name, display_name, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (water_type, original_name) DO UPDATE
+                SET display_name = EXCLUDED.display_name, updated_at = NOW()
+            `, [water_type, original_name, display_name.trim()]);
+        }
+        await client.query('COMMIT');
+        res.json({ success: true, message: '成功更新水質指標名稱別名！' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/manual-water-quality/metric-aliases error:', err);
+        res.status(500).json({ error: '儲存水質指標名稱別名失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 批次寫入/更新人工檢驗水質數據 (陣列 Upsert)
+app.post('/api/manual-water-quality/batch', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const items = req.body;
+        if (!Array.isArray(items)) {
+            return res.status(400).json({ error: '請求 body 須為陣列' });
+        }
+        
+        await client.query('BEGIN');
+        const inserted = [];
+        
+        for (const item of items) {
+            const { id, water_type, test_date, sample_point, data } = item;
+            if (!water_type || !test_date || !sample_point || !data) {
+                console.warn('跳過無效的水質數據項目:', item);
+                continue;
+            }
+            
+            const itemId = id || crypto.randomUUID();
+            const resItem = await client.query(
+                `INSERT INTO manual_water_quality_readings (id, water_type, test_date, sample_point, data)
+                 VALUES ($1, $2, $3, $4, $5::jsonb)
+                 ON CONFLICT (water_type, test_date, sample_point) 
+                 DO UPDATE SET data = EXCLUDED.data, created_at = NOW()
+                 RETURNING *`,
+                [itemId, water_type, test_date, sample_point, typeof data === 'string' ? data : JSON.stringify(data)]
+            );
+            inserted.push(resItem.rows[0]);
+        }
+        
+        await client.query('COMMIT');
+        res.status(200).json({ success: true, count: inserted.length, data: inserted });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/manual-water-quality/batch error:', err);
+        res.status(500).json({ error: '批次上傳水質數據失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 // ==================== Fluctuation Alerts APIs ====================
 
 // 取得所有警報
@@ -2526,8 +2914,8 @@ app.post('/api/notes', async (req, res) => {
         await client.query('BEGIN');
 
         const sql = `
-            INSERT INTO important_notes (id, date_str, area, chemical_name, note)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO important_notes (id, date_str, area, chemical_name, note, marked_water_type)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *
         `;
 
@@ -2536,7 +2924,8 @@ app.post('/api/notes', async (req, res) => {
             note.date_str,
             note.area,
             note.chemical_name,
-            note.note
+            note.note,
+            note.marked_water_type || null
         ]);
 
         await client.query('COMMIT');
@@ -2564,13 +2953,14 @@ app.post('/api/notes/batch', async (req, res) => {
         await client.query('BEGIN');
 
         const sql = `
-            INSERT INTO important_notes (id, date_str, area, chemical_name, note)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO important_notes (id, date_str, area, chemical_name, note, marked_water_type)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (id) DO UPDATE SET
                 date_str = EXCLUDED.date_str,
                 area = EXCLUDED.area,
                 chemical_name = EXCLUDED.chemical_name,
-                note = EXCLUDED.note
+                note = EXCLUDED.note,
+                marked_water_type = EXCLUDED.marked_water_type
         `;
 
         for (const note of notes) {
@@ -2579,7 +2969,8 @@ app.post('/api/notes/batch', async (req, res) => {
                 note.date_str,
                 note.area,
                 note.chemical_name,
-                note.note
+                note.note,
+                note.marked_water_type || null
             ]);
         }
 
@@ -2605,8 +2996,8 @@ app.put('/api/notes/:id', async (req, res) => {
 
         const sql = `
             UPDATE important_notes 
-            SET date_str = $1, area = $2, chemical_name = $3, note = $4
-            WHERE id = $5
+            SET date_str = $1, area = $2, chemical_name = $3, note = $4, marked_water_type = $5
+            WHERE id = $6
             RETURNING *
         `;
 
@@ -2615,6 +3006,7 @@ app.put('/api/notes/:id', async (req, res) => {
             note.area,
             note.chemical_name,
             note.note,
+            note.marked_water_type || null,
             id
         ]);
 

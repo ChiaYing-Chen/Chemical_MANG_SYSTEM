@@ -13,6 +13,7 @@ import {
 } from 'recharts';
 import AnnualDataView from './views/AnnualDataView';
 import { ExcelImportView } from './views/ExcelImportView';
+import { WaterQualityTrendsView } from './views/WaterQualityTrendsView';
 import { FluctuationAlertsView } from './components/FluctuationAlertsView';
 import { formatAnomalyMessage } from './utils/textUtils';
 
@@ -5717,7 +5718,8 @@ const ImportantNotesView: React.FC<{ thresholdWarningText?: string }> = ({ thres
         dateStr: formatDateForInput(new Date()),
         area: '',
         chemicalName: '',
-        note: ''
+        note: '',
+        markedWaterType: null
     });
 
     const loadNotes = async () => {
@@ -5743,7 +5745,8 @@ const ImportantNotesView: React.FC<{ thresholdWarningText?: string }> = ({ thres
             dateStr: note.dateStr,
             area: note.area,
             chemicalName: note.chemicalName,
-            note: note.note
+            note: note.note,
+            markedWaterType: note.markedWaterType || null
         });
         setIsEditOpen(true);
     };
@@ -5772,7 +5775,8 @@ const ImportantNotesView: React.FC<{ thresholdWarningText?: string }> = ({ thres
                 dateStr: formatDateForInput(new Date()),
                 area: '',
                 chemicalName: '',
-                note: ''
+                note: '',
+                markedWaterType: null
             });
             loadNotes();
         } catch (error) {
@@ -5951,8 +5955,38 @@ const ImportantNotesView: React.FC<{ thresholdWarningText?: string }> = ({ thres
                                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-900 font-medium">{note.dateStr}</td>
                                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-600">{note.area}</td>
                                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-600">{note.chemicalName}</td>
-                                                    <td className="px-6 py-4 text-sm text-slate-600 max-w-md break-words">{note.note}</td>
+                                                    <td className="px-6 py-4 text-sm text-slate-600 max-w-md break-words">
+                                                        <span>{note.note}</span>
+                                                        {note.markedWaterType === 'CW' && (
+                                                            <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800 border border-blue-200">
+                                                                標記: 冷卻水
+                                                            </span>
+                                                        )}
+                                                        {note.markedWaterType === 'BW' && (
+                                                            <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-800 border border-purple-200">
+                                                                標記: 鍋爐水
+                                                             </span>
+                                                        )}
+                                                    </td>
                                                     <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                                        <select
+                                                            value={note.markedWaterType || ''}
+                                                            onChange={async (e) => {
+                                                                const val = (e.target.value as any) || null;
+                                                                try {
+                                                                    await StorageService.updateNote({ ...note, markedWaterType: val });
+                                                                    loadNotes();
+                                                                } catch (error) {
+                                                                    console.error(error);
+                                                                    alert('快捷變更標記狀態失敗');
+                                                                }
+                                                            }}
+                                                            className="inline-block mr-3 text-xs border-slate-300 rounded-md shadow-sm focus:border-brand-500 focus:ring-brand-500 max-w-[120px]"
+                                                        >
+                                                            <option value="">未標記</option>
+                                                             <option value="CW">標記冷卻水</option>
+                                                             <option value="BW">標記鍋爐水</option>
+                                                        </select>
                                                         <button onClick={() => handleEdit(note)} className="text-brand-600 hover:text-brand-900 mr-3">編輯</button>
                                                         <button onClick={() => handleDelete(note.id)} className="text-red-600 hover:text-red-900">刪除</button>
                                                     </td>
@@ -6039,6 +6073,18 @@ const ImportantNotesView: React.FC<{ thresholdWarningText?: string }> = ({ thres
                             <div>
                                 <label className="block text-sm font-medium text-slate-700 mb-1">紀事內容</label>
                                 <textarea value={formData.note} onChange={e => setFormData({ ...formData, note: e.target.value })} className={inputClassName} rows={3} required />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">標記至水質趨勢圖</label>
+                                <select
+                                    value={formData.markedWaterType || ''}
+                                    onChange={e => setFormData({ ...formData, markedWaterType: (e.target.value as any) || null })}
+                                    className={inputClassName}
+                                >
+                                    <option value="">不標記</option>
+                                    <option value="CW">冷卻水趨勢圖 (CW)</option>
+                                    <option value="BW">鍋爐水趨勢圖 (BW)</option>
+                                </select>
                             </div>
                             <div className="flex justify-end gap-2 pt-2">
                                 <Button type="button" variant="ghost" onClick={() => { setIsEditOpen(false); setEditingNote(null); }}>取消</Button>
@@ -6968,13 +7014,13 @@ const ParamsSettingsView: React.FC<{
     );
 };
 
-type ViewType = 'dashboard' | 'entry' | 'analysis' | 'settings' | 'notes' | 'annual' | 'pi-test' | 'import' | 'params';
+type ViewType = 'dashboard' | 'entry' | 'analysis' | 'settings' | 'notes' | 'annual' | 'pi-test' | 'import' | 'params' | 'water-trends';
 
 const App: React.FC = () => {
     const [currentView, setCurrentView] = useState<ViewType>(() => {
         // 從 URL hash 讀取初始頁面
         const hash = window.location.hash.slice(1);
-        if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import', 'params'].includes(hash)) {
+        if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import', 'params', 'water-trends'].includes(hash)) {
             return hash as ViewType;
         }
         return 'dashboard';
@@ -7147,6 +7193,7 @@ const App: React.FC = () => {
             case 'settings': return <SettingsView tanks={tanks} readings={readings} onRefresh={refreshData} onLoading={setIsLoading} />;
             case 'notes': return <ImportantNotesView thresholdWarningText={appSettings.thresholdWarningText} />;
             case 'annual': return <AnnualDataView tanks={tanks} readings={readings} onNavigate={handleNavigateToAnalysis} />;
+            case 'water-trends': return <WaterQualityTrendsView />;
             case 'import': return <ExcelImportView tanks={tanks} onComplete={refreshData} onLoading={setIsLoading} />;
             case 'params': return <ParamsSettingsView appSettings={appSettings} setAppSettings={setAppSettings} />;
             default: return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} usageCalcWeeks={appSettings.usageCalcWeeks} lowLevelWarningText={appSettings.lowLevelWarningText} />;
@@ -7178,6 +7225,7 @@ const App: React.FC = () => {
                     <NavItem view="dashboard" icon={Icons.Dashboard} label="總覽看板" />
                     <NavItem view="analysis" icon={Icons.Analysis} label="用量分析" />
                     <NavItem view="annual" icon={Icons.Calendar} label="年度數據" />
+                    <NavItem view="water-trends" icon={Icons.Droplet} label="水質趨勢" />
                     <NavItem view="notes" icon={Icons.Notes} label="重要紀事" />
                     <NavItem view="entry" icon={Icons.Entry} label="數據輸入" />
                     <NavItem view="import" icon={Icons.FileText} label="辨識匯入" />

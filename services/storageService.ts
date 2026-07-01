@@ -548,7 +548,8 @@ export class StorageService {
             area: apiNote.area,
             chemicalName: apiNote.chemical_name,
             note: apiNote.note,
-            createdAt: apiNote.created_at
+            createdAt: apiNote.created_at,
+            markedWaterType: apiNote.marked_water_type
         };
     }
 
@@ -558,7 +559,8 @@ export class StorageService {
             date_str: note.dateStr,
             area: note.area,
             chemical_name: note.chemicalName,
-            note: note.note
+            note: note.note,
+            marked_water_type: note.markedWaterType
         };
     }
     // ==================== Fluctuation Alerts ====================

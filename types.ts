@@ -138,6 +138,7 @@ export interface ImportantNote {
   chemicalName: string;
   note: string;
   createdAt?: string;
+  markedWaterType?: 'CW' | 'BW' | null;
 }
 
 export interface FluctuationAlert {
