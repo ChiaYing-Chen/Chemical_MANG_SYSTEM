@@ -61,19 +61,28 @@ export class StorageService {
                 await API.createTank(apiTank);
             }
 
-            // 儲存相關參數
+            // 儲存相關參數時必須轉成後端欄位命名，並避免沒有實際數值時產生空白歷史資料。
             if (tank.calculationMethod === 'CWS_BLOWDOWN' && tank.cwsParams) {
-                await API.saveCWSParams({
+                const cwsParam = {
                     ...tank.cwsParams,
-                    tank_id: tank.id,
+                    tankId: tank.id,
                     date: tank.cwsParams.date || Date.now()
-                });
+                };
+                const hasCwsData =
+                    Number(cwsParam.circulationRate || 0) > 0 ||
+                    Number(cwsParam.tempDiff || 0) > 0 ||
+                    Number(cwsParam.cwsHardness || 0) > 0 ||
+                    Number(cwsParam.makeupHardness || 0) > 0;
+
+                if (hasCwsData) {
+                    await API.saveCWSParams(StorageService.convertCWSParamToAPI(cwsParam));
+                }
             } else if (tank.calculationMethod === 'BWS_STEAM' && tank.bwsParams) {
-                await API.saveBWSParams({
+                await API.saveBWSParams(StorageService.convertBWSParamToAPI({
                     ...tank.bwsParams,
-                    tank_id: tank.id,
+                    tankId: tank.id,
                     date: tank.bwsParams.date || Date.now()
-                });
+                }));
             }
         } catch (err) {
             console.error('Failed to save tank:', err);

@@ -1657,11 +1657,14 @@ const DataEntryView: React.FC<{
     const [exportEnd, setExportEnd] = useState('');
 
     // === B/C/D 數據品質檢查 State ===
+    type BCDIssueType = 'duplicate' | 'blank';
     interface DupBCDGroup {
         tankId: string;
         tankName: string;
         date: string; // YYYY-MM-DD
         items: any[]; // 各類型的原始資料
+        issueType: BCDIssueType;
+        missingFields?: string[];
     }
     const [dupBCDCheckStart, setDupBCDCheckStart] = useState('');
     const [dupBCDCheckEnd, setDupBCDCheckEnd] = useState('');
@@ -1673,6 +1676,16 @@ const DataEntryView: React.FC<{
     const handleDupBCDCheck = async (type: 'B' | 'C' | 'D') => {
         const startTs = dupBCDCheckStart ? new Date(dupBCDCheckStart + 'T00:00:00+08:00').getTime() : 0;
         const endTs = dupBCDCheckEnd ? new Date(dupBCDCheckEnd + 'T23:59:59+08:00').getTime() : Date.now();
+        const hasPositiveValue = (value: any) => Number.isFinite(Number(value)) && Number(value) > 0;
+        const getMissingCwsFields = (item: CWSParameterRecord) => {
+            const missing: string[] = [];
+            if (!hasPositiveValue(item.circulationRate)) missing.push('循環水量');
+            if (!hasPositiveValue(item.tempDiff)) missing.push('溫差');
+            const hasHardnessCycle = hasPositiveValue(item.cwsHardness) && hasPositiveValue(item.makeupHardness);
+            const hasManualCycle = Number.isFinite(Number(item.concentrationCycles)) && Number(item.concentrationCycles) > 1;
+            if (!hasHardnessCycle && !hasManualCycle) missing.push('濃縮倍數來源');
+            return missing;
+        };
 
         let allItems: { tankId: string; date: number; id: string; raw: any }[] = [];
         if (type === 'B') {
@@ -1704,7 +1717,23 @@ const DataEntryView: React.FC<{
             if (g.items.length < 2) continue;
             const [tankId, date] = key.split('|');
             const tank = tanks.find(t => t.id === tankId);
-            results.push({ tankId, tankName: tank?.name || tankId, date, items: g.items });
+            results.push({ tankId, tankName: tank?.name || tankId, date, items: g.items, issueType: 'duplicate' });
+        }
+
+        if (type === 'C') {
+            for (const item of allItems) {
+                const missingFields = getMissingCwsFields(item.raw as CWSParameterRecord);
+                if (missingFields.length === 0) continue;
+                const tank = tanks.find(t => t.id === item.tankId);
+                results.push({
+                    tankId: item.tankId,
+                    tankName: tank?.name || item.tankId,
+                    date: toTaipeiDateStr(item.date),
+                    items: [item.raw],
+                    issueType: 'blank',
+                    missingFields
+                });
+            }
         }
         setDupBCDGroups(results);
         setDupBCDChecked(true);
@@ -4117,7 +4146,7 @@ const DataEntryView: React.FC<{
                     {activeType === 'C' && (
                         <div className="mt-6 pt-6 border-t-2 border-amber-300">
                             <h4 className="font-bold text-amber-800 flex items-center mb-4">
-                                <span className="mr-2">🔍</span>數據品質檢查：偵測同一桶槽同日重複冷卻水生產數據
+                                <span className="mr-2">🔍</span>數據品質檢查：偵測同一桶槽同日重複與空白冷卻水生產數據
                             </h4>
                             <div className="flex flex-wrap items-end gap-3 mb-3">
                                 <div>
@@ -4130,9 +4159,13 @@ const DataEntryView: React.FC<{
                                 </div>
                                 <Button onClick={() => handleDupBCDCheck('C')} className="bg-amber-500 hover:bg-amber-600 text-white text-sm py-2 px-4">開始檢查</Button>
                             </div>
-                            {dupBCDChecked && activeType === 'C' && (dupBCDGroups.length === 0
-                                ? <p className="text-green-700 text-sm">✅ 未偵測到重複資料。</p>
-                                : <p className="text-red-700 text-sm">⚠️ 發現 {dupBCDGroups.length} 組重複。<button onClick={() => { setDupBCDDialogIndex(0); setIsDupBCDDialogOpen(true); }} className="ml-2 underline text-amber-700">重新開啟</button></p>)}
+                            {dupBCDChecked && activeType === 'C' && (() => {
+                                const duplicateCount = dupBCDGroups.filter(g => g.issueType === 'duplicate').length;
+                                const blankCount = dupBCDGroups.filter(g => g.issueType === 'blank').length;
+                                return dupBCDGroups.length === 0
+                                    ? <p className="text-green-700 text-sm">✅ 未偵測到重複或空白資料。</p>
+                                    : <p className="text-red-700 text-sm">⚠️ 發現 {duplicateCount} 組重複、{blankCount} 筆空白資料。<button onClick={() => { setDupBCDDialogIndex(0); setIsDupBCDDialogOpen(true); }} className="ml-2 underline text-amber-700">重新開啟</button></p>;
+                            })()}
                         </div>
                     )}
                     {/* D 頁籤數據品質檢查 */}
@@ -4161,6 +4194,7 @@ const DataEntryView: React.FC<{
                     {/* B/C/D 重複處理彈窗 */}
                     {isDupBCDDialogOpen && dupBCDGroups.length > 0 && (() => {
                         const group = dupBCDGroups[dupBCDDialogIndex];
+                        const isBlankIssue = group.issueType === 'blank';
                         const handleDeleteBCDDup = async (id: string) => {
                             if (!confirm('確定要刪除此筆資料？')) return;
                             try {
@@ -4182,11 +4216,11 @@ const DataEntryView: React.FC<{
                                 const updatedGroup = { ...group, items: group.items.filter((r: any) => r.id !== id) };
                                 const newGroups = dupBCDGroups
                                     .map((g, i) => i === dupBCDDialogIndex ? updatedGroup : g)
-                                    .filter(g => g.items.length >= 2);
+                                    .filter(g => g.issueType === 'duplicate' ? g.items.length >= 2 : g.items.length > 0);
                                 setDupBCDGroups(newGroups);
                                 if (newGroups.length === 0) {
                                     setIsDupBCDDialogOpen(false);
-                                    alert('所有重複資料已處理完成！');
+                                    alert('所有異常資料已處理完成！');
                                 } else if (dupBCDDialogIndex >= newGroups.length) {
                                     setDupBCDDialogIndex(newGroups.length - 1);
                                 }
@@ -4195,7 +4229,7 @@ const DataEntryView: React.FC<{
 
                         const getLabel = (item: any): string => {
                             if (activeType === 'B') return `生效日: ${item.startDate ? new Date(item.startDate).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-'} | SG: ${item.specificGravity ?? '-'} | 供應商: ${item.supplierName ?? '-'}`;
-                            if (activeType === 'C') return `日期: ${item.date ? new Date(Number(item.date)).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-'} | 循環水量: ${item.circulationRate ?? '-'} | 溫差: ${item.tempDiff ?? '-'}`;
+                            if (activeType === 'C') return `日期: ${item.date ? new Date(Number(item.date)).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-'} | 循環水量: ${item.circulationRate ?? '-'} | 溫差: ${item.tempDiff ?? '-'}${group.missingFields?.length ? ` | 缺少: ${group.missingFields.join('、')}` : ''}`;
                             return `日期: ${item.date ? new Date(Number(item.date)).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' }) : '-'} | 製氣量: ${item.steamProduction ?? '-'} T`;
                         };
 
@@ -4205,13 +4239,13 @@ const DataEntryView: React.FC<{
                                 <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[85vh] overflow-y-auto">
                                     <div className="bg-amber-50 border-b border-amber-200 px-6 py-4 rounded-t-xl">
                                         <div className="flex justify-between items-center">
-                                            <h3 className="font-bold text-amber-900 text-lg">⚠️ 重複資料 {dupBCDDialogIndex + 1} / {dupBCDGroups.length}</h3>
+                                            <h3 className="font-bold text-amber-900 text-lg">⚠️ {isBlankIssue ? '空白資料' : '重複資料'} {dupBCDDialogIndex + 1} / {dupBCDGroups.length}</h3>
                                             <button onClick={() => setIsDupBCDDialogOpen(false)} className="text-2xl font-bold text-slate-400 hover:text-red-600">×</button>
                                         </div>
                                         <p className="text-sm text-amber-800 mt-1">桶槽：<strong>{group.tankName}</strong> &bull; 日期：<strong>{group.date}</strong></p>
                                     </div>
                                     <div className="px-6 py-4">
-                                        <h4 className="font-semibold text-red-700 mb-3">同日重複筆數（請刪除不正確的那筆）</h4>
+                                        <h4 className="font-semibold text-red-700 mb-3">{isBlankIssue ? '必要欄位空白或為 0（可刪除後重新匯入/補登）' : '同日重複筆數（請刪除不正確的那筆）'}</h4>
                                         <div className="space-y-2">
                                             {group.items.map((item: any) => (
                                                 <div key={item.id} className="flex items-center justify-between bg-red-50 border border-red-200 rounded-lg p-3">
