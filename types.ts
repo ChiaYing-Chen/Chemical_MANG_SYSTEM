@@ -156,6 +156,58 @@ export interface FluctuationAlert {
   createdAt?: string;
 }
 
+export type InstrumentWaterType = 'CW' | 'BW';
+export type InstrumentConsumableUsageType = 'calibration' | 'general';
+
+export interface LiteInventoryItem {
+  key: string;
+  partNo: string;
+  name: string;
+  binCode: string;
+  quantity: number;
+  safetyStock?: number;
+  area?: string;
+  section?: string;
+  note?: string;
+  attribute?: string;
+  y6InstrumentId?: string;
+  isControlled?: boolean;
+}
+
+export interface InstrumentConsumableConfig {
+  id?: string;
+  configId?: string;
+  consumableItemKey: string;
+  usageType: InstrumentConsumableUsageType;
+  shelfLifeDays: number | null;
+  sortOrder?: number;
+}
+
+export interface InstrumentManagementConfig {
+  id?: string;
+  waterType: InstrumentWaterType;
+  testItemKey: string;
+  instrumentItemKey: string;
+  note: string;
+  sortOrder?: number;
+  consumables: InstrumentConsumableConfig[];
+}
+
+export interface InstrumentConsumableOpening {
+  id: string;
+  configId?: string | null;
+  consumableId?: string | null;
+  consumableItemKey: string;
+  openedDate: string;
+  expiresDate?: string | null;
+  status: 'OPEN' | 'CLOSED' | 'DISCARDED';
+  adjustedInventory: boolean;
+  inventoryAdjustLogId?: string | null;
+  createdBy?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 // Fluctuation Alerts
 export interface FluctuationAlert {
   id: string;

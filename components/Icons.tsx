@@ -29,7 +29,8 @@ import {
   HelpCircle,
   Check,
   Cylinder,
-  Info
+  Info,
+  Wrench
 } from 'lucide-react';
 
 export const Icons = {
@@ -64,5 +65,6 @@ export const Icons = {
   Help: HelpCircle,
   Check: Check,
   Cylinder: Cylinder,
-  Info: Info
+  Info: Info,
+  Instrument: Wrench
 };

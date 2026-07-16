@@ -14,6 +14,7 @@ import {
 import AnnualDataView from './views/AnnualDataView';
 import { ExcelImportView } from './views/ExcelImportView';
 import { WaterQualityTrendsView } from './views/WaterQualityTrendsView';
+import InstrumentManagementView from './views/InstrumentManagementView';
 import { FluctuationAlertsView } from './components/FluctuationAlertsView';
 import { formatAnomalyMessage } from './utils/textUtils';
 
@@ -7048,13 +7049,15 @@ const ParamsSettingsView: React.FC<{
     );
 };
 
-type ViewType = 'dashboard' | 'entry' | 'analysis' | 'settings' | 'notes' | 'annual' | 'pi-test' | 'import' | 'params' | 'water-trends';
+type ViewType = 'dashboard' | 'entry' | 'analysis' | 'settings' | 'notes' | 'annual' | 'pi-test' | 'import' | 'params' | 'water-trends' | 'instrument-management';
+
+const validViews: ViewType[] = ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import', 'params', 'water-trends', 'instrument-management'];
 
 const App: React.FC = () => {
     const [currentView, setCurrentView] = useState<ViewType>(() => {
         // 從 URL hash 讀取初始頁面
         const hash = window.location.hash.slice(1);
-        if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import', 'params', 'water-trends'].includes(hash)) {
+        if (hash && validViews.includes(hash as ViewType)) {
             return hash as ViewType;
         }
         return 'dashboard';
@@ -7114,7 +7117,7 @@ const App: React.FC = () => {
             } else {
                 // 從 hash 讀取
                 const hash = window.location.hash.slice(1);
-                if (hash && ['dashboard', 'entry', 'analysis', 'settings', 'notes', 'annual', 'pi-test', 'import', 'params'].includes(hash)) {
+                if (hash && validViews.includes(hash as ViewType)) {
                     setCurrentView(hash as ViewType);
                 } else {
                     setCurrentView('dashboard');
@@ -7228,6 +7231,7 @@ const App: React.FC = () => {
             case 'notes': return <ImportantNotesView thresholdWarningText={appSettings.thresholdWarningText} />;
             case 'annual': return <AnnualDataView tanks={tanks} readings={readings} onNavigate={handleNavigateToAnalysis} />;
             case 'water-trends': return <WaterQualityTrendsView />;
+            case 'instrument-management': return <InstrumentManagementView />;
             case 'import': return <ExcelImportView tanks={tanks} onComplete={refreshData} onLoading={setIsLoading} />;
             case 'params': return <ParamsSettingsView appSettings={appSettings} setAppSettings={setAppSettings} />;
             default: return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} usageCalcWeeks={appSettings.usageCalcWeeks} lowLevelWarningText={appSettings.lowLevelWarningText} />;
@@ -7260,6 +7264,7 @@ const App: React.FC = () => {
                     <NavItem view="analysis" icon={Icons.Analysis} label="用量分析" />
                     <NavItem view="annual" icon={Icons.Calendar} label="年度數據" />
                     <NavItem view="water-trends" icon={Icons.Droplet} label="水質趨勢" />
+                    <NavItem view="instrument-management" icon={Icons.Instrument} label="儀器管理" />
                     <NavItem view="notes" icon={Icons.Notes} label="重要紀事" />
                     <NavItem view="entry" icon={Icons.Entry} label="數據輸入" />
                     <NavItem view="import" icon={Icons.FileText} label="辨識匯入" />

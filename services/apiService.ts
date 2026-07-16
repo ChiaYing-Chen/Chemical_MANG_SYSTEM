@@ -1,4 +1,5 @@
 // API 服務層 - 連接到後端 PostgreSQL API
+import type { InstrumentConsumableOpening, InstrumentManagementConfig, LiteInventoryItem } from '../types';
 
 // 根據環境自動選擇 API 基礎路徑
 // 開發環境: 指向生產伺服器 API（因為本地無法連接資料庫）
@@ -392,6 +393,112 @@ export const deleteAlertsBatch = async (ids: string[]): Promise<void> => {
         body: JSON.stringify({ ids })
     });
     if (!response.ok) throw new Error('Failed to batch delete alerts');
+};
+
+// ==================== Instrument Management ====================
+
+const readErrorMessage = async (response: Response, fallback: string): Promise<string> => {
+    try {
+        const data = await response.json();
+        return data.message || data.error || fallback;
+    } catch {
+        return fallback;
+    }
+};
+
+export const fetchInstrumentInventoryItems = async (query?: string): Promise<LiteInventoryItem[]> => {
+    const params = new URLSearchParams();
+    if (query) params.set('q', query);
+    const url = `${API_BASE_URL}/instrument-management/inventory-items${params.toString() ? `?${params.toString()}` : ''}`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(await readErrorMessage(response, '取得庫存物料失敗'));
+    return await response.json();
+};
+
+export const fetchInstrumentConfigs = async (): Promise<InstrumentManagementConfig[]> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/configs`);
+    if (!response.ok) throw new Error(await readErrorMessage(response, '取得儀器管理設定失敗'));
+    return await response.json();
+};
+
+export const createInstrumentConfig = async (config: InstrumentManagementConfig): Promise<InstrumentManagementConfig> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/configs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config)
+    });
+    if (!response.ok) throw new Error(await readErrorMessage(response, '新增儀器管理設定失敗'));
+    return await response.json();
+};
+
+export const updateInstrumentConfig = async (id: string, config: InstrumentManagementConfig): Promise<InstrumentManagementConfig> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/configs/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config)
+    });
+    if (!response.ok) throw new Error(await readErrorMessage(response, '更新儀器管理設定失敗'));
+    return await response.json();
+};
+
+export const deleteInstrumentConfig = async (id: string): Promise<void> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/configs/${id}`, {
+        method: 'DELETE'
+    });
+    if (!response.ok) throw new Error(await readErrorMessage(response, '刪除儀器管理設定失敗'));
+};
+
+export const fetchInstrumentOpenings = async (): Promise<InstrumentConsumableOpening[]> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/openings`);
+    if (!response.ok) throw new Error(await readErrorMessage(response, '取得耗材開封紀錄失敗'));
+    return await response.json();
+};
+
+export const createInstrumentOpening = async (opening: {
+    configId?: string;
+    consumableId?: string;
+    consumableItemKey: string;
+    openedDate: string;
+    shelfLifeDays?: number | null;
+}): Promise<InstrumentConsumableOpening> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/openings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opening)
+    });
+    if (!response.ok) throw new Error(await readErrorMessage(response, '新增耗材開封紀錄失敗'));
+    return await response.json();
+};
+
+export const updateInstrumentOpening = async (id: string, patch: Partial<InstrumentConsumableOpening>): Promise<InstrumentConsumableOpening> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/openings/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch)
+    });
+    if (!response.ok) throw new Error(await readErrorMessage(response, '更新耗材開封紀錄失敗'));
+    return await response.json();
+};
+
+export const adjustInstrumentInventory = async (payload: {
+    itemKey: string;
+    diff: number;
+    note?: string;
+    refId?: string;
+}): Promise<any> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/inventory-adjust`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    if (!response.ok) throw new Error(await readErrorMessage(response, '調整庫存失敗'));
+    return await response.json();
+};
+
+export const runInstrumentExpiryCheck = async (): Promise<any> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/expiry-check`, { method: 'POST' });
+    if (!response.ok) throw new Error(await readErrorMessage(response, '耗材到期檢查失敗'));
+    return await response.json();
 };
 
 // ==================== Helper Functions ====================

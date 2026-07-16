@@ -189,6 +189,102 @@ const calculateTheoreticalUsageKg = (tank, supplies, cwsHistory, bwsHistory, sta
     return { value: total, hasMissingTheoretical };
 };
 
+const getTaipeiDateString = (date = new Date()) => {
+    const taipeiDate = new Date(date.getTime() + TAIPEI_OFFSET_MS);
+    return taipeiDate.toISOString().slice(0, 10);
+};
+
+const addDaysToDateString = (dateStr, days) => {
+    const [year, month, day] = String(dateStr).split('-').map(Number);
+    if (!year || !month || !day) return null;
+    const utcDate = new Date(Date.UTC(year, month - 1, day) + Number(days || 0) * DAY_MS);
+    return utcDate.toISOString().slice(0, 10);
+};
+
+const getLiteInventoryApiBaseUrl = (req) => {
+    if (process.env.LITEINVENTORY_API_BASE_URL) {
+        return process.env.LITEINVENTORY_API_BASE_URL.replace(/\/$/, '');
+    }
+
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim();
+
+    if (!host || host.startsWith('localhost') || host.startsWith('127.0.0.1')) {
+        return 'http://10.122.51.61/LiteInventory/api';
+    }
+
+    return `${proto}://${host}/LiteInventory/api`;
+};
+
+const buildLiteInventoryHeaders = (req) => {
+    const headers = { 'Content-Type': 'application/json' };
+    const passthroughHeaders = [
+        'x-remote-user',
+        'x-auth-user',
+        'x-iisnode-auth_user',
+        'x-iisnode-logon_user',
+        'auth-user',
+        'remote_user',
+        'cookie'
+    ];
+
+    for (const name of passthroughHeaders) {
+        const value = req.headers[name];
+        if (value) headers[name] = Array.isArray(value) ? value[0] : value;
+    }
+
+    if (!headers['x-remote-user']) {
+        const user = typeof getAuthorName === 'function' ? getAuthorName(req) : null;
+        if (user && user !== '匿名') {
+            headers['x-remote-user'] = user;
+            headers['x-auth-user'] = user;
+        }
+    }
+
+    return headers;
+};
+
+const callLiteInventoryApi = async (req, endpoint, options = {}) => {
+    const baseUrl = getLiteInventoryApiBaseUrl(req);
+    const response = await fetch(`${baseUrl}${endpoint}`, {
+        method: options.method || 'GET',
+        headers: { ...buildLiteInventoryHeaders(req), ...(options.headers || {}) },
+        body: options.body === undefined ? undefined : JSON.stringify(options.body)
+    });
+
+    const text = await response.text();
+    let data = null;
+    try {
+        data = text ? JSON.parse(text) : null;
+    } catch {
+        data = { status: 'error', message: text || response.statusText };
+    }
+
+    if (!response.ok) {
+        const err = new Error(data?.message || data?.error || `LiteInventory API ${response.status}`);
+        err.status = response.status;
+        err.payload = data;
+        throw err;
+    }
+
+    return data;
+};
+
+const normalizeInventoryItem = (item) => ({
+    key: item?.key || '',
+    partNo: item?.partNo || '',
+    name: item?.name || '',
+    binCode: item?.binCode || '',
+    quantity: Number(item?.quantity || 0),
+    safetyStock: Number(item?.safetyStock || 0),
+    area: item?.area || '',
+    section: item?.section || '',
+    note: item?.note || '',
+    attribute: item?.attribute || '',
+    y6InstrumentId: item?.y6InstrumentId || '',
+    isControlled: Boolean(item?.isControlled)
+});
+
 // MCP 連線儲存
 const mcpTransports = new Map();
 const mcpServers = new Map();
@@ -1493,6 +1589,67 @@ const migrateDatabase = async () => {
             )
         `);
 
+        // 10. Instrument Management tables
+        console.log('Ensuring instrument management tables...');
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS instrument_management_configs (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                water_type VARCHAR(10) NOT NULL CHECK (water_type IN ('CW', 'BW')),
+                test_item_key TEXT,
+                instrument_item_key TEXT,
+                note TEXT,
+                sort_order INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS instrument_management_consumables (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                config_id UUID NOT NULL REFERENCES instrument_management_configs(id) ON DELETE CASCADE,
+                consumable_item_key TEXT NOT NULL,
+                usage_type VARCHAR(20) NOT NULL DEFAULT 'general' CHECK (usage_type IN ('calibration', 'general')),
+                shelf_life_days INTEGER,
+                sort_order INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS instrument_consumable_openings (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                config_id UUID REFERENCES instrument_management_configs(id) ON DELETE SET NULL,
+                consumable_id UUID REFERENCES instrument_management_consumables(id) ON DELETE SET NULL,
+                consumable_item_key TEXT NOT NULL,
+                opened_date DATE NOT NULL,
+                expires_date DATE,
+                status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+                adjusted_inventory BOOLEAN DEFAULT FALSE,
+                inventory_adjust_log_id TEXT,
+                created_by TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS instrument_consumable_notifications (
+                id SERIAL PRIMARY KEY,
+                opening_id UUID NOT NULL REFERENCES instrument_consumable_openings(id) ON DELETE CASCADE,
+                notify_date DATE NOT NULL,
+                notification_key TEXT NOT NULL UNIQUE,
+                sent_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_im_configs_water_type ON instrument_management_configs(water_type, sort_order)
+        `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_im_consumables_config ON instrument_management_consumables(config_id, sort_order)
+        `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_im_openings_expiry ON instrument_consumable_openings(expires_date, status)
+        `);
+
         await client.query('COMMIT');
         console.log('Database migration completed.');
     } catch (err) {
@@ -2442,6 +2599,383 @@ const checkIsAdminByPimcp = async (req) => {
     return { isAdmin: false, username: user };
 };
 
+const toInstrumentConfigDto = (row, consumables = []) => ({
+    id: row.id,
+    waterType: row.water_type,
+    testItemKey: row.test_item_key || '',
+    instrumentItemKey: row.instrument_item_key || '',
+    note: row.note || '',
+    sortOrder: Number(row.sort_order || 0),
+    consumables: consumables.map(c => ({
+        id: c.id,
+        configId: c.config_id,
+        consumableItemKey: c.consumable_item_key,
+        usageType: c.usage_type,
+        shelfLifeDays: c.shelf_life_days === null || c.shelf_life_days === undefined ? null : Number(c.shelf_life_days),
+        sortOrder: Number(c.sort_order || 0)
+    }))
+});
+
+const toOpeningDto = (row) => ({
+    id: row.id,
+    configId: row.config_id,
+    consumableId: row.consumable_id,
+    consumableItemKey: row.consumable_item_key,
+    openedDate: typeof row.opened_date === 'string' ? row.opened_date.slice(0, 10) : getTaipeiDateString(new Date(row.opened_date)),
+    expiresDate: row.expires_date ? (typeof row.expires_date === 'string' ? row.expires_date.slice(0, 10) : getTaipeiDateString(new Date(row.expires_date))) : null,
+    status: row.status,
+    adjustedInventory: Boolean(row.adjusted_inventory),
+    inventoryAdjustLogId: row.inventory_adjust_log_id,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+});
+
+const validateInstrumentConfigPayload = (payload) => {
+    const waterType = payload.waterType || payload.water_type;
+    const testItemKey = payload.testItemKey ?? payload.test_item_key ?? '';
+    const instrumentItemKey = payload.instrumentItemKey ?? payload.instrument_item_key ?? '';
+    const consumables = Array.isArray(payload.consumables) ? payload.consumables : [];
+
+    if (!['CW', 'BW'].includes(waterType)) {
+        return { error: 'waterType 必須為 CW 或 BW' };
+    }
+
+    const normalizedConsumables = consumables
+        .map((item, index) => ({
+            id: item.id,
+            consumableItemKey: item.consumableItemKey || item.consumable_item_key || '',
+            usageType: item.usageType || item.usage_type || 'general',
+            shelfLifeDays: item.shelfLifeDays === '' || item.shelfLifeDays === undefined ? null : item.shelfLifeDays,
+            sortOrder: Number(item.sortOrder ?? item.sort_order ?? index)
+        }))
+        .filter(item => item.consumableItemKey);
+
+    for (const item of normalizedConsumables) {
+        if (!['calibration', 'general'].includes(item.usageType)) {
+            return { error: '耗材用途必須為 calibration 或 general' };
+        }
+        if (item.shelfLifeDays !== null) {
+            const days = Number(item.shelfLifeDays);
+            if (!Number.isInteger(days) || days < 0) {
+                return { error: '保存期限必須為 0 以上整數天數' };
+            }
+            item.shelfLifeDays = days;
+        }
+    }
+
+    if (!testItemKey && !instrumentItemKey && normalizedConsumables.length === 0) {
+        return { error: '至少需設定測試項目、手持儀器或耗材其中一項' };
+    }
+
+    if (instrumentItemKey && !normalizedConsumables.some(item => item.usageType === 'calibration')) {
+        return { error: '有設定手持儀器時，必須設定至少一項校正耗材' };
+    }
+
+    return {
+        value: {
+            waterType,
+            testItemKey,
+            instrumentItemKey,
+            note: payload.note || '',
+            sortOrder: Number(payload.sortOrder ?? payload.sort_order ?? 0),
+            consumables: normalizedConsumables
+        }
+    };
+};
+
+const fetchInstrumentConfigs = async (client = pool) => {
+    const configsRes = await client.query('SELECT * FROM instrument_management_configs ORDER BY water_type, sort_order, created_at');
+    const consumablesRes = await client.query('SELECT * FROM instrument_management_consumables ORDER BY config_id, sort_order, created_at');
+    const consumablesByConfig = new Map();
+
+    for (const item of consumablesRes.rows) {
+        if (!consumablesByConfig.has(item.config_id)) consumablesByConfig.set(item.config_id, []);
+        consumablesByConfig.get(item.config_id).push(item);
+    }
+
+    return configsRes.rows.map(row => toInstrumentConfigDto(row, consumablesByConfig.get(row.id) || []));
+};
+
+const replaceInstrumentConsumables = async (client, configId, consumables) => {
+    await client.query('DELETE FROM instrument_management_consumables WHERE config_id = $1', [configId]);
+    for (const item of consumables) {
+        await client.query(
+            `INSERT INTO instrument_management_consumables
+             (config_id, consumable_item_key, usage_type, shelf_life_days, sort_order)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [configId, item.consumableItemKey, item.usageType, item.shelfLifeDays, item.sortOrder]
+        );
+    }
+};
+
+app.get('/api/instrument-management/inventory-items', async (req, res) => {
+    try {
+        const items = await callLiteInventoryApi(req, '/inventory');
+        const query = String(req.query.q || '').trim().toLowerCase();
+        const normalized = Array.isArray(items) ? items.map(normalizeInventoryItem) : [];
+        const filtered = query
+            ? normalized.filter(item =>
+                [item.key, item.partNo, item.name, item.binCode, item.area, item.section]
+                    .some(value => String(value || '').toLowerCase().includes(query))
+            )
+            : normalized;
+        res.json(filtered.slice(0, 200));
+    } catch (err) {
+        console.error('GET /api/instrument-management/inventory-items error:', err.message);
+        res.status(err.status || 500).json(err.payload || { error: '取得 LiteInventory 物料失敗', details: err.message });
+    }
+});
+
+app.get('/api/instrument-management/configs', async (_req, res) => {
+    try {
+        res.json(await fetchInstrumentConfigs());
+    } catch (err) {
+        console.error('GET /api/instrument-management/configs error:', err);
+        res.status(500).json({ error: '取得儀器管理設定失敗', details: err.message });
+    }
+});
+
+app.post('/api/instrument-management/configs', async (req, res) => {
+    const parsed = validateInstrumentConfigPayload(req.body || {});
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const item = parsed.value;
+        const result = await client.query(
+            `INSERT INTO instrument_management_configs
+             (water_type, test_item_key, instrument_item_key, note, sort_order)
+             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+            [item.waterType, item.testItemKey || null, item.instrumentItemKey || null, item.note, item.sortOrder]
+        );
+        await replaceInstrumentConsumables(client, result.rows[0].id, item.consumables);
+        await client.query('COMMIT');
+        const configs = await fetchInstrumentConfigs();
+        res.status(201).json(configs.find(config => config.id === result.rows[0].id));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('POST /api/instrument-management/configs error:', err);
+        res.status(500).json({ error: '新增儀器管理設定失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+app.put('/api/instrument-management/configs/:id', async (req, res) => {
+    const parsed = validateInstrumentConfigPayload(req.body || {});
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const item = parsed.value;
+        const result = await client.query(
+            `UPDATE instrument_management_configs
+             SET water_type = $1, test_item_key = $2, instrument_item_key = $3, note = $4, sort_order = $5, updated_at = NOW()
+             WHERE id = $6 RETURNING *`,
+            [item.waterType, item.testItemKey || null, item.instrumentItemKey || null, item.note, item.sortOrder, req.params.id]
+        );
+        if (result.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: '找不到儀器管理設定' });
+        }
+        await replaceInstrumentConsumables(client, req.params.id, item.consumables);
+        await client.query('COMMIT');
+        const configs = await fetchInstrumentConfigs();
+        res.json(configs.find(config => config.id === req.params.id));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`PUT /api/instrument-management/configs/${req.params.id} error:`, err);
+        res.status(500).json({ error: '更新儀器管理設定失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/instrument-management/configs/:id', async (req, res) => {
+    try {
+        const result = await pool.query('DELETE FROM instrument_management_configs WHERE id = $1 RETURNING id', [req.params.id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: '找不到儀器管理設定' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error(`DELETE /api/instrument-management/configs/${req.params.id} error:`, err);
+        res.status(500).json({ error: '刪除儀器管理設定失敗', details: err.message });
+    }
+});
+
+app.get('/api/instrument-management/openings', async (_req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM instrument_consumable_openings ORDER BY opened_date DESC, created_at DESC');
+        res.json(result.rows.map(toOpeningDto));
+    } catch (err) {
+        console.error('GET /api/instrument-management/openings error:', err);
+        res.status(500).json({ error: '取得耗材開封紀錄失敗', details: err.message });
+    }
+});
+
+app.post('/api/instrument-management/openings', async (req, res) => {
+    const openedDate = req.body?.openedDate || getTaipeiDateString();
+    const createdBy = getAuthorName(req);
+    let configId = req.body?.configId || null;
+    let consumableId = req.body?.consumableId || null;
+    let consumableItemKey = req.body?.consumableItemKey || '';
+    let shelfLifeDays = req.body?.shelfLifeDays;
+
+    try {
+        if (consumableId) {
+            const lookup = await pool.query(
+                `SELECT c.config_id, c.consumable_item_key, c.shelf_life_days
+                 FROM instrument_management_consumables c
+                 WHERE c.id = $1`,
+                [consumableId]
+            );
+            if (lookup.rows.length === 0) return res.status(404).json({ error: '找不到耗材設定' });
+            configId = configId || lookup.rows[0].config_id;
+            consumableItemKey = consumableItemKey || lookup.rows[0].consumable_item_key;
+            shelfLifeDays = shelfLifeDays ?? lookup.rows[0].shelf_life_days;
+        }
+
+        if (!consumableItemKey) return res.status(400).json({ error: '缺少耗材物料' });
+        const expiresDate = req.body?.expiresDate || (shelfLifeDays === null || shelfLifeDays === undefined || shelfLifeDays === ''
+            ? null
+            : addDaysToDateString(openedDate, Number(shelfLifeDays)));
+
+        const result = await pool.query(
+            `INSERT INTO instrument_consumable_openings
+             (config_id, consumable_id, consumable_item_key, opened_date, expires_date, status, created_by)
+             VALUES ($1, $2, $3, $4, $5, 'OPEN', $6) RETURNING *`,
+            [configId, consumableId, consumableItemKey, openedDate, expiresDate, createdBy]
+        );
+        res.status(201).json(toOpeningDto(result.rows[0]));
+    } catch (err) {
+        console.error('POST /api/instrument-management/openings error:', err);
+        res.status(500).json({ error: '新增耗材開封紀錄失敗', details: err.message });
+    }
+});
+
+app.patch('/api/instrument-management/openings/:id', async (req, res) => {
+    try {
+        const current = await pool.query('SELECT * FROM instrument_consumable_openings WHERE id = $1', [req.params.id]);
+        if (current.rows.length === 0) return res.status(404).json({ error: '找不到耗材開封紀錄' });
+        const row = current.rows[0];
+        const result = await pool.query(
+            `UPDATE instrument_consumable_openings
+             SET status = $1, adjusted_inventory = $2, inventory_adjust_log_id = $3, updated_at = NOW()
+             WHERE id = $4 RETURNING *`,
+            [
+                req.body?.status || row.status,
+                req.body?.adjustedInventory ?? req.body?.adjusted_inventory ?? row.adjusted_inventory,
+                req.body?.inventoryAdjustLogId ?? req.body?.inventory_adjust_log_id ?? row.inventory_adjust_log_id,
+                req.params.id
+            ]
+        );
+        res.json(toOpeningDto(result.rows[0]));
+    } catch (err) {
+        console.error(`PATCH /api/instrument-management/openings/${req.params.id} error:`, err);
+        res.status(500).json({ error: '更新耗材開封紀錄失敗', details: err.message });
+    }
+});
+
+app.post('/api/instrument-management/inventory-adjust', async (req, res) => {
+    try {
+        const result = await callLiteInventoryApi(req, '/inventory/adjust', {
+            method: 'POST',
+            body: {
+                itemKey: req.body?.itemKey,
+                diff: req.body?.diff,
+                note: req.body?.note || 'WTCA 儀器管理庫存調整',
+                source: 'WTCA_INSTRUMENT_MANAGEMENT',
+                refId: req.body?.refId
+            }
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('POST /api/instrument-management/inventory-adjust error:', err.message);
+        res.status(err.status || 500).json(err.payload || { error: '調整 LiteInventory 庫存失敗', message: err.message });
+    }
+});
+
+const fetchLiteInventoryItemsForServer = async () => {
+    const baseUrl = (process.env.LITEINVENTORY_API_BASE_URL || 'http://10.122.51.61/LiteInventory/api').replace(/\/$/, '');
+    const response = await fetch(`${baseUrl}/inventory`);
+    if (!response.ok) return [];
+    const items = await response.json();
+    return Array.isArray(items) ? items.map(normalizeInventoryItem) : [];
+};
+
+const sendInstrumentExpiryNotifications = async () => {
+    const subscriptionId = process.env.PIMCP_INSTRUMENT_EXPIRY_SUBSCRIPTION_ID
+        ? parseInt(process.env.PIMCP_INSTRUMENT_EXPIRY_SUBSCRIPTION_ID, 10)
+        : null;
+    if (!subscriptionId) {
+        return { sent: false, reason: 'missing_subscription', count: 0 };
+    }
+
+    const today = getTaipeiDateString();
+    const dueRes = await pool.query(
+        `SELECT o.*, c.water_type
+         FROM instrument_consumable_openings o
+         LEFT JOIN instrument_management_configs c ON c.id = o.config_id
+         WHERE o.status = 'OPEN'
+           AND o.expires_date = $1
+           AND NOT EXISTS (
+               SELECT 1 FROM instrument_consumable_notifications n
+               WHERE n.opening_id = o.id AND n.notify_date = $1
+           )
+         ORDER BY o.expires_date, o.created_at`,
+        [today]
+    );
+
+    if (dueRes.rows.length === 0) return { sent: false, reason: 'no_due_items', count: 0 };
+
+    const inventoryItems = await fetchLiteInventoryItemsForServer();
+    const itemMap = new Map(inventoryItems.map(item => [item.key, item]));
+    const lines = dueRes.rows.map(row => {
+        const item = itemMap.get(row.consumable_item_key);
+        const waterType = row.water_type === 'CW' ? '冷卻水' : row.water_type === 'BW' ? '鍋爐水' : '未分類';
+        return `- ${waterType}｜${item?.name || row.consumable_item_key}，開封日 ${toOpeningDto(row).openedDate}`;
+    });
+
+    const PIMCP_URL = process.env.PIMCP_API_URL || 'http://localhost:3011';
+    const response = await fetch(`${PIMCP_URL}/api/notifications/external-api`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            subscriptionId,
+            title: 'WTCA 儀器耗材到期提醒',
+            message: `${today} 有 ${dueRes.rows.length} 筆儀器耗材已到期：\n${lines.join('\n')}`,
+            status: 'warning'
+        })
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`PIMCP notification failed: ${response.status} ${text}`);
+    }
+
+    for (const row of dueRes.rows) {
+        await pool.query(
+            `INSERT INTO instrument_consumable_notifications (opening_id, notify_date, notification_key)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (notification_key) DO NOTHING`,
+            [row.id, today, `${row.id}:${today}`]
+        );
+    }
+
+    return { sent: true, count: dueRes.rows.length, date: today };
+};
+
+app.post('/api/instrument-management/expiry-check', async (_req, res) => {
+    try {
+        res.json(await sendInstrumentExpiryNotifications());
+    } catch (err) {
+        console.error('POST /api/instrument-management/expiry-check error:', err);
+        res.status(500).json({ error: '儀器耗材到期檢查失敗', details: err.message });
+    }
+});
+
 // 取得當前登入者是否為網站管理者 (對接 PIMCP SSO)
 app.get('/api/manual-water-quality/is-admin', async (req, res) => {
     try {
@@ -3379,6 +3913,17 @@ app.get('/api/daily-alerts', async (req, res) => {
         res.status(500).json({ success: false, error: err.message });
     }
 });
+
+const instrumentExpiryTimer = setInterval(() => {
+    sendInstrumentExpiryNotifications()
+        .then(result => {
+            if (result.sent) {
+                console.log(`[Instrument Expiry] 已推送 ${result.count} 筆到期提醒`);
+            }
+        })
+        .catch(err => console.error('[Instrument Expiry] 到期提醒檢查失敗:', err.message));
+}, 60 * 60 * 1000);
+instrumentExpiryTimer.unref?.();
 
 // 啟動伺服器
 app.listen(PORT, '0.0.0.0', () => {
