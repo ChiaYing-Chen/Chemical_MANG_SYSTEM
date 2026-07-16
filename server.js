@@ -218,6 +218,13 @@ const getLiteInventoryApiBaseUrl = (req) => {
 
 const buildLiteInventoryHeaders = (req) => {
     const headers = { 'Content-Type': 'application/json' };
+    const userId = req.headers['x-user-id'];
+    if (userId) {
+        const normalizedUser = Array.isArray(userId) ? userId[0] : String(userId);
+        headers['x-remote-user'] = normalizedUser;
+        headers['x-auth-user'] = normalizedUser;
+    }
+
     const passthroughHeaders = [
         'x-remote-user',
         'x-auth-user',
@@ -230,7 +237,7 @@ const buildLiteInventoryHeaders = (req) => {
 
     for (const name of passthroughHeaders) {
         const value = req.headers[name];
-        if (value) headers[name] = Array.isArray(value) ? value[0] : value;
+        if (value && !headers[name]) headers[name] = Array.isArray(value) ? value[0] : value;
     }
 
     if (!headers['x-remote-user']) {

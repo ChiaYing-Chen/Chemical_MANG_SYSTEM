@@ -406,11 +406,20 @@ const readErrorMessage = async (response: Response, fallback: string): Promise<s
     }
 };
 
+const getUnifiedUserHeaders = (): HeadersInit => {
+    const userId =
+        localStorage.getItem('unified_user_name') ||
+        localStorage.getItem('pages_manual_user') ||
+        localStorage.getItem('appUserName') ||
+        '';
+    return userId ? { 'X-User-Id': userId } : {};
+};
+
 export const fetchInstrumentInventoryItems = async (query?: string): Promise<LiteInventoryItem[]> => {
     const params = new URLSearchParams();
     if (query) params.set('q', query);
     const url = `${API_BASE_URL}/instrument-management/inventory-items${params.toString() ? `?${params.toString()}` : ''}`;
-    const response = await fetch(url);
+    const response = await fetch(url, { headers: getUnifiedUserHeaders() });
     if (!response.ok) throw new Error(await readErrorMessage(response, '取得庫存物料失敗'));
     return await response.json();
 };
@@ -488,7 +497,7 @@ export const adjustInstrumentInventory = async (payload: {
 }): Promise<any> => {
     const response = await fetch(`${API_BASE_URL}/instrument-management/inventory-adjust`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getUnifiedUserHeaders() },
         body: JSON.stringify(payload)
     });
     if (!response.ok) throw new Error(await readErrorMessage(response, '調整庫存失敗'));
