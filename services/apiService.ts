@@ -412,7 +412,9 @@ const getUnifiedUserHeaders = (): HeadersInit => {
         localStorage.getItem('pages_manual_user') ||
         localStorage.getItem('appUserName') ||
         '';
-    return userId ? { 'X-User-Id': userId } : {};
+    // Fetch headers can only carry ISO-8859-1 compatible values. The unified header may
+    // store a Chinese display name, which is not a permission identifier and breaks fetch.
+    return userId && /^[\x20-\x7E]+$/.test(userId) ? { 'X-User-Id': userId } : {};
 };
 
 export const fetchInstrumentInventoryItems = async (query?: string): Promise<LiteInventoryItem[]> => {
