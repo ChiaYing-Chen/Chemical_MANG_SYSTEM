@@ -2672,7 +2672,7 @@ const validateInstrumentConfigPayload = (payload) => {
     }
 
     if (!testItemKey && !instrumentItemKey && normalizedConsumables.length === 0) {
-        return { error: '至少需設定測試項目、手持儀器或耗材其中一項' };
+        return { error: '至少需設定檢驗項目、手持儀器或耗材其中一項' };
     }
 
     if (instrumentItemKey && !normalizedConsumables.some(item => item.usageType === 'calibration')) {

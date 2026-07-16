@@ -226,7 +226,7 @@ const InstrumentManagementView: React.FC = () => {
     const validateConfig = (config: InstrumentManagementConfig) => {
         const validConsumables = config.consumables.filter(item => item.consumableItemKey);
         if (!config.testItemKey && !config.instrumentItemKey && validConsumables.length === 0) {
-            return '至少需設定測試項目、手持儀器或耗材其中一項';
+            return '至少需設定檢驗項目、手持儀器或耗材其中一項';
         }
         if (config.instrumentItemKey && !validConsumables.some(item => item.usageType === 'calibration')) {
             return '有設定手持儀器時，必須設定至少一項校正耗材';
@@ -348,7 +348,7 @@ const InstrumentManagementView: React.FC = () => {
                     <table className="min-w-[1120px] w-full border-collapse text-left text-sm">
                         <thead>
                             <tr className="border-b border-slate-200 bg-slate-50 text-xs font-bold text-slate-500">
-                                <th className="w-[18%] px-4 py-3">測試項目</th>
+                                <th className="w-[18%] px-4 py-3">檢驗項目</th>
                                 <th className="w-[18%] px-4 py-3">手持儀器</th>
                                 <th className="w-[34%] px-4 py-3">對應耗材</th>
                                 <th className="w-[18%] px-4 py-3">備註</th>
@@ -364,13 +364,14 @@ const InstrumentManagementView: React.FC = () => {
                                 <tr key={config.id || `new-${index}`} className="align-top">
                                     <td className="px-4 py-3">
                                         <div className="space-y-2">
-                                            <InventoryPicker
+                                            <input
+                                                type="text"
                                                 value={config.testItemKey}
-                                                items={items}
-                                                itemMap={itemMap}
-                                                onChange={key => updateConfig(index, { testItemKey: key })}
+                                                onChange={event => updateConfig(index, { testItemKey: event.target.value })}
+                                                placeholder="例如：pH、電導度、餘氯"
+                                                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-700 outline-none transition focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
                                             />
-                                            <ItemSummary item={itemMap.get(config.testItemKey)} />
+                                            <span className="block text-xs text-slate-400">對應手動輸入欄位</span>
                                         </div>
                                     </td>
                                     <td className="px-4 py-3">
@@ -497,7 +498,7 @@ const InstrumentManagementView: React.FC = () => {
                     </div>
                     <div>
                         <h1 className="text-2xl font-bold text-slate-800">儀器管理</h1>
-                        <p className="text-sm text-slate-500">手持儀器、測試項目與耗材開封期限管理</p>
+                        <p className="text-sm text-slate-500">手持儀器、檢驗項目與耗材開封期限管理</p>
                     </div>
                 </div>
                 <button

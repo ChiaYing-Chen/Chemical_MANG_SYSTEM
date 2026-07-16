@@ -186,7 +186,7 @@ export interface InstrumentConsumableConfig {
 export interface InstrumentManagementConfig {
   id?: string;
   waterType: InstrumentWaterType;
-  testItemKey: string;
+  testItemKey: string; // 檢驗項目名稱，例如 pH、電導度、餘氯
   instrumentItemKey: string;
   note: string;
   sortOrder?: number;
