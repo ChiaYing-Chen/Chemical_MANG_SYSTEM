@@ -56,7 +56,7 @@ const pool = new Pool({
 
 const TAIPEI_OFFSET_MS = 8 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const LIKELY_REFILL_RISE_DAYS = 16;
+const LIKELY_REFILL_RISE_DAYS = 5;
 
 const normalizeTimestampToTaipeiDayStart = (ts) => {
     const d = new Date(Number(ts) + TAIPEI_OFFSET_MS);

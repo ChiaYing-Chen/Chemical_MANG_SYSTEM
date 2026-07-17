@@ -202,7 +202,7 @@ type LevelRiseWarning = {
 };
 
 const SUSPICIOUS_RISE_DAYS = 5;
-const LIKELY_REFILL_RISE_DAYS = 16;
+const LIKELY_REFILL_RISE_DAYS = 5;
 
 const getLocalDateKey = (timestamp: number): string => {
     const d = new Date(timestamp);

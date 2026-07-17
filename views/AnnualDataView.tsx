@@ -7,7 +7,7 @@ import { Icons } from '../components/Icons';
 
 const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#82ca9d', '#a4de6c', '#d0ed57', '#ffc658'];
 const DAY_MS = 24 * 60 * 60 * 1000;
-const LIKELY_REFILL_RISE_DAYS = 16;
+const LIKELY_REFILL_RISE_DAYS = 5;
 
 const normalizeTimestampToLocalDayStart = (timestamp?: number): number => {
     if (!timestamp) return 0;
