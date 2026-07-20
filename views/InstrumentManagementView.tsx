@@ -110,13 +110,21 @@ const getTestItemPalette = (testItemKey: string) => {
 };
 
 const emptyOpeningDraft = () => ({
-    consumableItemKey: '',
+    consumableId: '',
     useArea: useAreaOptions[0],
     openedDate: todayTaipei(),
     expiresDate: ''
 });
 
 type OpeningDraft = ReturnType<typeof emptyOpeningDraft>;
+
+type CalibrationConsumableOption = {
+    configId: string;
+    consumableId: string;
+    consumableItemKey: string;
+    waterType: InstrumentWaterType;
+    testItemKey: string;
+};
 
 const ItemSummary: React.FC<{ item?: LiteInventoryItem; placeholder?: string }> = ({ item, placeholder = '尚未設定' }) => {
     if (!item) return <span className={`block truncate text-slate-400 text-xs ${inventoryItemFieldClass}`}>{placeholder}</span>;
@@ -341,6 +349,26 @@ const InstrumentManagementView: React.FC = () => {
 
     const itemMap = useMemo(() => new Map(items.map(item => [item.key, item])), [items]);
 
+    const calibrationConsumableOptions = useMemo<CalibrationConsumableOption[]>(() => (
+        configs.flatMap(config => {
+            if (!config.id) return [];
+            return config.consumables
+                .filter(consumable => (
+                    consumable.usageType === 'calibration'
+                    && consumable.consumableItemKey
+                    && consumable.id
+                    && !consumable.id.startsWith('temp-')
+                ))
+                .map(consumable => ({
+                    configId: config.id as string,
+                    consumableId: consumable.id as string,
+                    consumableItemKey: consumable.consumableItemKey,
+                    waterType: config.waterType,
+                    testItemKey: config.testItemKey
+                }));
+        })
+    ), [configs]);
+
     const mergeInventoryItems = useCallback((newItems: LiteInventoryItem[]) => {
         if (newItems.length === 0) return;
         setItems(prev => {
@@ -529,8 +557,11 @@ const InstrumentManagementView: React.FC = () => {
     };
 
     const createOpeningRecord = async () => {
-        if (!openingDraft.consumableItemKey) {
-            setError('請先選擇開封耗材');
+        const selectedConsumable = calibrationConsumableOptions.find(
+            option => option.consumableId === openingDraft.consumableId
+        );
+        if (!selectedConsumable) {
+            setError('請先選擇已設定的校正耗材');
             return;
         }
 
@@ -538,7 +569,9 @@ const InstrumentManagementView: React.FC = () => {
         setError('');
         try {
             const opening = await createInstrumentOpening({
-                consumableItemKey: openingDraft.consumableItemKey,
+                configId: selectedConsumable.configId,
+                consumableId: selectedConsumable.consumableId,
+                consumableItemKey: selectedConsumable.consumableItemKey,
                 useArea: openingDraft.useArea,
                 openedDate: openingDraft.openedDate,
                 expiresDate: openingDraft.expiresDate || null
@@ -549,10 +582,10 @@ const InstrumentManagementView: React.FC = () => {
                 const diffText = window.prompt('請輸入庫存調整量，扣庫存請輸入負數', '-1');
                 if (diffText) {
                     const result = await adjustInstrumentInventory({
-                        itemKey: openingDraft.consumableItemKey,
+                        itemKey: selectedConsumable.consumableItemKey,
                         diff: Number(diffText),
                         refId: opening.id,
-                        note: 'WTCA 儀器管理耗材開封'
+                        note: 'WTCA 儀器管理校正耗材開封'
                     });
                     const updated = await updateInstrumentOpening(opening.id, {
                         adjustedInventory: true,
@@ -563,9 +596,9 @@ const InstrumentManagementView: React.FC = () => {
                 }
             }
             setOpeningDraft(emptyOpeningDraft());
-            setMessage('耗材開封紀錄已建立');
+            setMessage('校正耗材開封紀錄已建立');
         } catch (err: any) {
-            setError(err.message || '開封耗材失敗');
+            setError(err.message || '開封校正耗材失敗');
         } finally {
             setCreatingOpening(false);
         }
@@ -813,21 +846,42 @@ const InstrumentManagementView: React.FC = () => {
 
                     <section className="rounded-lg border border-slate-200 bg-white shadow-sm">
                         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-                            <h2 className="text-base font-bold text-slate-800">耗材開封紀錄</h2>
+                            <h2 className="text-base font-bold text-slate-800">校正耗材開封紀錄</h2>
                             <span className="text-xs text-slate-500">共 {dueSoonOpenings.length} 筆未結案</span>
                         </div>
                         <div className="border-b border-slate-100 px-5 py-4">
                             <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[18em_12em_10em_10em_max-content] xl:items-start">
                                     <div className="space-y-2">
-                                        <label className="block text-xs font-bold text-slate-500">耗材</label>
-                                        <InventoryPicker
-                                            value={openingDraft.consumableItemKey}
-                                            items={items}
-                                            itemMap={itemMap}
-                                            onItemsLoaded={mergeInventoryItems}
-                                            onChange={key => updateOpeningDraft({ consumableItemKey: key })}
-                                        />
+                                        <label className="block text-xs font-bold text-slate-500">校正耗材</label>
+                                        <select
+                                            value={openingDraft.consumableId}
+                                            onChange={event => updateOpeningDraft({ consumableId: event.target.value })}
+                                            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                                        >
+                                            <option value="">
+                                                {calibrationConsumableOptions.length > 0 ? '請選擇校正耗材' : '尚未設定校正耗材'}
+                                            </option>
+                                            {(['CW', 'BW'] as InstrumentWaterType[]).map(waterType => {
+                                                const options = calibrationConsumableOptions.filter(option => option.waterType === waterType);
+                                                if (options.length === 0) return null;
+                                                return (
+                                                    <optgroup key={waterType} label={waterTypeMeta[waterType].label}>
+                                                        {options.map(option => {
+                                                            const item = itemMap.get(option.consumableItemKey);
+                                                            const itemName = item?.name || option.consumableItemKey;
+                                                            const testItem = option.testItemKey || '未命名檢驗項目';
+                                                            const inventory = item ? `（庫存 ${item.quantity}）` : '';
+                                                            return (
+                                                                <option key={option.consumableId} value={option.consumableId}>
+                                                                    {testItem}｜{itemName}{inventory}
+                                                                </option>
+                                                            );
+                                                        })}
+                                                    </optgroup>
+                                                );
+                                            })}
+                                        </select>
                                     </div>
                                     <div className="space-y-2">
                                         <label className="block text-xs font-bold text-slate-500">使用區域</label>
@@ -875,7 +929,7 @@ const InstrumentManagementView: React.FC = () => {
                             <table className="w-full text-left text-sm">
                                 <thead className="sticky top-0 bg-slate-50 text-xs font-bold text-slate-500">
                                     <tr>
-                                        <th className="px-4 py-3">耗材</th>
+                                        <th className="px-4 py-3">校正耗材</th>
                                         <th className="px-4 py-3">使用區域</th>
                                         <th className="px-4 py-3">開封日</th>
                                         <th className="px-4 py-3">到期日</th>
