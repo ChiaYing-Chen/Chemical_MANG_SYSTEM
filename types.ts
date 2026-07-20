@@ -198,8 +198,10 @@ export interface InstrumentConsumableOpening {
   configId?: string | null;
   consumableId?: string | null;
   consumableItemKey: string;
+  useArea?: string | null;
   openedDate: string;
   expiresDate?: string | null;
+  note?: string | null;
   status: 'OPEN' | 'CLOSED' | 'DISCARDED';
   adjustedInventory: boolean;
   inventoryAdjustLogId?: string | null;

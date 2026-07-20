@@ -1628,8 +1628,10 @@ const migrateDatabase = async () => {
                 config_id UUID REFERENCES instrument_management_configs(id) ON DELETE SET NULL,
                 consumable_id UUID REFERENCES instrument_management_consumables(id) ON DELETE SET NULL,
                 consumable_item_key TEXT NOT NULL,
+                use_area TEXT,
                 opened_date DATE NOT NULL,
                 expires_date DATE,
+                note TEXT,
                 status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
                 adjusted_inventory BOOLEAN DEFAULT FALSE,
                 inventory_adjust_log_id TEXT,
@@ -1648,6 +1650,13 @@ const migrateDatabase = async () => {
             )
         `);
         await client.query(`
+            CREATE TABLE IF NOT EXISTS instrument_management_notes (
+                note_key TEXT PRIMARY KEY,
+                note TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await client.query(`
             CREATE INDEX IF NOT EXISTS idx_im_configs_water_type ON instrument_management_configs(water_type, sort_order)
         `);
         await client.query(`
@@ -1655,6 +1664,14 @@ const migrateDatabase = async () => {
         `);
         await client.query(`
             CREATE INDEX IF NOT EXISTS idx_im_openings_expiry ON instrument_consumable_openings(expires_date, status)
+        `);
+        await client.query(`
+            ALTER TABLE instrument_consumable_openings
+            ADD COLUMN IF NOT EXISTS use_area TEXT
+        `);
+        await client.query(`
+            ALTER TABLE instrument_consumable_openings
+            ADD COLUMN IF NOT EXISTS note TEXT
         `);
 
         await client.query('COMMIT');
@@ -2628,8 +2645,10 @@ const toOpeningDto = (row) => ({
     configId: row.config_id,
     consumableId: row.consumable_id,
     consumableItemKey: row.consumable_item_key,
+    useArea: row.use_area || '',
     openedDate: typeof row.opened_date === 'string' ? row.opened_date.slice(0, 10) : getTaipeiDateString(new Date(row.opened_date)),
     expiresDate: row.expires_date ? (typeof row.expires_date === 'string' ? row.expires_date.slice(0, 10) : getTaipeiDateString(new Date(row.expires_date))) : null,
+    note: row.note || '',
     status: row.status,
     adjustedInventory: Boolean(row.adjusted_inventory),
     inventoryAdjustLogId: row.inventory_adjust_log_id,
@@ -2673,10 +2692,6 @@ const validateInstrumentConfigPayload = (payload) => {
 
     if (!testItemKey && !instrumentItemKey && normalizedConsumables.length === 0) {
         return { error: '至少需設定檢驗項目、手持儀器或耗材其中一項' };
-    }
-
-    if (instrumentItemKey && !normalizedConsumables.some(item => item.usageType === 'calibration')) {
-        return { error: '有設定手持儀器時，必須設定至少一項校正耗材' };
     }
 
     return {
@@ -2822,15 +2837,47 @@ app.get('/api/instrument-management/openings', async (_req, res) => {
     }
 });
 
+app.get('/api/instrument-management/notes/:key', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT note FROM instrument_management_notes WHERE note_key = $1', [req.params.key]);
+        res.json({ key: req.params.key, note: result.rows[0]?.note || '' });
+    } catch (err) {
+        console.error(`GET /api/instrument-management/notes/${req.params.key} error:`, err);
+        res.status(500).json({ error: '取得儀器管理筆記失敗', details: err.message });
+    }
+});
+
+app.put('/api/instrument-management/notes/:key', async (req, res) => {
+    try {
+        const note = req.body?.note || '';
+        const result = await pool.query(
+            `INSERT INTO instrument_management_notes (note_key, note, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (note_key)
+             DO UPDATE SET note = EXCLUDED.note, updated_at = NOW()
+             RETURNING note_key, note, updated_at`,
+            [req.params.key, note]
+        );
+        res.json({ key: result.rows[0].note_key, note: result.rows[0].note, updatedAt: result.rows[0].updated_at });
+    } catch (err) {
+        console.error(`PUT /api/instrument-management/notes/${req.params.key} error:`, err);
+        res.status(500).json({ error: '更新儀器管理筆記失敗', details: err.message });
+    }
+});
+
 app.post('/api/instrument-management/openings', async (req, res) => {
     const openedDate = req.body?.openedDate || getTaipeiDateString();
+    const useArea = req.body?.useArea || req.body?.use_area || '';
     const createdBy = getAuthorName(req);
     let configId = req.body?.configId || null;
     let consumableId = req.body?.consumableId || null;
     let consumableItemKey = req.body?.consumableItemKey || '';
     let shelfLifeDays = req.body?.shelfLifeDays;
+    const note = req.body?.note || '';
+    const validUseAreas = ['CT-1取樣站', 'CT-2取樣站', '一階鍋爐取樣站', '二階鍋爐取樣站'];
 
     try {
+        if (!validUseAreas.includes(useArea)) return res.status(400).json({ error: '使用區域不正確' });
         if (consumableId) {
             const lookup = await pool.query(
                 `SELECT c.config_id, c.consumable_item_key, c.shelf_life_days
@@ -2845,15 +2892,15 @@ app.post('/api/instrument-management/openings', async (req, res) => {
         }
 
         if (!consumableItemKey) return res.status(400).json({ error: '缺少耗材物料' });
-        const expiresDate = req.body?.expiresDate || (shelfLifeDays === null || shelfLifeDays === undefined || shelfLifeDays === ''
+        const expiresDate = req.body?.expiresDate !== undefined ? (req.body.expiresDate || null) : (shelfLifeDays === null || shelfLifeDays === undefined || shelfLifeDays === ''
             ? null
             : addDaysToDateString(openedDate, Number(shelfLifeDays)));
 
         const result = await pool.query(
             `INSERT INTO instrument_consumable_openings
-             (config_id, consumable_id, consumable_item_key, opened_date, expires_date, status, created_by)
-             VALUES ($1, $2, $3, $4, $5, 'OPEN', $6) RETURNING *`,
-            [configId, consumableId, consumableItemKey, openedDate, expiresDate, createdBy]
+             (config_id, consumable_id, consumable_item_key, use_area, opened_date, expires_date, note, status, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'OPEN', $8) RETURNING *`,
+            [configId, consumableId, consumableItemKey, useArea, openedDate, expiresDate, note, createdBy]
         );
         res.status(201).json(toOpeningDto(result.rows[0]));
     } catch (err) {
@@ -2869,12 +2916,16 @@ app.patch('/api/instrument-management/openings/:id', async (req, res) => {
         const row = current.rows[0];
         const result = await pool.query(
             `UPDATE instrument_consumable_openings
-             SET status = $1, adjusted_inventory = $2, inventory_adjust_log_id = $3, updated_at = NOW()
-             WHERE id = $4 RETURNING *`,
+             SET status = $1, adjusted_inventory = $2, inventory_adjust_log_id = $3,
+                 opened_date = $4, expires_date = $5, note = $6, updated_at = NOW()
+             WHERE id = $7 RETURNING *`,
             [
                 req.body?.status || row.status,
                 req.body?.adjustedInventory ?? req.body?.adjusted_inventory ?? row.adjusted_inventory,
                 req.body?.inventoryAdjustLogId ?? req.body?.inventory_adjust_log_id ?? row.inventory_adjust_log_id,
+                req.body?.openedDate ?? req.body?.opened_date ?? row.opened_date,
+                req.body?.expiresDate !== undefined ? (req.body.expiresDate || null) : (req.body?.expires_date !== undefined ? (req.body.expires_date || null) : row.expires_date),
+                req.body?.note ?? row.note,
                 req.params.id
             ]
         );
@@ -2942,7 +2993,8 @@ const sendInstrumentExpiryNotifications = async () => {
     const lines = dueRes.rows.map(row => {
         const item = itemMap.get(row.consumable_item_key);
         const waterType = row.water_type === 'CW' ? '冷卻水' : row.water_type === 'BW' ? '鍋爐水' : '未分類';
-        return `- ${waterType}｜${item?.name || row.consumable_item_key}，開封日 ${toOpeningDto(row).openedDate}`;
+        const area = row.use_area ? `｜${row.use_area}` : '';
+        return `- ${waterType}${area}｜${item?.name || row.consumable_item_key}，開封日 ${toOpeningDto(row).openedDate}`;
     });
 
     const PIMCP_URL = process.env.PIMCP_API_URL || 'http://localhost:3011';

@@ -465,11 +465,32 @@ export const fetchInstrumentOpenings = async (): Promise<InstrumentConsumableOpe
     return await response.json();
 };
 
+export const fetchInstrumentNote = async (key: string): Promise<string> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/notes/${encodeURIComponent(key)}`);
+    if (!response.ok) throw new Error(await readErrorMessage(response, '取得儀器管理筆記失敗'));
+    const data = await response.json();
+    return data.note || '';
+};
+
+export const updateInstrumentNote = async (key: string, note: string): Promise<string> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/notes/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note })
+    });
+    if (!response.ok) throw new Error(await readErrorMessage(response, '更新儀器管理筆記失敗'));
+    const data = await response.json();
+    return data.note || '';
+};
+
 export const createInstrumentOpening = async (opening: {
     configId?: string;
     consumableId?: string;
     consumableItemKey: string;
+    useArea?: string;
     openedDate: string;
+    expiresDate?: string | null;
+    note?: string;
     shelfLifeDays?: number | null;
 }): Promise<InstrumentConsumableOpening> => {
     const response = await fetch(`${API_BASE_URL}/instrument-management/openings`, {
