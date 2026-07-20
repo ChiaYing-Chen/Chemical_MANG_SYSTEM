@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
     adjustInstrumentInventory,
     createInstrumentConfig,
@@ -74,27 +75,149 @@ const InventoryPicker: React.FC<{
     items: LiteInventoryItem[];
     itemMap: Map<string, LiteInventoryItem>;
     onChange: (key: string) => void;
+    onItemsLoaded: (items: LiteInventoryItem[]) => void;
     placeholder?: string;
-}> = ({ value, items, itemMap, onChange, placeholder = '搜尋品名、料號或儲位' }) => {
+}> = ({ value, items, itemMap, onChange, onItemsLoaded, placeholder = '搜尋品名、料號或儲位' }) => {
     const [term, setTerm] = useState('');
     const [open, setOpen] = useState(false);
+    const [options, setOptions] = useState<LiteInventoryItem[]>([]);
+    const [searching, setSearching] = useState(false);
+    const [dropdownStyle, setDropdownStyle] = useState<React.CSSProperties>({});
+    const wrapperRef = useRef<HTMLDivElement | null>(null);
+    const dropdownRef = useRef<HTMLDivElement | null>(null);
     const selected = value ? itemMap.get(value) : undefined;
 
-    const filtered = useMemo(() => {
-        const q = term.trim().toLowerCase();
-        if (!q) return items.slice(0, 20);
-        return items
-            .filter(item => [item.name, item.partNo, item.binCode, item.key].some(v => String(v || '').toLowerCase().includes(q)))
-            .slice(0, 30);
-    }, [items, term]);
+    const updateDropdownPosition = () => {
+        const rect = wrapperRef.current?.getBoundingClientRect();
+        if (!rect) return;
+        const width = Math.min(Math.max(rect.width, 460), window.innerWidth - 24);
+        const left = Math.min(Math.max(rect.left, 12), window.innerWidth - width - 12);
+        const spaceBelow = window.innerHeight - rect.bottom - 12;
+        const maxHeight = Math.max(220, Math.min(360, spaceBelow > 220 ? spaceBelow : rect.top - 18));
+        const top = spaceBelow > 220 ? rect.bottom + 6 : Math.max(12, rect.top - maxHeight - 6);
+
+        setDropdownStyle({
+            position: 'fixed',
+            top,
+            left,
+            width,
+            maxHeight,
+            zIndex: 10000
+        });
+    };
+
+    useEffect(() => {
+        if (!open) return;
+        updateDropdownPosition();
+        window.addEventListener('resize', updateDropdownPosition);
+        window.addEventListener('scroll', updateDropdownPosition, true);
+        return () => {
+            window.removeEventListener('resize', updateDropdownPosition);
+            window.removeEventListener('scroll', updateDropdownPosition, true);
+        };
+    }, [open]);
+
+    useEffect(() => {
+        if (!open) return;
+        const handlePointerDown = (event: PointerEvent) => {
+            const target = event.target as Node;
+            if (wrapperRef.current?.contains(target) || dropdownRef.current?.contains(target)) return;
+            setOpen(false);
+            setTerm('');
+        };
+        document.addEventListener('pointerdown', handlePointerDown);
+        return () => document.removeEventListener('pointerdown', handlePointerDown);
+    }, [open]);
+
+    useEffect(() => {
+        if (!open) return;
+        const query = term.trim();
+
+        if (!query) {
+            setOptions(items.slice(0, 20));
+            return;
+        }
+
+        let active = true;
+        setSearching(true);
+        const timer = window.setTimeout(async () => {
+            try {
+                const result = await fetchInstrumentInventoryItems(query);
+                if (!active) return;
+                setOptions(result.slice(0, 50));
+                onItemsLoaded(result);
+            } catch {
+                if (active) setOptions([]);
+            } finally {
+                if (active) setSearching(false);
+            }
+        }, 250);
+
+        return () => {
+            active = false;
+            window.clearTimeout(timer);
+        };
+    }, [open, term, onItemsLoaded]);
+
+    useEffect(() => {
+        if (open) updateDropdownPosition();
+    }, [options, open]);
+
+    const dropdown = open ? createPortal(
+        <div
+            ref={dropdownRef}
+            className="overflow-auto rounded-lg border border-slate-200 bg-white shadow-2xl"
+            style={dropdownStyle}
+            onMouseDown={event => event.preventDefault()}
+        >
+            {searching ? (
+                <div className="px-3 py-4 text-center text-xs text-slate-400">搜尋中...</div>
+            ) : options.length === 0 ? (
+                <div className="px-3 py-4 text-center text-xs text-slate-400">找不到符合的物料</div>
+            ) : (
+                options.map(item => (
+                    <button
+                        key={item.key}
+                        type="button"
+                        className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left hover:bg-slate-50"
+                        title={itemTooltip(item)}
+                        onClick={() => {
+                            onItemsLoaded([item]);
+                            onChange(item.key);
+                            setOpen(false);
+                            setTerm('');
+                        }}
+                    >
+                        <span className="min-w-0">
+                            <span className="block truncate text-xs font-semibold text-slate-800">{item.name || item.key}</span>
+                            <span className="block truncate text-[11px] text-slate-500">{item.partNo || '-'} / {item.binCode || '-'}</span>
+                        </span>
+                        <span className="shrink-0 rounded bg-slate-100 px-2 py-1 text-xs font-bold text-slate-700">{item.quantity}</span>
+                    </button>
+                ))
+            )}
+            <button
+                type="button"
+                className="sticky bottom-0 w-full border-t border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-500 hover:text-slate-800"
+                onClick={() => {
+                    setOpen(false);
+                    setTerm('');
+                }}
+            >
+                關閉
+            </button>
+        </div>,
+        document.body
+    ) : null;
 
     return (
-        <div className="relative min-w-[14rem]">
+        <div ref={wrapperRef} className="relative min-w-[14rem]">
             <input
                 value={open ? term : selected ? `${selected.name || selected.key} / ${selected.quantity}` : ''}
                 onFocus={() => {
                     setOpen(true);
                     setTerm('');
+                    setOptions(items.slice(0, 20));
                 }}
                 onChange={event => {
                     setTerm(event.target.value);
@@ -114,43 +237,7 @@ const InventoryPicker: React.FC<{
                     X
                 </button>
             )}
-            {open && (
-                <div
-                    className="absolute z-30 mt-1 max-h-72 w-[24rem] overflow-auto rounded-lg border border-slate-200 bg-white shadow-lg"
-                    onMouseDown={event => event.preventDefault()}
-                >
-                    {filtered.length === 0 ? (
-                        <div className="px-3 py-4 text-center text-xs text-slate-400">找不到符合的物料</div>
-                    ) : (
-                        filtered.map(item => (
-                            <button
-                                key={item.key}
-                                type="button"
-                                className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left hover:bg-slate-50"
-                                title={itemTooltip(item)}
-                                onClick={() => {
-                                    onChange(item.key);
-                                    setOpen(false);
-                                    setTerm('');
-                                }}
-                            >
-                                <span className="min-w-0">
-                                    <span className="block truncate text-xs font-semibold text-slate-800">{item.name || item.key}</span>
-                                    <span className="block truncate text-[11px] text-slate-500">{item.partNo || '-'} / {item.binCode || '-'}</span>
-                                </span>
-                                <span className="shrink-0 rounded bg-slate-100 px-2 py-1 text-xs font-bold text-slate-700">{item.quantity}</span>
-                            </button>
-                        ))
-                    )}
-                    <button
-                        type="button"
-                        className="sticky bottom-0 w-full border-t border-slate-100 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-500 hover:text-slate-800"
-                        onClick={() => setOpen(false)}
-                    >
-                        關閉
-                    </button>
-                </div>
-            )}
+            {dropdown}
         </div>
     );
 };
@@ -165,6 +252,15 @@ const InstrumentManagementView: React.FC = () => {
     const [error, setError] = useState<string>('');
 
     const itemMap = useMemo(() => new Map(items.map(item => [item.key, item])), [items]);
+
+    const mergeInventoryItems = useCallback((newItems: LiteInventoryItem[]) => {
+        if (newItems.length === 0) return;
+        setItems(prev => {
+            const merged = new Map(prev.map(item => [item.key, item]));
+            newItems.forEach(item => merged.set(item.key, item));
+            return Array.from(merged.values());
+        });
+    }, []);
 
     const loadAll = async () => {
         setLoading(true);
@@ -380,6 +476,7 @@ const InstrumentManagementView: React.FC = () => {
                                                 value={config.instrumentItemKey}
                                                 items={items}
                                                 itemMap={itemMap}
+                                                onItemsLoaded={mergeInventoryItems}
                                                 onChange={key => updateConfig(index, { instrumentItemKey: key })}
                                             />
                                             <ItemSummary item={itemMap.get(config.instrumentItemKey)} />
@@ -395,6 +492,7 @@ const InstrumentManagementView: React.FC = () => {
                                                                 value={consumable.consumableItemKey}
                                                                 items={items}
                                                                 itemMap={itemMap}
+                                                                onItemsLoaded={mergeInventoryItems}
                                                                 onChange={key => updateConsumable(index, cIndex, { consumableItemKey: key })}
                                                             />
                                                             <ItemSummary item={itemMap.get(consumable.consumableItemKey)} />
