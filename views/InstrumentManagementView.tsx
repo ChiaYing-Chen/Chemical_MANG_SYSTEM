@@ -663,6 +663,7 @@ const InstrumentManagementView: React.FC = () => {
 
         setFinishingOpening(true);
         setError('');
+        let replacementCreated = false;
         try {
             const result = await finishInstrumentOpening(finishOpeningDraft.opening.id, {
                 createReplacement: true,
@@ -670,14 +671,46 @@ const InstrumentManagementView: React.FC = () => {
                 expiresDate: finishOpeningDraft.expiresDate
             });
             if (!result.closed || !result.replacement) throw new Error('伺服器未回傳完整的結案結果');
+            const replacement = result.replacement;
+            replacementCreated = true;
             setOpenings(prev => [
-                result.replacement as InstrumentConsumableOpening,
+                replacement,
                 ...prev.map(item => item.id === result.closed?.id ? result.closed : item)
             ]);
             setFinishOpeningDraft(null);
             setMessage('原紀錄已結案，新的耗材開封紀錄已建立');
+
+            if (window.confirm('新的耗材開封紀錄已建立，是否同步調整 LiteInventory 庫存？')) {
+                const diffText = window.prompt('請輸入庫存調整量，扣庫存請輸入負數', '-1');
+                if (diffText !== null && diffText.trim() !== '') {
+                    const diff = Number(diffText);
+                    if (!Number.isFinite(diff) || diff === 0) {
+                        setError('新紀錄已建立，但庫存調整量必須是非零數字');
+                        return;
+                    }
+                    const inventoryResult = await adjustInstrumentInventory({
+                        itemKey: replacement.consumableItemKey,
+                        diff,
+                        refId: replacement.id,
+                        note: 'WTCA 儀器管理校正耗材續開'
+                    });
+                    const updated = await updateInstrumentOpening(replacement.id, {
+                        adjustedInventory: true,
+                        inventoryAdjustLogId: inventoryResult.logId
+                    });
+                    setOpenings(prev => prev.map(item => item.id === updated.id ? updated : item));
+                    setMessage('原紀錄已結案，新紀錄與庫存調整已完成');
+                    await loadAll();
+                }
+            }
         } catch (err: any) {
-            setError(err.message || '建立新的耗材開封紀錄失敗');
+            if (replacementCreated) {
+                const inventoryError = `新紀錄已建立，但庫存調整失敗：${err.message || '未知錯誤'}`;
+                await loadAll().catch(() => undefined);
+                setError(inventoryError);
+            } else {
+                setError(err.message || '建立新的耗材開封紀錄失敗');
+            }
         } finally {
             setFinishingOpening(false);
         }
