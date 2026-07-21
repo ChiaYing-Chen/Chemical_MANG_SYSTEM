@@ -2936,6 +2936,88 @@ app.patch('/api/instrument-management/openings/:id', async (req, res) => {
     }
 });
 
+app.post('/api/instrument-management/openings/:id/finish', async (req, res) => {
+    if (typeof req.body?.createReplacement !== 'boolean') {
+        return res.status(400).json({ error: '請選擇是否建立新的耗材開封紀錄' });
+    }
+
+    const createReplacement = req.body?.createReplacement === true;
+    const openedDate = req.body?.openedDate;
+    const expiresDate = req.body?.expiresDate;
+    const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+    const isValidDate = (value) => {
+        if (!datePattern.test(value || '')) return false;
+        const parsed = new Date(`${value}T00:00:00Z`);
+        return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+    };
+
+    if (createReplacement) {
+        if (!isValidDate(openedDate) || !isValidDate(expiresDate)) {
+            return res.status(400).json({ error: '請選擇新的開封日與到期日' });
+        }
+        if (expiresDate < openedDate) {
+            return res.status(400).json({ error: '到期日不得早於開封日' });
+        }
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const current = await client.query(
+            'SELECT * FROM instrument_consumable_openings WHERE id = $1 FOR UPDATE',
+            [req.params.id]
+        );
+        if (current.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: '找不到耗材開封紀錄' });
+        }
+
+        const row = current.rows[0];
+        if (row.status !== 'OPEN') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: '此耗材開封紀錄已結案或刪除' });
+        }
+
+        if (!createReplacement) {
+            await client.query('DELETE FROM instrument_consumable_openings WHERE id = $1', [req.params.id]);
+            await client.query('COMMIT');
+            return res.json({ deletedId: req.params.id });
+        }
+
+        const closedResult = await client.query(
+            `UPDATE instrument_consumable_openings
+             SET status = 'CLOSED', updated_at = NOW()
+             WHERE id = $1 RETURNING *`,
+            [req.params.id]
+        );
+        const replacementResult = await client.query(
+            `INSERT INTO instrument_consumable_openings
+             (config_id, consumable_id, consumable_item_key, use_area, opened_date, expires_date, note, status, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, '', 'OPEN', $7) RETURNING *`,
+            [
+                row.config_id,
+                row.consumable_id,
+                row.consumable_item_key,
+                row.use_area,
+                openedDate,
+                expiresDate,
+                getAuthorName(req)
+            ]
+        );
+        await client.query('COMMIT');
+        res.json({
+            closed: toOpeningDto(closedResult.rows[0]),
+            replacement: toOpeningDto(replacementResult.rows[0])
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(`POST /api/instrument-management/openings/${req.params.id}/finish error:`, err);
+        res.status(500).json({ error: '結案耗材開封紀錄失敗', details: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 app.post('/api/instrument-management/inventory-adjust', async (req, res) => {
     try {
         const result = await callLiteInventoryApi(req, '/inventory/adjust', {

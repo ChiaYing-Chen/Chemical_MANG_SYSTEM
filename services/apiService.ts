@@ -512,6 +512,24 @@ export const updateInstrumentOpening = async (id: string, patch: Partial<Instrum
     return await response.json();
 };
 
+export const finishInstrumentOpening = async (id: string, payload: {
+    createReplacement: boolean;
+    openedDate?: string;
+    expiresDate?: string;
+}): Promise<{
+    deletedId?: string;
+    closed?: InstrumentConsumableOpening;
+    replacement?: InstrumentConsumableOpening;
+}> => {
+    const response = await fetch(`${API_BASE_URL}/instrument-management/openings/${id}/finish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getUnifiedUserHeaders() },
+        body: JSON.stringify(payload)
+    });
+    if (!response.ok) throw new Error(await readErrorMessage(response, '結案耗材開封紀錄失敗'));
+    return await response.json();
+};
+
 export const adjustInstrumentInventory = async (payload: {
     itemKey: string;
     diff: number;

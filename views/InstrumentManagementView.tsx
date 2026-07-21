@@ -9,6 +9,7 @@ import {
     fetchInstrumentInventoryItems,
     fetchInstrumentNote,
     fetchInstrumentOpenings,
+    finishInstrumentOpening,
     updateInstrumentConfig,
     updateInstrumentNote,
     updateInstrumentOpening
@@ -127,6 +128,13 @@ const emptyOpeningDraft = () => ({
 });
 
 type OpeningDraft = ReturnType<typeof emptyOpeningDraft>;
+
+type FinishOpeningDraft = {
+    opening: InstrumentConsumableOpening;
+    action: 'decision' | 'replace';
+    openedDate: string;
+    expiresDate: string;
+};
 
 type CalibrationConsumableOption = {
     configId: string;
@@ -350,6 +358,8 @@ const InstrumentManagementView: React.FC = () => {
     const [savingId, setSavingId] = useState<string | null>(null);
     const [creatingOpening, setCreatingOpening] = useState(false);
     const [openingDraft, setOpeningDraft] = useState<OpeningDraft>(emptyOpeningDraft);
+    const [finishOpeningDraft, setFinishOpeningDraft] = useState<FinishOpeningDraft | null>(null);
+    const [finishingOpening, setFinishingOpening] = useState(false);
     const [consumableNote, setConsumableNote] = useState('');
     const [consumableNoteDraft, setConsumableNoteDraft] = useState('');
     const [editingConsumableNote, setEditingConsumableNote] = useState(false);
@@ -611,6 +621,65 @@ const InstrumentManagementView: React.FC = () => {
             setError(err.message || '開封校正耗材失敗');
         } finally {
             setCreatingOpening(false);
+        }
+    };
+
+    const openFinishDialog = (opening: InstrumentConsumableOpening) => {
+        setError('');
+        setFinishOpeningDraft({
+            opening,
+            action: 'decision',
+            openedDate: todayTaipei(),
+            expiresDate: ''
+        });
+    };
+
+    const finishWithoutReplacement = async () => {
+        if (!finishOpeningDraft) return;
+        setFinishingOpening(true);
+        setError('');
+        try {
+            await finishInstrumentOpening(finishOpeningDraft.opening.id, { createReplacement: false });
+            setOpenings(prev => prev.filter(item => item.id !== finishOpeningDraft.opening.id));
+            setFinishOpeningDraft(null);
+            setMessage('耗材開封紀錄已刪除');
+        } catch (err: any) {
+            setError(err.message || '刪除耗材開封紀錄失敗');
+        } finally {
+            setFinishingOpening(false);
+        }
+    };
+
+    const finishWithReplacement = async () => {
+        if (!finishOpeningDraft) return;
+        if (!finishOpeningDraft.openedDate || !finishOpeningDraft.expiresDate) {
+            setError('請選擇新的開封日與到期日');
+            return;
+        }
+        if (finishOpeningDraft.expiresDate < finishOpeningDraft.openedDate) {
+            setError('到期日不得早於開封日');
+            return;
+        }
+
+        setFinishingOpening(true);
+        setError('');
+        try {
+            const result = await finishInstrumentOpening(finishOpeningDraft.opening.id, {
+                createReplacement: true,
+                openedDate: finishOpeningDraft.openedDate,
+                expiresDate: finishOpeningDraft.expiresDate
+            });
+            if (!result.closed || !result.replacement) throw new Error('伺服器未回傳完整的結案結果');
+            setOpenings(prev => [
+                result.replacement as InstrumentConsumableOpening,
+                ...prev.map(item => item.id === result.closed?.id ? result.closed : item)
+            ]);
+            setFinishOpeningDraft(null);
+            setMessage('原紀錄已結案，新的耗材開封紀錄已建立');
+        } catch (err: any) {
+            setError(err.message || '建立新的耗材開封紀錄失敗');
+        } finally {
+            setFinishingOpening(false);
         }
     };
 
@@ -991,10 +1060,7 @@ const InstrumentManagementView: React.FC = () => {
                                                 <td className="px-4 py-3 text-right">
                                                     <button
                                                         type="button"
-                                                        onClick={async () => {
-                                                            const updated = await updateInstrumentOpening(opening.id, { status: 'CLOSED' });
-                                                            setOpenings(prev => prev.map(item => item.id === updated.id ? updated : item));
-                                                        }}
+                                                        onClick={() => openFinishDialog(opening)}
                                                         className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
                                                     >
                                                         結案
@@ -1012,6 +1078,104 @@ const InstrumentManagementView: React.FC = () => {
                     {renderSection('CW')}
                     {renderSection('BW')}
                 </>
+            )}
+            {finishOpeningDraft && createPortal(
+                <div
+                    className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/60 p-4"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="finish-opening-title"
+                >
+                    <div className="w-full max-w-lg rounded-xl border border-slate-200 bg-white p-6 shadow-2xl">
+                        <h2 id="finish-opening-title" className="text-lg font-bold text-slate-800">結案校正耗材</h2>
+                        <p className="mt-2 text-sm leading-6 text-slate-600">
+                            是否依照原本的校正耗材與使用區域，建立新的開封紀錄？
+                        </p>
+                        <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+                            <div><span className="font-bold">校正耗材：</span>{itemMap.get(finishOpeningDraft.opening.consumableItemKey)?.name || finishOpeningDraft.opening.consumableItemKey}</div>
+                            <div className="mt-1"><span className="font-bold">使用區域：</span>{finishOpeningDraft.opening.useArea || '-'}</div>
+                        </div>
+                        {error && (
+                            <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+                                {error}
+                            </div>
+                        )}
+
+                        {finishOpeningDraft.action === 'decision' ? (
+                            <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                                <button
+                                    type="button"
+                                    onClick={() => setFinishOpeningDraft(null)}
+                                    disabled={finishingOpening}
+                                    className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                                >
+                                    取消
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={finishWithoutReplacement}
+                                    disabled={finishingOpening}
+                                    className="rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm font-semibold text-red-700 hover:bg-red-100 disabled:opacity-50"
+                                >
+                                    否，刪除此紀錄
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setFinishOpeningDraft(prev => prev ? { ...prev, action: 'replace' } : prev)}
+                                    disabled={finishingOpening}
+                                    className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
+                                >
+                                    是，建立新紀錄
+                                </button>
+                            </div>
+                        ) : (
+                            <>
+                                <div className="mt-5 grid gap-4 sm:grid-cols-2">
+                                    <label className="space-y-2 text-xs font-bold text-slate-600">
+                                        <span className="block">新的開封日</span>
+                                        <input
+                                            type="date"
+                                            required
+                                            value={finishOpeningDraft.openedDate}
+                                            onChange={event => setFinishOpeningDraft(prev => prev ? { ...prev, openedDate: event.target.value } : prev)}
+                                            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                                        />
+                                    </label>
+                                    <label className="space-y-2 text-xs font-bold text-slate-600">
+                                        <span className="block">新的到期日</span>
+                                        <input
+                                            type="date"
+                                            required
+                                            min={finishOpeningDraft.openedDate || undefined}
+                                            value={finishOpeningDraft.expiresDate}
+                                            onChange={event => setFinishOpeningDraft(prev => prev ? { ...prev, expiresDate: event.target.value } : prev)}
+                                            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                                        />
+                                    </label>
+                                </div>
+                                <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                                    <button
+                                        type="button"
+                                        onClick={() => setFinishOpeningDraft(prev => prev ? { ...prev, action: 'decision' } : prev)}
+                                        disabled={finishingOpening}
+                                        className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                                    >
+                                        返回
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={finishWithReplacement}
+                                        disabled={finishingOpening || !finishOpeningDraft.openedDate || !finishOpeningDraft.expiresDate}
+                                        className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
+                                    >
+                                        {finishingOpening ? '處理中...' : '確認結案並建立'}
+                                    </button>
+                                </div>
+                            </>
+                        )}
+                    </div>
+                </div>,
+                document.body
             )}
         </div>
     );
