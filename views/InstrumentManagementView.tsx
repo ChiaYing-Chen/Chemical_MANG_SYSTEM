@@ -20,12 +20,22 @@ import {
     InstrumentWaterType,
     LiteInventoryItem
 } from '../types';
-import { CalendarDays, PackageCheck, Plus, RefreshCw, Save, Trash2, Wrench } from 'lucide-react';
+import { AlertTriangle, CalendarDays, PackageCheck, Plus, RefreshCw, Save, Trash2, Wrench } from 'lucide-react';
 
 const todayTaipei = () => {
     const now = new Date();
     const taipei = new Date(now.getTime() + 8 * 60 * 60 * 1000);
     return taipei.toISOString().slice(0, 10);
+};
+
+const getExpiryAlert = (expiresDate: string | null | undefined, today: string) => {
+    if (!expiresDate || expiresDate > today) return null;
+    if (expiresDate === today) return { label: '今日到期', overdueDays: 0 };
+
+    const expiryTime = Date.parse(`${expiresDate}T00:00:00Z`);
+    const todayTime = Date.parse(`${today}T00:00:00Z`);
+    const overdueDays = Math.max(1, Math.round((todayTime - expiryTime) / 86_400_000));
+    return { label: `已逾期 ${overdueDays} 天`, overdueDays };
 };
 
 const createTempId = () => {
@@ -755,6 +765,10 @@ const InstrumentManagementView: React.FC = () => {
     const dueSoonOpenings = openings
         .filter(opening => opening.status === 'OPEN')
         .sort((a, b) => String(a.expiresDate || '').localeCompare(String(b.expiresDate || '')));
+    const currentTaipeiDate = todayTaipei();
+    const expiredOpeningCount = dueSoonOpenings.filter(opening =>
+        getExpiryAlert(opening.expiresDate, currentTaipeiDate)
+    ).length;
 
     const renderConsumableNoteBlock = () => (
         <div className="px-5 py-4">
@@ -847,7 +861,15 @@ const InstrumentManagementView: React.FC = () => {
                     <section className="rounded-lg border border-slate-200 bg-white shadow-sm">
                         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
                             <h2 className="text-base font-bold text-slate-800">校正耗材開封紀錄</h2>
-                            <span className="text-xs text-slate-500">共 {dueSoonOpenings.length} 筆未結案</span>
+                            <div className="flex items-center gap-3">
+                                {expiredOpeningCount > 0 && (
+                                    <span className="instrument-expiry-summary inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-bold">
+                                        <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+                                        {expiredOpeningCount} 筆已到期
+                                    </span>
+                                )}
+                                <span className="text-xs text-slate-500">共 {dueSoonOpenings.length} 筆未結案</span>
+                            </div>
                         </div>
                         <div className="border-b border-slate-100 px-5 py-4">
                             <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
@@ -944,20 +966,29 @@ const InstrumentManagementView: React.FC = () => {
                                         </tr>
                                     ) : dueSoonOpenings.map(opening => {
                                         const item = itemMap.get(opening.consumableItemKey);
-                                        const expired = opening.expiresDate ? opening.expiresDate <= todayTaipei() : false;
+                                        const expiryAlert = getExpiryAlert(opening.expiresDate, currentTaipeiDate);
                                         return (
-                                            <tr key={opening.id}>
+                                            <tr key={opening.id} className={expiryAlert ? 'instrument-opening-expired' : undefined}>
                                                 <td className="px-4 py-3"><ItemSummary item={item} placeholder={opening.consumableItemKey} /></td>
                                                 <td className="px-4 py-3 text-slate-600">{opening.useArea || '-'}</td>
                                                 <td className="px-4 py-3 text-slate-600">{opening.openedDate}</td>
                                                 <td className="px-4 py-3">
-                                                    <input
-                                                        type="date"
-                                                        value={opening.expiresDate || ''}
-                                                        onChange={event => updateOpeningLocal(opening.id, { expiresDate: event.target.value || null })}
-                                                        onBlur={() => saveOpeningPatch(opening, { expiresDate: opening.expiresDate || null })}
-                                                        className={`w-36 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100 ${expired ? 'text-red-600' : 'text-slate-700'}`}
-                                                    />
+                                                    <div className="flex flex-wrap items-center gap-2">
+                                                        <input
+                                                            type="date"
+                                                            value={opening.expiresDate || ''}
+                                                            onChange={event => updateOpeningLocal(opening.id, { expiresDate: event.target.value || null })}
+                                                            onBlur={() => saveOpeningPatch(opening, { expiresDate: opening.expiresDate || null })}
+                                                            aria-label={expiryAlert ? `到期日，${expiryAlert.label}` : '到期日'}
+                                                            className={`w-36 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100 ${expiryAlert ? 'instrument-expiry-input' : 'text-slate-700'}`}
+                                                        />
+                                                        {expiryAlert && (
+                                                            <span className="instrument-expiry-badge inline-flex items-center gap-1 whitespace-nowrap rounded-full border px-2 py-1 text-xs font-extrabold" role="status">
+                                                                <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+                                                                {expiryAlert.label}
+                                                            </span>
+                                                        )}
+                                                    </div>
                                                 </td>
                                                 <td className="px-4 py-3 text-slate-600">{opening.adjustedInventory ? '已調整' : '未調整'}</td>
                                                 <td className="px-4 py-3 text-right">

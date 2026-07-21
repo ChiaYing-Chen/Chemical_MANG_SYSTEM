@@ -171,6 +171,33 @@ tbody tr:hover {
   background-color: #1c2b4d !important; /* Hover 行發亮 */
 }
 
+/* 儀器校正耗材到期提醒：覆寫表格斑馬紋與全域表單色，確保警示足夠醒目。 */
+tbody tr.instrument-opening-expired,
+tbody tr.instrument-opening-expired:nth-child(even),
+tbody tr.instrument-opening-expired:nth-child(odd) {
+  background: linear-gradient(90deg, rgba(127, 29, 29, 0.48) 0%, rgba(69, 20, 31, 0.42) 100%) !important;
+  box-shadow: inset 4px 0 0 #fb7185;
+}
+
+tbody tr.instrument-opening-expired:hover {
+  background: linear-gradient(90deg, rgba(153, 27, 27, 0.58) 0%, rgba(88, 28, 40, 0.52) 100%) !important;
+}
+
+.instrument-expiry-input {
+  background-color: #3f121b !important;
+  border-color: #fb7185 !important;
+  color: #fff1f2 !important;
+  box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.28), 0 0 14px rgba(244, 63, 94, 0.24);
+}
+
+.instrument-expiry-badge,
+.instrument-expiry-summary {
+  border-color: #fb7185;
+  background-color: #881337;
+  color: #fff1f2;
+  box-shadow: 0 0 12px rgba(244, 63, 94, 0.24);
+}
+
 /* 彈出視窗與 Modal 內部微調 */
 .bg-slate-50 {
   background-color: #0d1322 !important;
