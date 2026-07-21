@@ -855,9 +855,6 @@ const InstrumentManagementView: React.FC = () => {
                 <div className="rounded-lg border border-slate-200 bg-white p-12 text-center text-slate-500">載入儀器管理資料...</div>
             ) : (
                 <>
-                    {renderSection('CW')}
-                    {renderSection('BW')}
-
                     <section className="rounded-lg border border-slate-200 bg-white shadow-sm">
                         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
                             <h2 className="text-base font-bold text-slate-800">校正耗材開封紀錄</h2>
@@ -1011,6 +1008,9 @@ const InstrumentManagementView: React.FC = () => {
                         </div>
                         {renderConsumableNoteBlock()}
                     </section>
+
+                    {renderSection('CW')}
+                    {renderSection('BW')}
                 </>
             )}
         </div>
