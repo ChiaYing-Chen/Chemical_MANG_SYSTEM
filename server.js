@@ -2914,11 +2914,16 @@ app.patch('/api/instrument-management/openings/:id', async (req, res) => {
         const current = await pool.query('SELECT * FROM instrument_consumable_openings WHERE id = $1', [req.params.id]);
         if (current.rows.length === 0) return res.status(404).json({ error: '找不到耗材開封紀錄' });
         const row = current.rows[0];
+        const nextUseArea = req.body?.useArea ?? req.body?.use_area ?? row.use_area;
+        const validUseAreas = ['CT-1取樣站', 'CT-2取樣站', '一階鍋爐取樣站', '二階鍋爐取樣站'];
+        if (nextUseArea && !validUseAreas.includes(nextUseArea)) {
+            return res.status(400).json({ error: '使用區域不正確' });
+        }
         const result = await pool.query(
             `UPDATE instrument_consumable_openings
              SET status = $1, adjusted_inventory = $2, inventory_adjust_log_id = $3,
-                 opened_date = $4, expires_date = $5, note = $6, updated_at = NOW()
-             WHERE id = $7 RETURNING *`,
+                 opened_date = $4, expires_date = $5, note = $6, use_area = $7, updated_at = NOW()
+             WHERE id = $8 RETURNING *`,
             [
                 req.body?.status || row.status,
                 req.body?.adjustedInventory ?? req.body?.adjusted_inventory ?? row.adjusted_inventory,
@@ -2926,6 +2931,7 @@ app.patch('/api/instrument-management/openings/:id', async (req, res) => {
                 req.body?.openedDate ?? req.body?.opened_date ?? row.opened_date,
                 req.body?.expiresDate !== undefined ? (req.body.expiresDate || null) : (req.body?.expires_date !== undefined ? (req.body.expires_date || null) : row.expires_date),
                 req.body?.note ?? row.note,
+                nextUseArea,
                 req.params.id
             ]
         );

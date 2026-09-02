@@ -21,7 +21,7 @@ import {
     InstrumentWaterType,
     LiteInventoryItem
 } from '../types';
-import { AlertTriangle, CalendarDays, PackageCheck, Plus, RefreshCw, Save, Trash2, Wrench } from 'lucide-react';
+import { AlertTriangle, CalendarDays, PackageCheck, Pencil, Plus, RefreshCw, Save, Trash2, Wrench } from 'lucide-react';
 
 const todayTaipei = () => {
     const now = new Date();
@@ -122,7 +122,7 @@ const getTestItemPalette = (testItemKey: string) => {
 
 const emptyOpeningDraft = () => ({
     consumableId: '',
-    useArea: useAreaOptions[0],
+    useArea: '',
     openedDate: todayTaipei(),
     expiresDate: ''
 });
@@ -364,6 +364,8 @@ const InstrumentManagementView: React.FC = () => {
     const [consumableNoteDraft, setConsumableNoteDraft] = useState('');
     const [editingConsumableNote, setEditingConsumableNote] = useState(false);
     const [savingConsumableNote, setSavingConsumableNote] = useState(false);
+    const [editingAreaDraft, setEditingAreaDraft] = useState<{ opening: InstrumentConsumableOpening; useArea: string } | null>(null);
+    const [savingArea, setSavingArea] = useState(false);
     const [message, setMessage] = useState<string>('');
     const [error, setError] = useState<string>('');
 
@@ -576,7 +578,28 @@ const InstrumentManagementView: React.FC = () => {
         }
     };
 
+    const saveEditingArea = async () => {
+        if (!editingAreaDraft) return;
+        setSavingArea(true);
+        setError('');
+        try {
+            const updated = await updateInstrumentOpening(editingAreaDraft.opening.id, { useArea: editingAreaDraft.useArea });
+            setOpenings(prev => prev.map(item => item.id === updated.id ? updated : item));
+            setEditingAreaDraft(null);
+            setMessage('使用區域已更新');
+        } catch (err: any) {
+            setError(err.message || '更新使用區域失敗');
+        } finally {
+            setSavingArea(false);
+        }
+    };
+
     const createOpeningRecord = async () => {
+        if (!openingDraft.useArea) {
+            setError('請選擇使用區域');
+            return;
+        }
+
         const selectedConsumable = calibrationConsumableOptions.find(
             option => option.consumableId === openingDraft.consumableId
         );
@@ -1011,6 +1034,7 @@ const InstrumentManagementView: React.FC = () => {
                                             onChange={event => updateOpeningDraft({ useArea: event.target.value })}
                                             className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
                                         >
+                                            <option value="">請選擇使用區域</option>
                                             {useAreaOptions.map(area => (
                                                 <option key={area} value={area}>{area}</option>
                                             ))}
@@ -1069,7 +1093,26 @@ const InstrumentManagementView: React.FC = () => {
                                         return (
                                             <tr key={opening.id} className={expiryAlert ? 'instrument-opening-expired' : undefined}>
                                                 <td className="px-4 py-3"><ItemSummary item={item} placeholder={opening.consumableItemKey} /></td>
-                                                <td className="px-4 py-3 text-slate-600">{opening.useArea || '-'}</td>
+                                                <td className="px-4 py-3">
+                                                    <div className="inline-flex items-center gap-1.5">
+                                                        <span className="text-slate-600">{opening.useArea || '-'}</span>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => {
+                                                                setError('');
+                                                                setEditingAreaDraft({
+                                                                    opening,
+                                                                    useArea: opening.useArea || useAreaOptions[0]
+                                                                });
+                                                            }}
+                                                            className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition"
+                                                            title="修改使用區域"
+                                                            aria-label="修改使用區域"
+                                                        >
+                                                            <Pencil className="h-3.5 w-3.5" />
+                                                        </button>
+                                                    </div>
+                                                </td>
                                                 <td className="px-4 py-3 text-slate-600">{opening.openedDate}</td>
                                                 <td className="px-4 py-3">
                                                     <div className="flex flex-wrap items-center gap-2">
@@ -1206,6 +1249,67 @@ const InstrumentManagementView: React.FC = () => {
                                 </div>
                             </>
                         )}
+                    </div>
+                </div>,
+                document.body
+            )}
+            {editingAreaDraft && createPortal(
+                <div
+                    className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/60 p-4"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="edit-area-title"
+                >
+                    <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 shadow-2xl">
+                        <h2 id="edit-area-title" className="text-lg font-bold text-slate-800">修改使用區域</h2>
+                        <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700 space-y-1">
+                            <div>
+                                <span className="font-bold">校正耗材：</span>
+                                {itemMap.get(editingAreaDraft.opening.consumableItemKey)?.name || editingAreaDraft.opening.consumableItemKey}
+                            </div>
+                            <div>
+                                <span className="font-bold">開封日：</span>
+                                {editingAreaDraft.opening.openedDate}
+                            </div>
+                        </div>
+
+                        {error && (
+                            <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+                                {error}
+                            </div>
+                        )}
+
+                        <div className="mt-4 space-y-2">
+                            <label className="block text-xs font-bold text-slate-600">選擇使用區域</label>
+                            <select
+                                value={editingAreaDraft.useArea}
+                                onChange={event => setEditingAreaDraft(prev => prev ? { ...prev, useArea: event.target.value } : prev)}
+                                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                            >
+                                {useAreaOptions.map(area => (
+                                    <option key={area} value={area}>{area}</option>
+                                ))}
+                            </select>
+                        </div>
+
+                        <div className="mt-6 flex justify-end gap-3">
+                            <button
+                                type="button"
+                                onClick={() => setEditingAreaDraft(null)}
+                                disabled={savingArea}
+                                className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                            >
+                                取消
+                            </button>
+                            <button
+                                type="button"
+                                onClick={saveEditingArea}
+                                disabled={savingArea || !editingAreaDraft.useArea}
+                                className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-50"
+                            >
+                                {savingArea ? '儲存中...' : '儲存'}
+                            </button>
+                        </div>
                     </div>
                 </div>,
                 document.body
