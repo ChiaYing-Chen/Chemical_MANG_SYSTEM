@@ -466,7 +466,7 @@ export class StorageService {
             addedAmountLiters: parseFloat(apiReading.added_amount_liters || 0),
             operatorName: apiReading.operator_name,
             readAt: apiReading.read_at ? new Date(apiReading.read_at).getTime() : undefined,
-            piLevelCm: apiReading.pi_level_cm ? parseFloat(apiReading.pi_level_cm) : undefined,
+            piLevelCm: apiReading.pi_level_cm != null ? parseFloat(apiReading.pi_level_cm) : undefined,
             piCheck: apiReading.pi_check || undefined
         };
     }

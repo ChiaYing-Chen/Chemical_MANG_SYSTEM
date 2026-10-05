@@ -138,7 +138,9 @@ export const applyCalib = (calib, cm) => (isNum(cm) ? calib.slope * cm + calib.i
 /** 容許誤差（cm）：校正資料充足時取 max(固定值, 3σ)，否則用固定值 */
 export function toleranceCm(tank, calib) {
     const base = isNum(tank.piCheckToleranceCm) && tank.piCheckToleranceCm > 0 ? tank.piCheckToleranceCm : DEFAULT_TOLERANCE_CM;
-    if (calib && calib.mode === 'LINEAR' && isNum(calib.residualStd)) return Math.max(base, 3 * calib.residualStd);
+    // 舊資料將擬合模式存成 AUTO；有 R² 且至少七筆才代表曾完成線性回歸。
+    const linear = calib?.mode === 'LINEAR' || (calib?.mode === 'AUTO' && calib.n >= 7 && isNum(calib.rSquared));
+    if (linear && isNum(calib.residualStd)) return Math.max(base, 3 * calib.residualStd);
     return base;
 }
 
@@ -190,7 +192,7 @@ const round = (v, d = 1) => (isNum(v) ? Math.round(v * 10 ** d) / 10 ** d : null
 export function evaluate({ tank, inputValue, tNow, prev, series, calib, others = [], addedLiters = 0 }) {
     const messages = [];
     const manualCm = inputToCm(tank, inputValue);
-    const result = { status: 'OK', manualCm: round(manualCm, 2), messages };
+    const result = { status: 'OK', readAt: tNow, manualCm: round(manualCm, 2), messages };
 
     const rawNow = piValueAt(series, tNow);
     if (!isNum(rawNow) || !isNum(manualCm)) {
@@ -251,6 +253,7 @@ export function evaluate({ tank, inputValue, tNow, prev, series, calib, others =
         const intervalH = (tNow - prev.readAt) / HOUR;
         result.intervalHours = round(intervalH, 1);
         result.prevEstimated = !!prev.estimated;
+        if (prev.estimated) messages.push('前次未記錄實際抄表時間，區間用量僅為估算');
 
         const seg = (series || [])
             .filter((p) => p.t >= prev.readAt - 30 * MIN && p.t <= tNow + 15 * MIN)
@@ -281,7 +284,7 @@ export function evaluate({ tank, inputValue, tNow, prev, series, calib, others =
 
             // 人工液位明顯上升，但 PI 無補藥跡象
             const manualRise = manualCm - prev.levelCm;
-            if (manualRise >= minRise && !result.refill.detected && addedCm === 0) {
+            if (!prev.estimated && manualRise >= minRise && !result.refill.detected && addedCm === 0) {
                 if (pointOk) {
                     // 本次值吻合線上 → 問題多半在前次紀錄
                     result.status = 'WARN';

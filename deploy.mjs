@@ -7,7 +7,8 @@ const remoteRoot = '\\\\10.122.51.61\\c$\\inetpub\\wwwroot\\WTCA';
 
 function formatDate(d) {
     const pad = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    const taipei = new Date(d.getTime() + 8 * 3600000);
+    return `${taipei.getUTCFullYear()}${pad(taipei.getUTCMonth() + 1)}${pad(taipei.getUTCDate())}-${pad(taipei.getUTCHours())}${pad(taipei.getUTCMinutes())}${pad(taipei.getUTCSeconds())}`;
 }
 
 const timestamp = formatDate(new Date());
@@ -23,10 +24,10 @@ fs.mkdirSync(backupDir, { recursive: true });
 
 // 2. 備份現有檔案
 console.log('\n[2/5] 備份遠端現有檔案...');
-const remoteServerJs = path.join(remoteRoot, 'server.js');
-if (fs.existsSync(remoteServerJs)) {
-    fs.copyFileSync(remoteServerJs, path.join(backupDir, 'server.js'));
-    console.log('  - 已備份 server.js');
+const backendFiles = ['server.js', 'levelCheck.js', 'levelCheckPersistence.js', 'package.json'];
+for (const file of backendFiles) {
+    const remoteFile = path.join(remoteRoot, file);
+    if (fs.existsSync(remoteFile)) fs.copyFileSync(remoteFile, path.join(backupDir, file));
 }
 
 const remoteDist = path.join(remoteRoot, 'dist');
@@ -35,7 +36,7 @@ if (fs.existsSync(remoteDist)) {
     try {
         execSync(`robocopy "${remoteDist}" "${backupDist}" /E /XO /NP /R:2 /W:3`, { stdio: 'ignore' });
     } catch (e) {
-        // Robocopy non-zero exit codes < 8 mean success with files copied
+        if (typeof e.status !== 'number' || e.status >= 8) throw new Error('遠端備份失敗，停止佈署');
     }
     console.log('  - 已備份 dist 目錄');
 }
@@ -54,7 +55,6 @@ console.log('  - 前端 dist 目錄同步完成！');
 
 // 4. 佈署後端程式與核心模組
 console.log('\n[4/5] 佈署後端程式與核心模組...');
-const backendFiles = ['server.js', 'levelCheck.js', 'package.json'];
 for (const file of backendFiles) {
     const src = path.join(localRoot, file);
     const dst = path.join(remoteRoot, file);

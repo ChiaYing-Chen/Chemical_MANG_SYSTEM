@@ -103,6 +103,7 @@ export type LevelCheckStatus = 'OK' | 'WARN' | 'ERROR' | 'NO_PI';
 
 export interface LevelCheckResult {
   status: LevelCheckStatus;
+  readAt?: number; // 本次 PI 查核的實際抄表時間（毫秒）
   manualCm?: number;
   piRawCm?: number;
   piRefCm?: number;
@@ -142,7 +143,7 @@ export interface TankCalibrationLog {
   oldIntercept?: number;
   newSlope: number;
   newIntercept: number;
-  actionType: 'AUTO_RECALCULATE' | 'MANUAL_UPDATE';
+  actionType: 'AUTO_RECALCULATE' | 'MANUAL_UPDATE' | 'RESET_INVALID_TAG';
   reason?: string;
   createdAt: string;
 }

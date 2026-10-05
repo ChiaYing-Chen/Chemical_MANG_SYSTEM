@@ -1369,6 +1369,7 @@ const DataEntryView: React.FC<{
     const [convertedCountInfo, setConvertedCountInfo] = useState<number>(0);
     const [piLiveChecks, setPiLiveChecks] = useState<Record<string, LevelCheckResult>>({});
     const [piChecking, setPiChecking] = useState(false);
+    const [readAtInput, setReadAtInput] = useState(() => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 16));
 
     const getRecentDailyUsageKg = (tankId: string) => {
         const usageCalcWeeks = appSettings?.usageCalcWeeks || 4;
@@ -1592,7 +1593,8 @@ const DataEntryView: React.FC<{
                 await onBatchSave(pendingReadings);
                 setBatchLevels({}); // Clear manual inputs
                 setPiLiveChecks({}); // Clear inline PI checks
-                alert(`已成功儲存 ${pendingReadings.length} 筆液位紀錄`);
+                const uncheckedCount = pendingReadings.filter(r => r.piCheck?.status === 'NO_PI').length;
+                alert(`已成功儲存 ${pendingReadings.length} 筆液位紀錄${uncheckedCount ? `；其中 ${uncheckedCount} 筆未完成 PI 查核` : ''}`);
             } else {
                 // Import Saving
                 await onBatchSave(pendingReadings);
@@ -2036,11 +2038,11 @@ const DataEntryView: React.FC<{
         e.preventDefault();
 
         // 智慧判斷：若按下儲存的時間落於晚上 23:00 ~ 23:59:59，提示確認抄表日期
-        const now = new Date();
-        if (now.getHours() === 23) {
+        const now = new Date(Date.now() + 8 * 3600000);
+        if (now.getUTCHours() === 23) {
             const [y, m, d] = date.split('-');
             const dateDisplay = `${y}/${m}/${d}`;
-            const confirmed = window.confirm(`⚠️ 注意：現在時間為深夜 ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}，即將跨日。\n\n儲存的抄表日期為「${dateDisplay}」，是否正確？\n\n按「確定」繼續儲存，按「取消」返回修改日期。`);
+            const confirmed = window.confirm(`⚠️ 注意：現在時間為深夜 ${now.getUTCHours().toString().padStart(2, '0')}:${now.getUTCMinutes().toString().padStart(2, '0')}，即將跨日。\n\n儲存的抄表日期為「${dateDisplay}」，是否正確？\n\n按「確定」繼續儲存，按「取消」返回修改日期。`);
             if (!confirmed) return;
         }
 
@@ -2050,35 +2052,41 @@ const DataEntryView: React.FC<{
             return;
         }
 
-        const timestamp = getNormalizedTimestamp(date);
-        if (!timestamp) {
+        const timestamp = Date.parse(date + 'T00:00:00+08:00');
+        if (!Number.isFinite(timestamp)) {
             alert('日期格式錯誤');
             return;
         }
 
         // 檢查是否有現存紀錄 (將資料庫的時戳明確轉換為 YYYY-MM-DD 字串，以確保跨瀏覽器相容性並完美比對)
         const existingRecordsForDate = readings.filter(r => {
-            const rd = new Date(r.timestamp);
-            const rDateStr = `${rd.getFullYear()}-${String(rd.getMonth() + 1).padStart(2, '0')}-${String(rd.getDate()).padStart(2, '0')}`;
+            const rDateStr = new Date(r.timestamp + 8 * 3600000).toISOString().slice(0, 10);
             return rDateStr === date && entries.some(([tId, val]) => tId === r.tankId && val);
         });
 
         if (existingRecordsForDate.length > 0) {
             const tankNames = existingRecordsForDate.map(r => tanks.find(t => t.id === r.tankId)?.name || r.tankId).join(', ');
-            const dateDisplay = new Date(timestamp).toLocaleDateString('zh-TW');
+            const dateDisplay = new Date(timestamp).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
             const confirmed = window.confirm(`⚠️ 覆蓋確認\n\n選定日期 (${dateDisplay}) 已有以下儲槽的紀錄：\n${tankNames}\n\n是否確定要覆蓋現有數據？`);
             if (!confirmed) return;
         }
 
+        const readAtMs = Date.parse(`${readAtInput}:00+08:00`);
+        if (!Number.isFinite(readAtMs) || readAtMs > Date.now() + 60000) {
+            alert('請填寫有效的實際抄表時間（台北時間），不可填未來時間');
+            return;
+        }
         onLoading(true);
         setPiChecking(true);
         try {
-            // 執行 PI 線上輔助查核 (以當日 00:00~24:00 台北時間對照線上液位與用量)
+            // 查核與保存使用同一個實際抄表時間；所屬日期僅用於日報歸屬。
             let currentPiChecks: Record<string, LevelCheckResult> = {};
             try {
                 const piResp = await API.checkLevels({
                     businessDate: date,
-                    entries: batchLevels
+                    readAt: readAtMs,
+                    entries: batchLevels,
+                    addedLiters: Object.fromEntries(existingRecordsForDate.map(r => [r.tankId, r.addedAmountLiters || 0]))
                 });
                 if (piResp?.results) {
                     currentPiChecks = piResp.results;
@@ -2087,9 +2095,16 @@ const DataEntryView: React.FC<{
             } catch (piErr) {
                 console.warn('PI check during submit warning:', piErr);
             }
+            for (const [tankId, value] of entries) {
+                if (value && !currentPiChecks[tankId]) {
+                    currentPiChecks[tankId] = { status: 'NO_PI', messages: ['PI 查核連線失敗或未回傳此槽結果，本次未完成查核'] };
+                }
+            }
+            setPiLiveChecks(currentPiChecks);
+            const unchecked = entries.filter(([id, value]) => value && currentPiChecks[id]?.status === 'NO_PI');
+            if (unchecked.length && !window.confirm(`下列儲槽未完成 PI 查核：\n${unchecked.map(([id]) => `${tanks.find(t => t.id === id)?.name || id}：${currentPiChecks[id].messages.join('；')}`).join('\n')}\n\n是否仍要儲存人工紀錄？本次不視為 PI 查核通過。`)) return;
 
             const newReadings: Reading[] = [];
-            const nowMs = Date.now();
 
             for (const [tId, valStr] of entries) {
                 if (!valStr) continue;
@@ -2133,8 +2148,8 @@ const DataEntryView: React.FC<{
                     supplyId: activeSup?.id,
                     addedAmountLiters: existingRecord?.addedAmountLiters || 0, // 保留原有的加藥量
                     operatorName: operator,
-                    readAt: nowMs,
-                    piLevelCm: piCheckForTank?.piRefCm,
+                    readAt: readAtMs,
+                    piLevelCm: piCheckForTank?.piRawCm,
                     piCheck: piCheckForTank
                 });
             }
@@ -2154,7 +2169,7 @@ const DataEntryView: React.FC<{
                 await onBatchSave(newReadings);
                 setBatchLevels({}); // Clear inputs
                 setPiLiveChecks({});
-                alert(`已成功儲存 ${newReadings.length} 筆液位紀錄`);
+                alert(`已成功儲存 ${newReadings.length} 筆液位紀錄${unchecked.length ? `；其中 ${unchecked.length} 筆未完成 PI 查核` : ''}`);
             }
         } catch (e) {
             console.error(e);
@@ -3093,10 +3108,10 @@ const DataEntryView: React.FC<{
                 >
                     {activeType === 'A' && (
                         <form onSubmit={handleSubmitReadings} className="space-y-6">
-                            <div className="flex items-center justify-between bg-blue-50 p-3 rounded-lg border border-blue-100 mb-4">
-                                <div className="flex items-center gap-4">
+                            <div className="flex flex-wrap gap-3 items-center justify-between bg-blue-50 p-3 rounded-lg border border-blue-100 mb-4">
+                                <div className="flex flex-wrap items-center gap-4">
                                     <div>
-                                        <label className="block text-sm font-medium text-blue-900">抄表日期</label>
+                                        <label className="block text-sm font-medium text-blue-900">抄表所屬日期</label>
                                         <input
                                             type="date"
                                             value={date}
@@ -3105,6 +3120,12 @@ const DataEntryView: React.FC<{
                                             className="mt-1 block w-full rounded-md border-blue-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
                                             required
                                         />
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-medium text-blue-900">實際抄表時間（台北）</label>
+                                        <input type="datetime-local" value={readAtInput} onChange={e => setReadAtInput(e.target.value)} required className="mt-1 block rounded-md border-blue-300 text-sm" />
+                                        <button type="button" className="text-xs text-blue-700" onClick={() => setReadAtInput(new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 16))}>帶入現在時間</button>
+                                        <p className="text-xs text-slate-500">補登或修改舊紀錄時，請填當時實際抄表時間。</p>
                                     </div>
                                     <div className="text-sm text-blue-700 pt-5">
                                         <span className="bg-blue-200 px-2 py-1 rounded text-xs mr-2">提示</span>
@@ -3238,7 +3259,7 @@ const DataEntryView: React.FC<{
                                                                             </div>
                                                                         );
                                                                     }
-                                                                    return null;
+                                                                    return <div className="text-xs text-amber-800 mt-1">未完成 PI 查核：{chk.messages.join('；')}</div>;
                                                                 })()}
                                                             </div>
                                                         </div>
@@ -7254,7 +7275,7 @@ const ParamsSettingsView: React.FC<{
                             功能說明與校正準則：
                         </div>
                         <ul className="list-disc pl-5 space-y-1 text-slate-600">
-                            <li><strong>回歸公式計算</strong>：利用歷史有效人工輸入與 PI recorded values 進行最小平方法線性擬合，推算斜率 (a) 與截距 (b)。</li>
+                            <li><strong>校正公式計算</strong>：使用具有實際抄表時間的有效配對。少於 3 筆保留原公式；3～6 筆或 PI 變化不足 20 cm 僅校正偏移，其餘才進行線性回歸。</li>
                             <li><strong>手動微調與歷程</strong>：若現場感測器校正或零點偏移，可手動微調參數，所有變動均會記錄於「調校歷程」中備查。</li>
                             <li><strong>自動連帶防呆比對</strong>：於「數據輸入」點擊「批次儲存所有輸入」時，系統將自動套用此處校正公式連帶進行對照查核，即時比對是否 KEY 錯小數點或一二階欄位對調。</li>
                         </ul>

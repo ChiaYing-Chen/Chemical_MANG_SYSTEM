@@ -19,16 +19,14 @@ export const PiCalibrationModal: React.FC<PiCalibrationModalProps> = ({ isOpen, 
     const [backfilling, setBackfilling] = useState(false);
 
     const handleBackfill = async () => {
-        if (!window.confirm('確定要自 PI 系統回補過去 35 天歷史液位數據並自動擬合真實回歸公式嗎？\n這將耗時約 15~20 秒。')) return;
+        if (!window.confirm('確定要回補過去 35 天具有實際抄表時間的 PI 配對資料並重算公式嗎？\n不足 3 筆保留原公式；3～6 筆或量程不足僅校正偏移。耗時取決於資料量與 PI 連線。')) return;
         setBackfilling(true);
         try {
             const resp = await API.backfillPiLevels(35);
-            if (resp.success) {
-                alert(`已成功回補 ${resp.totalUpdated} 筆歷史數據，並完成全槽迴歸公式計算！`);
-                await loadData();
-            } else {
-                alert('回補失敗: ' + (resp.error || '未知錯誤'));
-            }
+            const details = (resp.details || []).map((d: any) => `${d.tankName}：回補 ${d.updated} 筆，略過 ${d.skipped} 筆${d.error ? '；' + d.error : ''}`);
+            const fits = (resp.calibrations || []).filter((c: any) => !c.updated).map((c: any) => `${c.tankName}：${c.reason}`);
+            alert(`${resp.success ? '回補完成' : '回補未全部完成'}：共回補 ${resp.totalUpdated || 0} 筆\n${[...details, ...fits].join('\n')}`);
+            await loadData();
         } catch (e: any) {
             console.error(e);
             alert('回補失敗: ' + (e.message || String(e)));
@@ -61,8 +59,8 @@ export const PiCalibrationModal: React.FC<PiCalibrationModalProps> = ({ isOpen, 
         if (!window.confirm('確定要針對所有具備 PI Tag 的儲槽，以歷史配對數據重新計算線性回歸公式嗎？')) return;
         setActionLoading(true);
         try {
-            await API.recalculateTankCalibration(undefined, '管理員手動批次觸發重新回歸計算');
-            alert('已成功重新計算所有儲槽的校正公式！');
+            const resp = await API.recalculateTankCalibration(undefined, '管理員手動批次觸發重新回歸計算');
+            alert(`已更新 ${resp.count} 槽公式\n${(resp.data || []).filter((c: any) => !c.updated).map((c: any) => `${c.tankName}：${c.reason}`).join('\n')}`);
             await loadData();
         } catch (e: any) {
             alert('重新計算失敗: ' + (e.message || String(e)));
@@ -74,8 +72,8 @@ export const PiCalibrationModal: React.FC<PiCalibrationModalProps> = ({ isOpen, 
     const handleRecalculateSingle = async (tank: TankCalibration) => {
         setActionLoading(true);
         try {
-            await API.recalculateTankCalibration(tank.tankId, `單槽手動觸發: ${tank.tankName}`);
-            alert(`已完成「${tank.tankName}」的重新回歸計算！`);
+            const resp = await API.recalculateTankCalibration(tank.tankId, `單槽手動觸發: ${tank.tankName}`);
+            alert(resp.count ? `已更新「${tank.tankName}」公式` : (resp.data?.[0]?.reason || '沒有可更新的公式'));
             await loadData();
         } catch (e: any) {
             alert('重新計算失敗: ' + (e.message || String(e)));
@@ -262,7 +260,7 @@ export const PiCalibrationModal: React.FC<PiCalibrationModalProps> = ({ isOpen, 
                                                                 ? 'bg-amber-100 text-amber-700'
                                                                 : 'bg-green-100 text-green-700'
                                                         }`}>
-                                                            {item.mode === 'MANUAL' ? '手動設定' : '自動迴歸'}
+                                                            {item.mode === 'MANUAL' ? '手動設定' : item.mode === 'LINEAR' || (item.mode === 'AUTO' && item.rSquared !== undefined && item.sampleCount >= 7) ? '線性回歸' : item.sampleCount >= 3 ? '偏移校正' : '樣本不足'}
                                                         </span>
                                                     </td>
                                                     <td className="px-4 py-3 text-xs text-slate-500 max-w-[160px] truncate" title={item.note}>
@@ -337,7 +335,7 @@ export const PiCalibrationModal: React.FC<PiCalibrationModalProps> = ({ isOpen, 
                                                                 ? 'bg-amber-100 text-amber-800'
                                                                 : 'bg-blue-100 text-blue-800'
                                                         }`}>
-                                                            {log.actionType === 'MANUAL_UPDATE' ? '手動微調' : '自動迴歸'}
+                                                            {log.actionType === 'MANUAL_UPDATE' ? '手動微調' : log.actionType === 'RESET_INVALID_TAG' ? '錯配修復' : '自動校正'}
                                                         </span>
                                                     </td>
                                                     <td className="px-4 py-3 font-mono text-xs">
