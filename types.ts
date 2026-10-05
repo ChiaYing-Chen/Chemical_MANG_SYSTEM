@@ -91,6 +91,60 @@ export interface Tank {
   // Valid specific gravity range for chemical supply validation
   sgRangeMin?: number; // Minimum acceptable SG
   sgRangeMax?: number; // Maximum acceptable SG
+
+  // PI Online Level Check Configuration
+  piLevelTag?: string;
+  piLevelUnit?: 'PERCENT' | 'CM';
+  piCheckToleranceCm?: number;
+  piRefillMinRiseCm?: number;
+}
+
+export type LevelCheckStatus = 'OK' | 'WARN' | 'ERROR' | 'NO_PI';
+
+export interface LevelCheckResult {
+  status: LevelCheckStatus;
+  manualCm?: number;
+  piRawCm?: number;
+  piRefCm?: number;
+  piRefInputUnit?: number;
+  deviationCm?: number;
+  toleranceCm?: number;
+  calibMode?: string;
+  calibN?: number;
+  swapSuspect?: { tankId: string; tankName: string; deviationCm: number };
+  refill?: { detected: boolean; count?: number; riseCm: number; at?: number; estLiters?: number };
+  intervalHours?: number;
+  prevEstimated?: boolean;
+  manualUsagePer24h?: number;
+  piUsagePer24h?: number;
+  messages: string[];
+}
+
+export interface TankCalibration {
+  tankId: string;
+  tankName?: string;
+  system?: string;
+  slope: number;
+  intercept: number;
+  rSquared?: number;
+  residualStd?: number;
+  sampleCount: number;
+  mode: string;
+  note?: string;
+  updatedAt?: string;
+}
+
+export interface TankCalibrationLog {
+  id?: string;
+  tankId: string;
+  tankName?: string;
+  oldSlope?: number;
+  oldIntercept?: number;
+  newSlope: number;
+  newIntercept: number;
+  actionType: 'AUTO_RECALCULATE' | 'MANUAL_UPDATE';
+  reason?: string;
+  createdAt: string;
 }
 
 // Table A: Tank Levels
@@ -108,6 +162,11 @@ export interface Reading {
 
   addedAmountLiters: number;
   operatorName: string;
+
+  // PI Verification Snapshot
+  readAt?: number;
+  piLevelCm?: number;
+  piCheck?: LevelCheckResult;
 }
 
 export enum NoteCategory {

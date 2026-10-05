@@ -746,7 +746,8 @@ export const WaterQualityTrendsView: React.FC = () => {
                                     </div>
                                 ) : (
                                     // BW 分類列表展示 (已修正除鐵水名稱)
-                                    Object.entries(pointsByCategory).map(([catName, pts]) => {
+                                    Object.entries(pointsByCategory).map(([catName, ptsRaw]) => {
+                                        const pts = ptsRaw as string[];
                                         if (pts.length === 0) return null;
                                         return (
                                             <div key={catName} className="space-y-1 bg-slate-50/50 p-2 rounded-lg border border-slate-100">

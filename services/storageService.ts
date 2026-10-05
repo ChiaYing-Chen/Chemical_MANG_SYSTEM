@@ -419,7 +419,11 @@ export class StorageService {
             validationThreshold: apiTank.validation_threshold ? parseFloat(apiTank.validation_threshold) : 30,
             sgRangeMin: apiTank.sg_range_min ? parseFloat(apiTank.sg_range_min) : undefined,
             sgRangeMax: apiTank.sg_range_max ? parseFloat(apiTank.sg_range_max) : undefined,
-            piPercentFactor: apiTank.pi_percent_factor ? parseFloat(apiTank.pi_percent_factor) : undefined
+            piPercentFactor: apiTank.pi_percent_factor ? parseFloat(apiTank.pi_percent_factor) : undefined,
+            piLevelTag: apiTank.pi_level_tag || undefined,
+            piLevelUnit: apiTank.pi_level_unit || 'PERCENT',
+            piCheckToleranceCm: apiTank.pi_check_tolerance_cm ? parseFloat(apiTank.pi_check_tolerance_cm) : undefined,
+            piRefillMinRiseCm: apiTank.pi_refill_min_rise_cm ? parseFloat(apiTank.pi_refill_min_rise_cm) : undefined
         };
     }
 
@@ -441,7 +445,11 @@ export class StorageService {
             validation_threshold: tank.validationThreshold ?? 30,
             sg_range_min: tank.sgRangeMin,
             sg_range_max: tank.sgRangeMax,
-            pi_percent_factor: tank.piPercentFactor ?? null
+            pi_percent_factor: tank.piPercentFactor ?? null,
+            pi_level_tag: tank.piLevelTag || null,
+            pi_level_unit: tank.piLevelUnit || 'PERCENT',
+            pi_check_tolerance_cm: tank.piCheckToleranceCm ?? null,
+            pi_refill_min_rise_cm: tank.piRefillMinRiseCm ?? null
         };
     }
 
@@ -456,7 +464,10 @@ export class StorageService {
             appliedSpecificGravity: parseFloat(apiReading.applied_sg),
             supplyId: apiReading.supply_id,
             addedAmountLiters: parseFloat(apiReading.added_amount_liters || 0),
-            operatorName: apiReading.operator_name
+            operatorName: apiReading.operator_name,
+            readAt: apiReading.read_at ? new Date(apiReading.read_at).getTime() : undefined,
+            piLevelCm: apiReading.pi_level_cm ? parseFloat(apiReading.pi_level_cm) : undefined,
+            piCheck: apiReading.pi_check || undefined
         };
     }
 
@@ -471,7 +482,10 @@ export class StorageService {
             applied_sg: reading.appliedSpecificGravity,
             supply_id: reading.supplyId,
             added_amount_liters: reading.addedAmountLiters,
-            operator_name: reading.operatorName
+            operator_name: reading.operatorName,
+            read_at: reading.readAt || null,
+            pi_level_cm: reading.piLevelCm ?? null,
+            pi_check: reading.piCheck || null
         };
     }
 

@@ -9,6 +9,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
 import crypto from 'crypto';
 import * as backendUtils from './backendUtils.js';
+import * as levelCheck from './levelCheck.js';
 
 // 本地開發環境原生載入 .env 配置
 try {
@@ -1184,9 +1185,10 @@ app.post('/api/tanks', async (req, res) => {
     try {
         const { id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold, pi_percent_factor } = req.body;
         const result = await pool.query(
-            `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold, sg_range_min, sg_range_max, pi_percent_factor)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`,
-            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level || 20.0, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max, pi_percent_factor ?? null]
+            `INSERT INTO tanks (id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order, shape_type, dimensions, input_unit, validation_threshold, sg_range_min, sg_range_max, pi_percent_factor, pi_level_tag, pi_level_unit, pi_check_tolerance_cm, pi_refill_min_rise_cm)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING *`,
+            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level || 20.0, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max, pi_percent_factor ?? null,
+                req.body.pi_level_tag || null, req.body.pi_level_unit || 'PERCENT', req.body.pi_check_tolerance_cm ?? null, req.body.pi_refill_min_rise_cm ?? null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -1209,9 +1211,11 @@ app.put('/api/tanks/:id', async (req, res) => {
 
         const result = await pool.query(
             `UPDATE tanks SET name=$2, system_type=$3, capacity_liters=$4, geo_factor=$5, description=$6, 
-       safe_min_level=$7, target_daily_usage=$8, calculation_method=$9, sort_order=$10, shape_type=$11, dimensions=$12, input_unit=$13, validation_threshold=$14, sg_range_min=$15, sg_range_max=$16, pi_percent_factor=$17
+       safe_min_level=$7, target_daily_usage=$8, calculation_method=$9, sort_order=$10, shape_type=$11, dimensions=$12, input_unit=$13, validation_threshold=$14, sg_range_min=$15, sg_range_max=$16, pi_percent_factor=$17,
+       pi_level_tag=$18, pi_level_unit=$19, pi_check_tolerance_cm=$20, pi_refill_min_rise_cm=$21
        WHERE id=$1 RETURNING *`,
-            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max, pi_percent_factor ?? null]
+            [id, name, system_type, capacity_liters, geo_factor, description, safe_min_level, target_daily_usage, calculation_method, sort_order || 0, shape_type, dimensions, input_unit || 'CM', validation_threshold || 30, req.body.sg_range_min, req.body.sg_range_max, pi_percent_factor ?? null,
+                req.body.pi_level_tag || null, req.body.pi_level_unit || 'PERCENT', req.body.pi_check_tolerance_cm ?? null, req.body.pi_refill_min_rise_cm ?? null]
         );
 
         console.log('Update result:', result.rows[0]);
@@ -1342,11 +1346,11 @@ app.get('/api/readings', async (req, res) => {
 // 新增液位紀錄
 app.post('/api/readings', async (req, res) => {
     try {
-        const { id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters, operator_name } = req.body;
+        const { id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters, operator_name, read_at, pi_level_cm, pi_check } = req.body;
         const result = await pool.query(
-            `INSERT INTO readings (id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters, operator_name)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-            [id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters || 0, operator_name]
+            `INSERT INTO readings (id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters, operator_name, read_at, pi_level_cm, pi_check)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_timestamp($11::double precision / 1000), $12, $13) RETURNING *`,
+            [id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters || 0, operator_name, read_at ?? null, pi_level_cm ?? null, pi_check ? JSON.stringify(pi_check) : null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -1407,12 +1411,12 @@ app.post('/api/readings/batch', async (req, res) => {
 
         const results = [];
         for (const reading of readings) {
-            const { id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters, operator_name } = reading;
+            const { id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters, operator_name, read_at, pi_level_cm, pi_check } = reading;
 
             // 使用 upsert 邏輯: 如果 ID 存在則更新，否則新增
             const result = await client.query(
-                `INSERT INTO readings (id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters, operator_name)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                `INSERT INTO readings (id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters, operator_name, read_at, pi_level_cm, pi_check)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_timestamp($11::double precision / 1000), $12, $13)
                  ON CONFLICT (id) DO UPDATE SET
                     timestamp = EXCLUDED.timestamp,
                     level_cm = EXCLUDED.level_cm,
@@ -1421,9 +1425,12 @@ app.post('/api/readings/batch', async (req, res) => {
                     applied_sg = EXCLUDED.applied_sg,
                     supply_id = EXCLUDED.supply_id,
                     added_amount_liters = EXCLUDED.added_amount_liters,
-                    operator_name = EXCLUDED.operator_name
+                    operator_name = EXCLUDED.operator_name,
+                    read_at = COALESCE(EXCLUDED.read_at, readings.read_at),
+                    pi_level_cm = COALESCE(EXCLUDED.pi_level_cm, readings.pi_level_cm),
+                    pi_check = COALESCE(EXCLUDED.pi_check, readings.pi_check)
                  RETURNING *`,
-                [id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters || 0, operator_name]
+                [id, tank_id, timestamp, level_cm, calculated_volume, calculated_weight_kg, applied_sg, supply_id, added_amount_liters || 0, operator_name, read_at ?? null, pi_level_cm ?? null, pi_check ? JSON.stringify(pi_check) : null]
             );
             results.push(result.rows[0]);
         }
@@ -1513,6 +1520,78 @@ const migrateDatabase = async () => {
         console.log('Ensuring sg_range columns in tanks table...');
         await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS sg_range_min NUMERIC');
         await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS sg_range_max NUMERIC');
+
+        // 4b. PI 液位輔助查核：儲槽 tag 設定 + 液位紀錄實際抄表時刻與查核快照
+        console.log('Ensuring PI level-check columns...');
+        await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS pi_percent_factor NUMERIC');
+        await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS pi_level_tag TEXT');
+        await client.query("ALTER TABLE tanks ADD COLUMN IF NOT EXISTS pi_level_unit TEXT DEFAULT 'PERCENT'");
+        await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS pi_check_tolerance_cm REAL');
+        await client.query('ALTER TABLE tanks ADD COLUMN IF NOT EXISTS pi_refill_min_rise_cm REAL');
+        await client.query('ALTER TABLE readings ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ');
+        await client.query('ALTER TABLE readings ADD COLUMN IF NOT EXISTS pi_level_cm REAL'); // 抄表當下 PI 換算公分（未校正原始值，供後續迴歸校正）
+        await client.query('ALTER TABLE readings ADD COLUMN IF NOT EXISTS pi_check JSONB');
+
+        // 4c. PI 線上液位校正公式與歷程資料表
+        console.log('Ensuring tank_calibrations and logs tables...');
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS tank_calibrations (
+                tank_id TEXT PRIMARY KEY REFERENCES tanks(id) ON DELETE CASCADE,
+                slope NUMERIC DEFAULT 1.0,
+                intercept NUMERIC DEFAULT 0.0,
+                r_squared NUMERIC,
+                residual_std NUMERIC,
+                sample_count INTEGER DEFAULT 0,
+                mode TEXT DEFAULT 'AUTO',
+                note TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS tank_calibration_logs (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                tank_id TEXT REFERENCES tanks(id) ON DELETE CASCADE,
+                old_slope NUMERIC,
+                old_intercept NUMERIC,
+                new_slope NUMERIC,
+                new_intercept NUMERIC,
+                action_type TEXT,
+                reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // 4d. 自動預設 PI Tag 映射（若尚未設定）
+        const defaultTagRules = [
+            { match: (n) => (n.includes('CT-1') || n.includes('一階')) && n.includes('硫酸'), tag: 'W52_LI-H2SO4-Z.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-1') || n.includes('一階')) && n.includes('漂白水'), tag: 'W52_PH1-3_1.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-1') || n.includes('一階')) && n.includes('分散劑'), tag: 'W52_PH1-3_2.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-1') || n.includes('一階')) && (n.includes('腐蝕結垢') || n.includes('結垢')), tag: 'W52_PH1-3_3.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-1') || n.includes('一階')) && n.includes('銅腐蝕'), tag: 'W52_PH1-3_4.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-1') || n.includes('一階')) && n.includes('殺菌'), tag: 'W52_PH1-3_5.PV', unit: 'PERCENT' },
+
+            { match: (n) => (n.includes('CT-2') || n.includes('二階')) && n.includes('硫酸'), tag: 'W52_LI-CF24-Y.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-2') || n.includes('二階')) && n.includes('漂白水'), tag: 'W52_PH2-2_1.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-2') || n.includes('二階')) && n.includes('分散劑'), tag: 'W52_PH2-3_4.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-2') || n.includes('二階')) && (n.includes('腐蝕結垢') || n.includes('結垢')), tag: 'W52_PH2-3_3.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-2') || n.includes('二階')) && n.includes('銅腐蝕'), tag: 'W52_PH2-3_2.PV', unit: 'PERCENT' },
+            { match: (n) => (n.includes('CT-2') || n.includes('二階')) && n.includes('殺菌'), tag: 'W52_PH2-3_1.PV', unit: 'PERCENT' },
+
+            { match: (n) => n.includes('清罐劑'), tag: 'W52_LI-CF1T1A-Z.PV', unit: 'CM' },
+            { match: (n) => n.includes('脫氧劑'), tag: 'W52_LI-CF1T2A-Z.PV', unit: 'CM' },
+            { match: (n) => n.includes('中和胺'), tag: 'W52_LI-CF1T3A-Z.PV', unit: 'CM' }
+        ];
+
+        const existingTanks = await client.query('SELECT id, name, pi_level_tag FROM tanks');
+        for (const t of existingTanks.rows) {
+            if (!t.pi_level_tag) {
+                const found = defaultTagRules.find(r => r.match(t.name));
+                if (found) {
+                    await client.query('UPDATE tanks SET pi_level_tag = $1, pi_level_unit = $2 WHERE id = $3', [found.tag, found.unit, t.id]);
+                    console.log(`Auto-mapped PI tag for ${t.name}: ${found.tag}`);
+                }
+            }
+        }
 
         // 5. Fluctuation Alerts table
         console.log('Ensuring fluctuation_alerts table...');
@@ -2479,6 +2558,581 @@ app.get('/mcp-connect/:token', async (req, res) => {
         console.log(`[MCP] 連接成功: ${token}`);
     } catch (err) {
         console.error("[MCP] 連接錯誤:", err);
+    }
+});
+
+// ==================== PI 液位輔助查核 ====================
+// 以「實際抄表時刻」為錨點比對人工液位與 PI 線上液位計（詳見 levelCheck.js）。
+// 依規範：影響「現在」判斷的即時查核一律使用 recorded values（原始資料），不使用 summary，避免歸檔延遲。
+import { exec as execCb } from 'child_process';
+
+const LC_HOUR_MS = 3600000;
+/** ms → PI Web API 用的台北時間 ISO 字串（明確指定 +08:00，不依賴系統時區） */
+const toTaipeiIso = (ms) => new Date(ms + 8 * LC_HOUR_MS).toISOString().replace(/\.\d{3}Z$/, '+08:00');
+/** Tag 名稱白名單字元，避免注入 PowerShell 腳本 */
+const safePiTag = (t) => (typeof t === 'string' && /^[A-Za-z0-9_.\-]+$/.test(t.trim()) ? t.trim() : null);
+const lcNum = (v) => (v === null || v === undefined || v === '' || isNaN(Number(v)) ? undefined : Number(v));
+
+/**
+ * 批次取得多個 tag 的 recorded values（單一 PowerShell 程序，沿用 piBatchFetch 的驗證方式）。
+ * @param {Array<{tagName:string,startMs:number,endMs:number}>} requests
+ * @returns {Promise<Map<string,{series:Array<{t:number,v:number}>, error:string|null}>>}
+ */
+const piRecordedFetch = async (requests) => {
+    const baseUrl = PI_BASE_URL;
+    const piUser = process.env.PI_USERNAME || '';
+    const piPass = process.env.PI_PASSWORD || '';
+    const piDomain = process.env.PI_DOMAIN || '';
+    const useEnvCred = piUser && piPass;
+    const fullUser = useEnvCred ? (piDomain ? `${piDomain}\\${piUser}` : piUser) : '';
+    const escapedPwd = useEnvCred ? piPass.replace(/'/g, "''") : '';
+    const uniq = [];
+    for (const r of requests) {
+        const tag = safePiTag(r.tagName);
+        if (tag && !uniq.some((u) => u.tagName === tag)) uniq.push({ ...r, tagName: tag });
+    }
+    const resultMap = new Map();
+    if (uniq.length === 0) return resultMap;
+
+    const psScript = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$OutputEncoding = [Text.Encoding]::UTF8
+[Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+$ErrorActionPreference = 'Stop'
+${useEnvCred
+            ? `$secPwd = ConvertTo-SecureString '${escapedPwd}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential('${fullUser}', $secPwd)`
+            : `$cred = $null`}
+function PiGet($url) {
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($url)
+            $req.Method = 'GET'; $req.Accept = 'application/json'; $req.PreAuthenticate = $true; $req.Timeout = 30000
+            if ($null -ne $cred) { $req.Credentials = $cred } else { $req.UseDefaultCredentials = $true }
+            $resp = $req.GetResponse()
+            $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $body = $reader.ReadToEnd(); $reader.Close(); $resp.Close()
+            return ($body | ConvertFrom-Json)
+        } catch {
+            if ($attempt -eq 3) { throw }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+$out = @{}
+$inv = [Globalization.CultureInfo]::InvariantCulture
+try {
+    $servers = PiGet '${baseUrl}/dataservers'
+    $serverId = $servers.Items[0].WebId
+${uniq.map((r) => `
+    try {
+        $search = PiGet "${baseUrl}/dataservers/$serverId/points?nameFilter=${r.tagName}"
+        if ($search.Items.Count -eq 0) { $out['${r.tagName}'] = @{ data = ''; error = 'Tag Not Found' } }
+        else {
+            $webId = $search.Items[0].WebId
+            $rec = PiGet "${baseUrl}/streams/$webId/recorded?startTime=${encodeURIComponent(toTaipeiIso(r.startMs))}&endTime=${encodeURIComponent(toTaipeiIso(r.endMs))}&maxCount=20000&boundaryType=Outside&selectedFields=Items.Timestamp%3BItems.Value%3BItems.Good"
+            $sb = New-Object System.Text.StringBuilder
+            foreach ($it in $rec.Items) {
+                if ($it.Good -eq $false) { continue }
+                $d = 0.0
+                if (-not [double]::TryParse([string]$it.Value, [Globalization.NumberStyles]::Float, $inv, [ref]$d)) { continue }
+                $ts = $it.Timestamp
+                if ($ts -is [datetime]) { $ts = $ts.ToUniversalTime().ToString('o') }
+                [void]$sb.Append($ts).Append('|').Append($d.ToString($inv)).Append(';')
+            }
+            $out['${r.tagName}'] = @{ data = $sb.ToString(); error = $null }
+        }
+    } catch { $out['${r.tagName}'] = @{ data = ''; error = $_.Exception.Message } }
+`).join('')}
+} catch {
+    $out['_authError'] = $_.Exception.Message
+}
+$out | ConvertTo-Json -Depth 4 -Compress
+`;
+    const tmpFile = join(tmpdir(), 'pi_recorded_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.ps1');
+    try {
+        writeFileSync(tmpFile, psScript, { encoding: 'utf8', flag: 'w' });
+        const stdout = await new Promise((resolve, reject) => {
+            execCb('powershell -NoProfile -ExecutionPolicy Bypass -File "' + tmpFile + '"',
+                { encoding: 'utf8', timeout: 120000, maxBuffer: 50 * 1024 * 1024 },
+                (err, so, se) => (err ? reject(new Error((se || err.message || '').toString().slice(0, 300))) : resolve(so)));
+        });
+        const parsed = JSON.parse(stdout.trim());
+        for (const r of uniq) {
+            if (parsed._authError) { resultMap.set(r.tagName, { series: [], error: 'PI 驗證/連線失敗：' + parsed._authError }); continue; }
+            const item = parsed[r.tagName];
+            if (!item) { resultMap.set(r.tagName, { series: [], error: 'No result returned' }); continue; }
+            const series = String(item.data || '').split(';').filter(Boolean).map((s) => {
+                const [ts, v] = s.split('|');
+                return { t: Date.parse(ts), v: Number(v) };
+            }).filter((p) => Number.isFinite(p.t) && Number.isFinite(p.v)).sort((a, b) => a.t - b.t);
+            resultMap.set(r.tagName, { series, error: item.error || null });
+        }
+    } catch (e) {
+        for (const r of uniq) resultMap.set(r.tagName, { series: [], error: String(e.message || e).slice(0, 300) });
+    } finally {
+        try { unlinkSync(tmpFile); } catch (_) { }
+    }
+    return resultMap;
+};
+
+/** DB tanks 列 → levelCheck 所需的儲槽物件 */
+const mapTankForLevelCheck = (row) => {
+    let dimensions = row.dimensions;
+    if (typeof dimensions === 'string') { try { dimensions = JSON.parse(dimensions); } catch (_) { dimensions = undefined; } }
+    return {
+        id: row.id,
+        name: row.name,
+        system: row.system_type,
+        inputUnit: row.input_unit || 'CM',
+        piPercentFactor: lcNum(row.pi_percent_factor),
+        dimensions: dimensions || undefined,
+        factor: lcNum(row.geo_factor),
+        targetDailyUsage: lcNum(row.target_daily_usage),
+        piLevelTag: safePiTag(row.pi_level_tag),
+        piLevelUnit: row.pi_level_unit || 'PERCENT',
+        piCheckToleranceCm: lcNum(row.pi_check_tolerance_cm),
+        piRefillMinRiseCm: lcNum(row.pi_refill_min_rise_cm),
+    };
+};
+
+/**
+ * 液位輸入即時查核
+ * body: { readAt: ms(實際抄表時刻), businessDate: ms(抄表日 00:00), entries: { [tankId]: 輸入值 }, addedLiters?: { [tankId]: 公升 } }
+ */
+/**
+ * 取得所有儲槽的線性回歸校正公式與歷程紀錄
+ */
+app.get('/api/tank-calibrations', async (_req, res) => {
+    try {
+        const calibRes = await pool.query(`
+            SELECT t.id AS tank_id, t.name AS tank_name, t.system_type AS system,
+                   c.slope, c.intercept, c.r_squared, c.residual_std, c.sample_count,
+                   COALESCE(c.mode, 'AUTO') AS mode, c.note, c.updated_at
+            FROM tanks t
+            LEFT JOIN tank_calibrations c ON t.id = c.tank_id
+            WHERE t.pi_level_tag IS NOT NULL
+            ORDER BY t.sort_order, t.name
+        `);
+
+        const logsRes = await pool.query(`
+            SELECT l.*, t.name AS tank_name
+            FROM tank_calibration_logs l
+            JOIN tanks t ON l.tank_id = t.id
+            ORDER BY l.created_at DESC
+            LIMIT 50
+        `);
+
+        res.json({
+            calibrations: calibRes.rows.map(r => ({
+                tankId: r.tank_id,
+                tankName: r.tank_name,
+                system: r.system,
+                slope: r.slope !== null ? Number(r.slope) : 1.0,
+                intercept: r.intercept !== null ? Number(r.intercept) : 0.0,
+                rSquared: r.r_squared !== null ? Number(r.r_squared) : undefined,
+                residualStd: r.residual_std !== null ? Number(r.residual_std) : undefined,
+                sampleCount: r.sample_count || 0,
+                mode: r.mode || 'AUTO',
+                note: r.note || '',
+                updatedAt: r.updated_at
+            })),
+            logs: logsRes.rows.map(r => ({
+                id: r.id,
+                tankId: r.tank_id,
+                tankName: r.tank_name,
+                oldSlope: r.old_slope !== null ? Number(r.old_slope) : undefined,
+                oldIntercept: r.old_intercept !== null ? Number(r.old_intercept) : undefined,
+                newSlope: Number(r.new_slope),
+                newIntercept: Number(r.new_intercept),
+                actionType: r.action_type,
+                reason: r.reason,
+                createdAt: r.created_at
+            }))
+        });
+    } catch (err) {
+        console.error('GET /api/tank-calibrations error:', err);
+        res.status(500).json({ error: '取得校正公式失敗', details: err.message });
+    }
+});
+
+/**
+ * 自動重新計算校正公式 (可針對特定儲槽或全部)
+ */
+app.post('/api/tank-calibrations/recalculate', async (req, res) => {
+    try {
+        const { tankId, reason = '系統自動重新迴歸校正' } = req.body || {};
+        const tankFilter = tankId ? 'AND t.id = $1' : '';
+        const params = tankId ? [tankId] : [];
+        const tanks = (await pool.query(`SELECT id, name, pi_level_tag FROM tanks t WHERE pi_level_tag IS NOT NULL ${tankFilter}`, params)).rows;
+
+        const results = [];
+        for (const t of tanks) {
+            const pairsRes = await pool.query(`
+                SELECT pi_level_cm, level_cm
+                FROM readings
+                WHERE tank_id = $1 AND pi_level_cm IS NOT NULL
+                  AND (pi_check IS NULL OR COALESCE(pi_check->>'status', '') <> 'ERROR')
+                ORDER BY timestamp DESC
+                LIMIT 60
+            `, [t.id]);
+
+            const pairs = pairsRes.rows.map(r => ({ x: Number(r.pi_level_cm), y: Number(r.level_cm) }));
+            const fit = levelCheck.fitCalibration(pairs);
+
+            // 查詢現有校正值
+            const curRes = await pool.query('SELECT slope, intercept FROM tank_calibrations WHERE tank_id = $1', [t.id]);
+            const cur = curRes.rows[0];
+
+            await pool.query(`
+                INSERT INTO tank_calibrations (tank_id, slope, intercept, r_squared, residual_std, sample_count, mode, note, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, 'AUTO', $7, CURRENT_TIMESTAMP)
+                ON CONFLICT (tank_id) DO UPDATE SET
+                    slope = EXCLUDED.slope,
+                    intercept = EXCLUDED.intercept,
+                    r_squared = EXCLUDED.r_squared,
+                    residual_std = EXCLUDED.residual_std,
+                    sample_count = EXCLUDED.sample_count,
+                    mode = 'AUTO',
+                    note = EXCLUDED.note,
+                    updated_at = CURRENT_TIMESTAMP
+            `, [t.id, fit.slope, fit.intercept, fit.rSquared ?? null, fit.residualStd ?? null, fit.n, reason]);
+
+            await pool.query(`
+                INSERT INTO tank_calibration_logs (tank_id, old_slope, old_intercept, new_slope, new_intercept, action_type, reason)
+                VALUES ($1, $2, $3, $4, $5, 'AUTO_RECALCULATE', $6)
+            `, [t.id, cur ? cur.slope : null, cur ? cur.intercept : null, fit.slope, fit.intercept, reason]);
+
+            results.push({ tankId: t.id, tankName: t.name, fit });
+        }
+
+        res.json({ success: true, count: results.length, data: results });
+    } catch (err) {
+        console.error('POST /api/tank-calibrations/recalculate error:', err);
+        res.status(500).json({ error: '重新計算校正公式失敗', details: err.message });
+    }
+});
+
+/**
+ * 手動微調儲槽校正公式
+ */
+
+/**
+ * 歷史 PI 液位數據回補與回歸校正
+ * 撈取指定天數（預設 35 天）各槽歷史抄表記錄，向 PI Web API 取得對應時間的 recorded values，
+ * 回填至 readings.pi_level_cm，並立即重新計算各槽的線性回歸公式。
+ */
+app.post('/api/admin/backfill-pi-levels', async (req, res) => {
+    try {
+        const days = Math.min(60, Math.max(1, Number(req.body?.days) || 35));
+        const now = Date.now();
+        const startMs = now - (days * 24 * LC_HOUR_MS);
+        const endMs = now + 2 * LC_HOUR_MS;
+
+        console.log(`[Backfill] 開始回補過去 ${days} 天的 PI 歷史數據 (起點: ${toTaipeiIso(startMs)})...`);
+
+        // 1. 取得所有設定了 PI Tag 的儲槽
+        const tanksRes = await pool.query(`
+            SELECT * FROM tanks WHERE pi_level_tag IS NOT NULL ORDER BY sort_order ASC, name ASC
+        `);
+        const tanks = tanksRes.rows.map(mapTankForLevelCheck);
+
+        if (tanks.length === 0) {
+            return res.json({ success: true, message: '沒有設定 PI Tag 的儲槽', count: 0 });
+        }
+
+        const tankIds = tanks.map(t => t.id);
+
+        // 2. 取得過去指定天數的所有 readings
+        const readingsRes = await pool.query(`
+            SELECT id, tank_id, timestamp, level_cm, read_at
+            FROM readings
+            WHERE timestamp >= $1 AND tank_id = ANY($2)
+            ORDER BY timestamp ASC
+        `, [startMs, tankIds]);
+
+        const allReadings = readingsRes.rows;
+        console.log(`[Backfill] 找到 ${allReadings.length} 筆歷史液位紀錄待比對`);
+
+        // 3. 一次批次抓取所有儲槽的 PI recorded values (單一 PowerShell 程序，極速完成！)
+        const requests = tanks.map(t => ({ tagName: t.piLevelTag, startMs, endMs }));
+        console.log(`[Backfill] 正在批次向 PI 擷取 ${requests.length} 個 Tags 之歷史數據...`);
+        const piMap = await piRecordedFetch(requests);
+
+        let totalUpdated = 0;
+        const details = [];
+
+        // 4. 對每筆 reading 計算對應時刻的 pi_level_cm 並批次寫入資料庫
+        for (const tank of tanks) {
+            const tankReadings = allReadings.filter(r => r.tank_id === tank.id);
+            const pd = piMap.get(tank.piLevelTag);
+            const series = pd?.series || [];
+
+            let updatedInTank = 0;
+            for (const r of tankReadings) {
+                const tTarget = Number(r.read_at ? new Date(r.read_at).getTime() : r.timestamp);
+                const rawPi = levelCheck.piValueAt(series, tTarget, { halfWindowMs: 60 * 60 * 1000, maxGapMs: 12 * LC_HOUR_MS });
+                if (rawPi !== null && !isNaN(rawPi)) {
+                    const piCm = levelCheck.piToCm(tank, rawPi);
+                    if (piCm !== null && !isNaN(piCm)) {
+                        await pool.query('UPDATE readings SET pi_level_cm = $1 WHERE id = $2', [piCm, r.id]);
+                        updatedInTank++;
+                        totalUpdated++;
+                    }
+                }
+            }
+
+            details.push({
+                tankId: tank.id,
+                tankName: tank.name,
+                tag: tank.piLevelTag,
+                readingsCount: tankReadings.length,
+                updated: updatedInTank,
+                seriesCount: series.length
+            });
+        }
+
+        console.log(`[Backfill] 回填完成，共更新 ${totalUpdated} 筆 readings.pi_level_cm`);
+
+        // 5. 重新迴歸計算所有儲槽的校正公式
+        const recalResults = [];
+        for (const t of tanks) {
+            const pairsRes = await pool.query(`
+                SELECT pi_level_cm, level_cm
+                FROM readings
+                WHERE tank_id = $1 AND pi_level_cm IS NOT NULL
+                  AND (pi_check IS NULL OR COALESCE(pi_check->>'status', '') <> 'ERROR')
+                ORDER BY timestamp DESC
+                LIMIT 60
+            `, [t.id]);
+
+            const pairs = pairsRes.rows.map(r => ({ x: Number(r.pi_level_cm), y: Number(r.level_cm) }));
+            const fit = levelCheck.fitCalibration(pairs);
+
+            const curRes = await pool.query('SELECT slope, intercept FROM tank_calibrations WHERE tank_id = $1', [t.id]);
+            const cur = curRes.rows[0];
+
+            await pool.query(`
+                INSERT INTO tank_calibrations (tank_id, slope, intercept, r_squared, residual_std, sample_count, mode, note, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, 'AUTO', $7, CURRENT_TIMESTAMP)
+                ON CONFLICT (tank_id) DO UPDATE SET
+                    slope = EXCLUDED.slope,
+                    intercept = EXCLUDED.intercept,
+                    r_squared = EXCLUDED.r_squared,
+                    residual_std = EXCLUDED.residual_std,
+                    sample_count = EXCLUDED.sample_count,
+                    mode = 'AUTO',
+                    note = EXCLUDED.note,
+                    updated_at = CURRENT_TIMESTAMP
+            `, [t.id, fit.slope, fit.intercept, fit.rSquared ?? null, fit.residualStd ?? null, fit.n, `歷史數據回補 (${days} 天) 自動迴歸計算`]);
+
+            await pool.query(`
+                INSERT INTO tank_calibration_logs (tank_id, old_slope, old_intercept, new_slope, new_intercept, action_type, reason)
+                VALUES ($1, $2, $3, $4, $5, 'AUTO_RECALCULATE', $6)
+            `, [t.id, cur ? cur.slope : null, cur ? cur.intercept : null, fit.slope, fit.intercept, `歷史數據回補 (${days} 天) 自動迴歸計算`]);
+
+            recalResults.push({ tankId: t.id, tankName: t.name, fit });
+        }
+
+        res.json({
+            success: true,
+            days,
+            totalReadings: allReadings.length,
+            totalUpdated,
+            details,
+            calibrations: recalResults
+        });
+    } catch (err) {
+        console.error('POST /api/admin/backfill-pi-levels error:', err);
+        res.status(500).json({ error: '回補歷史數據失敗', details: err.message });
+    }
+});
+
+app.put('/api/tank-calibrations/:tankId', async (req, res) => {
+    try {
+        const { tankId } = req.params;
+        const { slope, intercept, note = '', reason = '手動調整' } = req.body;
+        if (!Number.isFinite(Number(slope)) || !Number.isFinite(Number(intercept))) {
+            return res.status(400).json({ error: '斜率 (slope) 與截距 (intercept) 必須為有效數值' });
+        }
+
+        const curRes = await pool.query('SELECT slope, intercept FROM tank_calibrations WHERE tank_id = $1', [tankId]);
+        const cur = curRes.rows[0];
+
+        await pool.query(`
+            INSERT INTO tank_calibrations (tank_id, slope, intercept, mode, note, updated_at)
+            VALUES ($1, $2, $3, 'MANUAL', $4, CURRENT_TIMESTAMP)
+            ON CONFLICT (tank_id) DO UPDATE SET
+                slope = EXCLUDED.slope,
+                intercept = EXCLUDED.intercept,
+                mode = 'MANUAL',
+                note = EXCLUDED.note,
+                updated_at = CURRENT_TIMESTAMP
+        `, [tankId, slope, intercept, note]);
+
+        await pool.query(`
+            INSERT INTO tank_calibration_logs (tank_id, old_slope, old_intercept, new_slope, new_intercept, action_type, reason)
+            VALUES ($1, $2, $3, $4, $5, 'MANUAL_UPDATE', $6)
+        `, [tankId, cur ? cur.slope : null, cur ? cur.intercept : null, slope, intercept, reason]);
+
+        res.json({ success: true, tankId, slope, intercept });
+    } catch (err) {
+        console.error('PUT /api/tank-calibrations error:', err);
+        res.status(500).json({ error: '更新校正公式失敗', details: err.message });
+    }
+});
+
+/**
+ * 液位輸入即時查核
+ * 以抄表日 00:00 ~ 24:00 (台北時間 UTC+8) 計算全日用量與 PI 線上液位計對照
+ */
+app.post('/api/level-check', async (req, res) => {
+    try {
+        const { readAt, businessDate, entries = {}, addedLiters = {} } = req.body || {};
+
+        // 解析台北時間 00:00:00 至 24:00:00 (UTC+8)
+        let dayStartMs, dayEndMs, tNow;
+        if (businessDate) {
+            const bTs = Number(businessDate);
+            if (Number.isFinite(bTs)) {
+                const d = new Date(bTs + 8 * LC_HOUR_MS);
+                dayStartMs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - 8 * LC_HOUR_MS;
+                dayEndMs = dayStartMs + 24 * LC_HOUR_MS;
+            } else if (typeof businessDate === 'string') {
+                const parts = businessDate.split('-').map(Number);
+                if (parts.length === 3) {
+                    dayStartMs = Date.UTC(parts[0], parts[1] - 1, parts[2]) - 8 * LC_HOUR_MS;
+                    dayEndMs = dayStartMs + 24 * LC_HOUR_MS;
+                }
+            }
+        }
+        if (!dayStartMs) {
+            const now = new Date(Date.now() + 8 * LC_HOUR_MS);
+            dayStartMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - 8 * LC_HOUR_MS;
+            dayEndMs = dayStartMs + 24 * LC_HOUR_MS;
+        }
+
+        // 定點比對時刻：若有給 readAt 則使用，否則以抄表日 23:59:59 (或當前時刻)
+        if (Number.isFinite(Number(readAt))) {
+            tNow = Number(readAt);
+        } else {
+            const nowMs = Date.now();
+            tNow = (nowMs >= dayStartMs && nowMs <= dayEndMs) ? nowMs : (dayEndMs - 1000);
+        }
+
+        const allTanks = (await pool.query('SELECT * FROM tanks')).rows.map(mapTankForLevelCheck);
+        const piTanks = allTanks.filter((t) => t.piLevelTag);
+        const entered = Object.entries(entries)
+            .filter(([, v]) => v !== '' && v !== null && v !== undefined && Number.isFinite(Number(v)))
+            .map(([id, v]) => ({ tank: allTanks.find((t) => t.id === id), value: Number(v) }))
+            .filter((e) => e.tank);
+
+        // 讀取各槽儲存的校正公式 (tank_calibrations)
+        const storedCalibs = (await pool.query('SELECT * FROM tank_calibrations')).rows;
+        const calibs = {};
+        for (const t of allTanks) {
+            const sc = storedCalibs.find(c => c.tank_id === t.id);
+            if (sc && sc.slope !== null) {
+                calibs[t.id] = {
+                    slope: Number(sc.slope),
+                    intercept: Number(sc.intercept),
+                    rSquared: sc.r_squared !== null ? Number(sc.r_squared) : undefined,
+                    residualStd: sc.residual_std !== null ? Number(sc.residual_std) : undefined,
+                    n: sc.sample_count || 0,
+                    mode: sc.mode || 'LINEAR'
+                };
+            }
+        }
+
+        // 若無已存校正公式，以近 30 筆讀值動態計算
+        const uncalibrated = allTanks.filter(t => !calibs[t.id]);
+        if (uncalibrated.length > 0) {
+            const calibRows = (await pool.query(`
+                SELECT tank_id, pi_level_cm, level_cm FROM (
+                    SELECT tank_id, pi_level_cm, level_cm,
+                           ROW_NUMBER() OVER (PARTITION BY tank_id ORDER BY timestamp DESC) AS rn
+                    FROM readings
+                    WHERE pi_level_cm IS NOT NULL
+                      AND (pi_check IS NULL OR COALESCE(pi_check->>'status', '') <> 'ERROR')
+                      AND timestamp < $1
+                ) x WHERE rn <= 30`, [dayStartMs])).rows;
+
+            for (const t of uncalibrated) {
+                calibs[t.id] = levelCheck.fitCalibration(
+                    calibRows.filter((r) => r.tank_id === t.id).map((r) => ({ x: Number(r.pi_level_cm), y: Number(r.level_cm) })));
+            }
+        }
+
+        // 前一日人工紀錄 (以抄表日 00:00 前一筆或剛好在前一日 00:00 的紀錄)
+        const prevs = {};
+        for (const { tank } of entered) {
+            const q = await pool.query(
+                `SELECT level_cm, added_amount_liters, timestamp, EXTRACT(EPOCH FROM read_at) * 1000 AS read_at_ms
+                 FROM readings WHERE tank_id = $1 AND timestamp < $2
+                 ORDER BY timestamp DESC LIMIT 1`,
+                [tank.id, dayStartMs + 1000]);
+            const row = q.rows[0];
+            if (row) {
+                prevs[tank.id] = {
+                    levelCm: Number(row.level_cm),
+                    readAt: dayStartMs, // 以日曆日 00:00:00 為區間起點
+                    estimated: false,
+                    addedAmountLiters: Number(row.added_amount_liters) || 0
+                };
+            }
+        }
+
+        // PI 資料擷取範圍：涵蓋當日 00:00 到 24:00 (含緩衝區)
+        const windowStart = dayStartMs - 1 * LC_HOUR_MS;
+        const windowEnd = Math.max(dayEndMs + 15 * 60000, tNow + 15 * 60000);
+        const piData = await piRecordedFetch(piTanks.map((t) => ({ tagName: t.piLevelTag, startMs: windowStart, endMs: windowEnd })));
+
+        // 各槽在 tNow 的線上參考值 (供錯欄位比對)
+        const others = piTanks.map((t) => {
+            const raw = levelCheck.piValueAt(piData.get(t.piLevelTag)?.series || [], tNow);
+            return {
+                tank: t,
+                refCm: raw === null ? null : levelCheck.applyCalib(calibs[t.id], levelCheck.piToCm(t, raw)),
+                tol: levelCheck.toleranceCm(t, calibs[t.id]),
+            };
+        });
+
+        const results = {};
+        for (const { tank, value } of entered) {
+            if (!tank.piLevelTag) {
+                results[tank.id] = { status: 'NO_PI', messages: ['未設定 PI 液位 Tag'] };
+                continue;
+            }
+            const pd = piData.get(tank.piLevelTag) || { series: [], error: 'No result' };
+            if (pd.error && pd.series.length === 0) {
+                results[tank.id] = { status: 'NO_PI', messages: [`PI 讀取失敗：${pd.error}`] };
+                continue;
+            }
+            results[tank.id] = levelCheck.evaluate({
+                tank, inputValue: value, tNow, prev: prevs[tank.id] || null, series: pd.series,
+                calib: calibs[tank.id], others, addedLiters: Number(addedLiters[tank.id]) || 0,
+            });
+        }
+
+        res.json({ results, readAt: tNow, window: { start: toTaipeiIso(dayStartMs), end: toTaipeiIso(dayEndMs) } });
+    } catch (err) {
+        console.error('POST /api/level-check error:', err);
+        res.status(500).json({ error: '液位查核失敗', details: err.message });
+    }
+});
+
+app.get('/api/pi-level-test', async (req, res) => {
+    try {
+        const tag = safePiTag(req.query.tag);
+        if (!tag) return res.status(400).json({ error: 'Tag 名稱無效（僅允許英數字、底線、點、減號）' });
+        const now = Date.now();
+        const r = (await piRecordedFetch([{ tagName: tag, startMs: now - 2 * LC_HOUR_MS, endMs: now }])).get(tag);
+        const last = r?.series?.[r.series.length - 1];
+        if (!last) return res.json({ ok: false, error: r?.error || '近 2 小時無資料' });
+        res.json({ ok: true, tag, value: last.v, time: toTaipeiIso(last.t), points: r.series.length });
+    } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
     }
 });
 
@@ -4071,6 +4725,14 @@ const instrumentExpiryTimer = setInterval(() => {
         .catch(err => console.error('[Instrument Expiry] 到期提醒檢查失敗:', err.message));
 }, 60 * 60 * 1000);
 instrumentExpiryTimer.unref?.();
+
+// 管理端服務重啟（由 NSSM 自動重新拉起）
+app.post('/api/admin/restart', (req, res) => {
+    res.json({ success: true, message: '後端服務即將在 1 秒後重啟 (NSSM 自動重啟)...' });
+    setTimeout(() => {
+        process.exit(0);
+    }, 1000);
+});
 
 // 啟動伺服器
 app.listen(PORT, '0.0.0.0', () => {

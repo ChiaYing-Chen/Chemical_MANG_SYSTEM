@@ -14,6 +14,8 @@ export interface ImportAnomaly {
     nextDate?: string;
     nextValue?: number;
     isPossibleRefill?: boolean; // 當液位上升超過閾值15倍以上，判斷為可能補藥
+    piCheckDetails?: string[];
+    piSwapSuspect?: string;
 }
 
 interface ImportAnomalyModalProps {
@@ -128,6 +130,21 @@ export const ImportAnomalyModal: React.FC<ImportAnomalyModalProps> = ({
                                                         </span>
                                                     )}
                                                 </div>
+                                                {!item.isPossibleRefill && (
+                                                    <div className="my-1.5 text-xs font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-md flex items-center gap-1.5 shadow-xs">
+                                                        <Icons.Alert className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                                                        <span>請確認是否KEY錯欄位或數字</span>
+                                                    </div>
+                                                )}
+                                                {item.piCheckDetails && item.piCheckDetails.length > 0 && (
+                                                    <div className="my-1 space-y-1">
+                                                        {item.piCheckDetails.map((msg, idx) => (
+                                                            <div key={idx} className="text-xs text-slate-700 bg-slate-50 border border-slate-200 px-2 py-1 rounded flex items-center gap-1">
+                                                                <span className="text-blue-600 font-bold">PI線上依據:</span> {msg}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                )}
                                                 {onAddNote && (
                                                     <div className="flex items-center gap-2">
                                                         {notedIds.has(item.id) ? (

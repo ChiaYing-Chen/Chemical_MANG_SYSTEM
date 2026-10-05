@@ -640,3 +640,62 @@ export const checkManualWaterQualityAdmin = async (userId?: string): Promise<{ i
     if (!response.ok) throw new Error('Failed to check manual water quality admin status');
     return await response.json();
 };
+
+// ==================== PI Level Check & Calibrations ====================
+
+export const checkLevels = async (payload: {
+    readAt?: number;
+    businessDate?: number | string;
+    entries: Record<string, number | string>;
+    addedLiters?: Record<string, number>;
+}) => {
+    const res = await fetch(`${API_BASE_URL}/level-check`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Level check failed');
+    return await res.json();
+};
+
+export const fetchTankCalibrations = async () => {
+    const res = await fetch(`${API_BASE_URL}/tank-calibrations`);
+    if (!res.ok) throw new Error('Failed to fetch tank calibrations');
+    return await res.json();
+};
+
+export const recalculateTankCalibration = async (tankId?: string, reason?: string) => {
+    const res = await fetch(`${API_BASE_URL}/tank-calibrations/recalculate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tankId, reason })
+    });
+    if (!res.ok) throw new Error('Recalculate failed');
+    return await res.json();
+};
+
+export const updateTankCalibration = async (tankId: string, data: { slope: number; intercept: number; note?: string; reason?: string }) => {
+    const res = await fetch(`${API_BASE_URL}/tank-calibrations/${tankId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error('Update calibration failed');
+    return await res.json();
+};
+
+export const testPiLevel = async (tag: string) => {
+    const res = await fetch(`${API_BASE_URL}/pi-level-test?tag=${encodeURIComponent(tag)}`);
+    if (!res.ok) throw new Error('Test PI level failed');
+    return await res.json();
+};
+
+export const backfillPiLevels = async (days: number = 35) => {
+    const res = await fetch(`${API_BASE_URL}/admin/backfill-pi-levels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ days })
+    });
+    if (!res.ok) throw new Error('Backfill failed');
+    return await res.json();
+};
