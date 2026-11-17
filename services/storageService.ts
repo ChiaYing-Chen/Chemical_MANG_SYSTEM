@@ -159,10 +159,17 @@ export class StorageService {
         }
     }
 
-    static async saveReadingsBatch(readings: Reading[]): Promise<void> {
+    static async saveReadingsBatch(readings: Reading[], alerts?: Partial<FluctuationAlert>[]): Promise<{ sent: boolean; error?: string } | undefined> {
         const BATCH_SIZE = 100;
         try {
             const apiReadings = readings.map(r => StorageService.convertReadingToAPI(r));
+            // 人工批次只送一次，讓液位與異常共用交易。
+            if (alerts !== undefined) {
+                const result = await API.createReadingsBatch(apiReadings, {
+                    alerts: alerts.map(a => StorageService.convertAlertToAPI(a))
+                });
+                return result.notification || { sent: false, error: '液位已儲存，但未收到通知結果。請勿重複儲存。' };
+            }
 
             for (let i = 0; i < apiReadings.length; i += BATCH_SIZE) {
                 const chunk = apiReadings.slice(i, i + BATCH_SIZE);
@@ -178,9 +185,9 @@ export class StorageService {
 
     // ==================== Chemical Supplies ====================
 
-    static async getSupplies(): Promise<ChemicalSupply[]> {
+    static async getSupplies(tankId?: string): Promise<ChemicalSupply[]> {
         try {
-            const supplies = await API.fetchSupplies();
+            const supplies = await API.fetchSupplies(tankId);
             return supplies.map(s => StorageService.convertSupplyFromAPI(s));
         } catch (err) {
             console.error('Failed to get supplies:', err);

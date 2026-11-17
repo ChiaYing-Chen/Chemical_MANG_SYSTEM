@@ -259,3 +259,50 @@ export const calculateTankVolume = (tank: Tank, levelCm: number): number => {
 
     return 0;
 };
+
+export interface LevelDiffUsageResult {
+    levelDiffCm: number;
+    startVolumeL: number;
+    endVolumeL: number;
+    volumeDiffL: number;
+    usageKg: number;
+}
+
+/**
+ * 依起始液位與結束液位（cm）及指定比重，計算液位差、體積差（L）與用量（kg）。
+ */
+export const calculateLevelDifferenceUsage = (
+    tank: Tank,
+    startLevelCm: number,
+    endLevelCm: number,
+    specificGravity: number
+): LevelDiffUsageResult => {
+    const startVolumeL = calculateTankVolume(tank, startLevelCm);
+    const endVolumeL = calculateTankVolume(tank, endLevelCm);
+    const levelDiffCm = startLevelCm - endLevelCm;
+    const volumeDiffL = startVolumeL - endVolumeL;
+    const usageKg = volumeDiffL * specificGravity;
+
+    return {
+        levelDiffCm,
+        startVolumeL,
+        endVolumeL,
+        volumeDiffL,
+        usageKg
+    };
+};
+
+/**
+ * 篩選指定桶槽最近 N 筆有效藥劑批次（依生效日由新到舊排序）。
+ */
+export const getRecentSupplyOptions = (
+    supplies: ChemicalSupply[],
+    tankId: string,
+    limit: number = 4
+): ChemicalSupply[] => {
+    return supplies
+        .filter(s => s.tankId === tankId && Number.isFinite(s.specificGravity) && s.specificGravity > 0)
+        .sort((a, b) => b.startDate - a.startDate)
+        .slice(0, limit);
+};
+

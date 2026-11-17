@@ -309,3 +309,37 @@ tbody tr.instrument-opening-expired:hover {
   border-color: #9f4455;
   color: #fecdd3;
 }
+
+/* 原生 <dialog> 液位差用量換算小工具樣式（僅在 :modal 狀態設定位置與滾動隔離） */
+dialog.level-calc-dialog:modal {
+  overscroll-behavior: contain;
+  margin: auto;
+  padding: 0;
+  border: 1px solid #2d3b55;
+  border-radius: 0.75rem;
+  background-color: #121a2e;
+  color: #f8fafc;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.75);
+  max-width: 28rem;
+  width: calc(100% - 2rem);
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+}
+
+dialog.level-calc-dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background-color: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(2px);
+}
+
+dialog.level-calc-dialog input,
+dialog.level-calc-dialog select {
+  font: inherit;
+  font-size: max(1rem, 1em);
+}
+
+dialog.level-calc-dialog :is(input, select, button):focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}

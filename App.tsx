@@ -2,11 +2,10 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { StorageService } from './services/storageService';
 import * as API from './services/apiService';
 import { calculateTankVolume } from './utils/calculationUtils';
-import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType, FluctuationAlert, LevelCheckResult } from './types';
+import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType, FluctuationAlert } from './types';
 import { Icons } from './components/Icons';
 import { LoadingOverlay } from './components/LoadingOverlay';
 import { ImportAnomalyModal, ImportAnomaly } from './components/ImportAnomalyModal';
-import { PiCalibrationModal } from './components/PiCalibrationModal';
 import * as XLSX from 'xlsx';
 import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
@@ -17,6 +16,7 @@ import { ExcelImportView } from './views/ExcelImportView';
 import { WaterQualityTrendsView } from './views/WaterQualityTrendsView';
 import InstrumentManagementView from './views/InstrumentManagementView';
 import { FluctuationAlertsView } from './components/FluctuationAlertsView';
+import { LevelUsageCalculatorModal } from './components/LevelUsageCalculatorModal';
 import { formatAnomalyMessage } from './utils/textUtils';
 
 // --- Helper Components ---
@@ -444,10 +444,11 @@ const TankStatusCard: React.FC<{
     dragProps?: any,
     onNavigate?: (tankId: string) => void,
     onDeliveryClick?: (tank: any) => void,
+    onLevelUsageClick?: (tank: any) => void,
     onLevelClick?: (tank: any) => void,
     onDailyUsageClick?: (tank: any) => void,
     lowLevelWarningText?: string
-}> = ({ tank, dragProps, onNavigate, onDeliveryClick, onLevelClick, onDailyUsageClick, lowLevelWarningText = '存量偏低，請叫藥' }) => {
+}> = ({ tank, dragProps, onNavigate, onDeliveryClick, onLevelUsageClick, onLevelClick, onDailyUsageClick, lowLevelWarningText = '存量偏低，請叫藥' }) => {
 
     const handleCardClick = () => {
         if (onNavigate) {
@@ -459,6 +460,13 @@ const TankStatusCard: React.FC<{
         e.stopPropagation(); // Prevent card click
         if (onDeliveryClick) {
             onDeliveryClick(tank);
+        }
+    };
+
+    const handleLevelUsageClick = (e: React.MouseEvent) => {
+        e.stopPropagation(); // Prevent card click
+        if (onLevelUsageClick) {
+            onLevelUsageClick(tank);
         }
     };
 
@@ -547,21 +555,35 @@ const TankStatusCard: React.FC<{
                     </div>
                 </div>
 
-                <div className="flex items-center justify-between mt-1">
+                <div className="flex items-center justify-between gap-2 mt-1">
                     <div className="text-[10px] text-slate-400 flex items-center">
                         <Icons.ClipboardPen className="w-3 h-3 mr-1 opacity-50" />
                         {tank.lastReading ? new Date(tank.lastReading.timestamp).toLocaleDateString() : '無紀錄'}
                     </div>
 
-                    {onDeliveryClick && (
-                        <button
-                            onClick={handleDeliveryClick}
-                            className="text-xs bg-amber-100 hover:bg-amber-200 text-amber-700 px-2 py-1 rounded flex items-center gap-1 transition-colors"
-                            title="交貨評估"
-                        >
-                            📦 評估
-                        </button>
-                    )}
+                    <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                        {onLevelUsageClick && (
+                            <button
+                                type="button"
+                                onClick={handleLevelUsageClick}
+                                className="text-xs bg-blue-100 hover:bg-blue-200 text-blue-700 px-2 py-1 rounded flex items-center gap-1 transition-colors"
+                                title="液位差用量換算"
+                            >
+                                <Icons.Calculator className="w-3.5 h-3.5" />
+                                換算
+                            </button>
+                        )}
+                        {onDeliveryClick && (
+                            <button
+                                type="button"
+                                onClick={handleDeliveryClick}
+                                className="text-xs bg-amber-100 hover:bg-amber-200 text-amber-700 px-2 py-1 rounded flex items-center gap-1 transition-colors"
+                                title="交貨評估"
+                            >
+                                📦 評估
+                            </button>
+                        )}
+                    </div>
                 </div>
             </div>
         </div>
@@ -914,7 +936,7 @@ const DailyUsageTrendModal: React.FC<{
                     const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
                     const offset = d.getTimezoneOffset();
                     const localDate = new Date(d.getTime() - (offset * 60 * 1000));
-                    
+
                     const Y = localDate.getFullYear();
                     const M = String(localDate.getMonth() + 1).padStart(2, '0');
                     const D = String(localDate.getDate()).padStart(2, '0');
@@ -1016,6 +1038,7 @@ const DailyUsageTrendModal: React.FC<{
 
 const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onNavigate?: (tankId: string, month: number, year: number) => void, onLoading?: (loading: boolean) => void, usageCalcWeeks?: number, lowLevelWarningText?: string }> = ({ tanks, readings, onRefresh, onNavigate, onLoading, usageCalcWeeks = 8, lowLevelWarningText = '存量偏低，請叫藥' }) => {
     const [deliveryModalTank, setDeliveryModalTank] = useState<any>(null);
+    const [levelCalcModalTank, setLevelCalcModalTank] = useState<any>(null);
     const [trendModalTank, setTrendModalTank] = useState<any>(null);
     const [dailyUsageModalTank, setDailyUsageModalTank] = useState<any>(null);
 
@@ -1149,7 +1172,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
         const sourceIndex = groupTanks.findIndex(t => t.id === tankId);
         if (sourceIndex === -1 || sourceIndex === targetIndex) return;
 
-        // Optimistic Reordering locally is hard without local state for tanks, 
+        // Optimistic Reordering locally is hard without local state for tanks,
         // so we just call API and refresh.
         // Calculate new Sort Orders.
         // We need the full list of tanks in this group to calculate new orders.
@@ -1167,13 +1190,13 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
         // BUT the user request says "Design sorting for Cooling System, Phase 1 & 2".
         // It's safest if these tanks have distinct sortOrder values.
         // Let's assume we simply update the sortOrder of *these* tanks to be consistent.
-        // A simple strategy: Use Date.now() + index to ensure global uniqueness and order? 
+        // A simple strategy: Use Date.now() + index to ensure global uniqueness and order?
         // Or just index if we filter by group in SQL? SQL logic sorts ALL tanks by sort_order.
         // If we only update this group's tanks to 0, 1, 2... and others are 0, collision happens.
         // Solution: Get the MIN sort_order of the current group (or 0) and re-index from there?
         // Or better: Just give them large spaced numbers?
-        // Let's try 1000 * groupIndex + index. 
-        // Cooling1: 1000 + index. Cooling2: 2000 + index. 
+        // Let's try 1000 * groupIndex + index.
+        // Cooling1: 1000 + index. Cooling2: 2000 + index.
         // This ensures separation.
 
         const baseIndex = targetGroup === 'coolingArea1' ? 1000 : 2000;
@@ -1222,6 +1245,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                     tank={t}
                                     onNavigate={handleNavigate}
                                     onDeliveryClick={setDeliveryModalTank}
+                                    onLevelUsageClick={setLevelCalcModalTank}
                                     onLevelClick={setTrendModalTank}
                                     onDailyUsageClick={setDailyUsageModalTank}
                                     lowLevelWarningText={lowLevelWarningText}
@@ -1247,6 +1271,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                                     tank={t}
                                     onNavigate={handleNavigate}
                                     onDeliveryClick={setDeliveryModalTank}
+                                    onLevelUsageClick={setLevelCalcModalTank}
                                     onLevelClick={setTrendModalTank}
                                     onDailyUsageClick={setDailyUsageModalTank}
                                     lowLevelWarningText={lowLevelWarningText}
@@ -1276,7 +1301,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} onDailyUsageClick={setDailyUsageModalTank} lowLevelWarningText={lowLevelWarningText} />)}
+                            {groups.boiler.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelUsageClick={setLevelCalcModalTank} onLevelClick={setTrendModalTank} onDailyUsageClick={setDailyUsageModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -1293,7 +1318,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 gap-4">
-                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} onDailyUsageClick={setDailyUsageModalTank} lowLevelWarningText={lowLevelWarningText} />)}
+                            {groups.denox.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelUsageClick={setLevelCalcModalTank} onLevelClick={setTrendModalTank} onDailyUsageClick={setDailyUsageModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -1307,7 +1332,7 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                     </div>
                     <div className="p-6">
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelClick={setTrendModalTank} onDailyUsageClick={setDailyUsageModalTank} lowLevelWarningText={lowLevelWarningText} />)}
+                            {groups.others.map(t => <TankStatusCard key={t.id} tank={t} onNavigate={handleNavigate} onDeliveryClick={setDeliveryModalTank} onLevelUsageClick={setLevelCalcModalTank} onLevelClick={setTrendModalTank} onDailyUsageClick={setDailyUsageModalTank} lowLevelWarningText={lowLevelWarningText} />)}
                         </div>
                     </div>
                 </section>
@@ -1318,6 +1343,14 @@ const DashboardView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: (
                 <DeliveryEstimationModal
                     tank={deliveryModalTank}
                     onClose={() => setDeliveryModalTank(null)}
+                />
+            )}
+
+            {/* Level Difference Usage Calculator Modal */}
+            {levelCalcModalTank && (
+                <LevelUsageCalculatorModal
+                    tank={levelCalcModalTank}
+                    onClose={() => setLevelCalcModalTank(null)}
                 />
             )}
 
@@ -1344,7 +1377,7 @@ const DataEntryView: React.FC<{
     tanks: Tank[],
     readings: Reading[],
     onSave: (r: Reading) => void,
-    onBatchSave: (rs: Reading[]) => void,
+    onBatchSave: (rs: Reading[], alerts?: Partial<FluctuationAlert>[]) => Promise<void>,
     onUpdateTank: (tank?: Tank) => void;
     onLoading: (loading: boolean) => void;
     appSettings: any;
@@ -1367,16 +1400,14 @@ const DataEntryView: React.FC<{
     const [anomalySource, setAnomalySource] = useState<'IMPORT' | 'MANUAL'>('IMPORT');
     const [pendingReadings, setPendingReadings] = useState<Reading[]>([]);
     const [convertedCountInfo, setConvertedCountInfo] = useState<number>(0);
-    const [piLiveChecks, setPiLiveChecks] = useState<Record<string, LevelCheckResult>>({});
-    const [piChecking, setPiChecking] = useState(false);
-    const [readAtInput, setReadAtInput] = useState(() => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 16));
+    const [batchSaving, setBatchSaving] = useState(false);
 
     const getRecentDailyUsageKg = (tankId: string) => {
         const usageCalcWeeks = appSettings?.usageCalcWeeks || 4;
         const now = Date.now();
         const weeksAgo = now - (usageCalcWeeks * 7 * 24 * 60 * 60 * 1000);
         const tankReadings = readings.filter(r => r.tankId === tankId && r.timestamp >= weeksAgo).sort((a, b) => a.timestamp - b.timestamp);
-        
+
         if (tankReadings.length >= 2) {
             let totalUsageLiters = 0;
             for (let i = 1; i < tankReadings.length; i++) {
@@ -1394,7 +1425,7 @@ const DataEntryView: React.FC<{
         return '0.0';
     };
 
-    const checkAnomalies = (newReadings: Reading[], piChecksMap?: Record<string, LevelCheckResult>): ImportAnomaly[] => {
+    const checkAnomalies = (newReadings: Reading[]): ImportAnomaly[] => {
         const anomalies: ImportAnomaly[] = [];
 
         // Group by tank for validation
@@ -1495,7 +1526,6 @@ const DataEntryView: React.FC<{
                                 });
                             }
 
-                            const piCheckForReading = piChecksMap ? piChecksMap[tank.id] : undefined;
                             anomalies.push({
                                 id: newReading.id,
                                 tankId: tank.id,
@@ -1508,38 +1538,12 @@ const DataEntryView: React.FC<{
                                 nextDate: next ? new Date(next.timestamp).toLocaleDateString() : undefined,
                                 nextValue: next ? next.calculatedVolume : undefined,
                                 isPossibleRefill,
-                                piCheckDetails: piCheckForReading?.messages,
-                                piSwapSuspect: piCheckForReading?.swapSuspect?.tankName
                             });
                         }
                     }
                 }
             }
         });
-
-        // 檢查 PI 線上液位比對結果 (若 PI 比對發現 ERROR 或 WARN 但尚未列入異常)
-        if (piChecksMap) {
-            for (const newReading of newReadings) {
-                const piCheck = piChecksMap[newReading.tankId];
-                if (piCheck && (piCheck.status === 'ERROR' || piCheck.status === 'WARN')) {
-                    const alreadyIn = anomalies.some(a => a.id === newReading.id);
-                    if (!alreadyIn) {
-                        const tank = tanks.find(t => t.id === newReading.tankId);
-                        anomalies.push({
-                            id: newReading.id,
-                            tankId: newReading.tankId,
-                            date: new Date(newReading.timestamp).toLocaleDateString(),
-                            tankName: tank?.name || newReading.tankId,
-                            reason: piCheck.messages.join('； ') || '請確認是否KEY錯欄位或數字',
-                            currentValue: newReading.calculatedVolume,
-                            isPossibleRefill: piCheck.refill?.detected,
-                            piCheckDetails: piCheck.messages,
-                            piSwapSuspect: piCheck.swapSuspect?.tankName
-                        });
-                    }
-                }
-            }
-        }
 
         // 排序異常列表：先按日期，再按儲槽名稱
         anomalies.sort((a, b) => {
@@ -1559,9 +1563,7 @@ const DataEntryView: React.FC<{
 
         onLoading(true);
         try {
-            // Save Anomalies as Alerts
-            if (importAnomalies.length > 0) {
-                const alertsToSave: Partial<FluctuationAlert>[] = importAnomalies.map(anomaly => {
+            const alertsToSave: Partial<FluctuationAlert>[] = importAnomalies.map(anomaly => {
                     // 將 toLocaleDateString() 產生的非標準日期（例如 2026/2/26）
                     // 轉換為標準 ISO 格式 YYYY-MM-DD（月和日需補零）
                     const parsedDate = new Date(anomaly.date.replace(/\//g, '-'));
@@ -1585,16 +1587,15 @@ const DataEntryView: React.FC<{
                         note: '' // Initial note is empty
                     };
                 });
+            if (anomalySource !== 'MANUAL' && alertsToSave.length > 0) {
                 await StorageService.saveAlertsBatch(alertsToSave);
             }
 
             if (anomalySource === 'MANUAL') {
-                // Manual Entry Saving
-                await onBatchSave(pendingReadings);
+                // 人工批次由後端一起儲存異常並通知。
+                await onBatchSave(pendingReadings, alertsToSave);
                 setBatchLevels({}); // Clear manual inputs
-                setPiLiveChecks({}); // Clear inline PI checks
-                const uncheckedCount = pendingReadings.filter(r => r.piCheck?.status === 'NO_PI').length;
-                alert(`已成功儲存 ${pendingReadings.length} 筆液位紀錄${uncheckedCount ? `；其中 ${uncheckedCount} 筆未完成 PI 查核` : ''}`);
+                alert(`已成功儲存 ${pendingReadings.length} 筆液位紀錄`);
             } else {
                 // Import Saving
                 await onBatchSave(pendingReadings);
@@ -2071,39 +2072,9 @@ const DataEntryView: React.FC<{
             if (!confirmed) return;
         }
 
-        const readAtMs = Date.parse(`${readAtInput}:00+08:00`);
-        if (!Number.isFinite(readAtMs) || readAtMs > Date.now() + 60000) {
-            alert('請填寫有效的實際抄表時間（台北時間），不可填未來時間');
-            return;
-        }
         onLoading(true);
-        setPiChecking(true);
+        setBatchSaving(true);
         try {
-            // 查核與保存使用同一個實際抄表時間；所屬日期僅用於日報歸屬。
-            let currentPiChecks: Record<string, LevelCheckResult> = {};
-            try {
-                const piResp = await API.checkLevels({
-                    businessDate: date,
-                    readAt: readAtMs,
-                    entries: batchLevels,
-                    addedLiters: Object.fromEntries(existingRecordsForDate.map(r => [r.tankId, r.addedAmountLiters || 0]))
-                });
-                if (piResp?.results) {
-                    currentPiChecks = piResp.results;
-                    setPiLiveChecks(piResp.results);
-                }
-            } catch (piErr) {
-                console.warn('PI check during submit warning:', piErr);
-            }
-            for (const [tankId, value] of entries) {
-                if (value && !currentPiChecks[tankId]) {
-                    currentPiChecks[tankId] = { status: 'NO_PI', messages: ['PI 查核連線失敗或未回傳此槽結果，本次未完成查核'] };
-                }
-            }
-            setPiLiveChecks(currentPiChecks);
-            const unchecked = entries.filter(([id, value]) => value && currentPiChecks[id]?.status === 'NO_PI');
-            if (unchecked.length && !window.confirm(`下列儲槽未完成 PI 查核：\n${unchecked.map(([id]) => `${tanks.find(t => t.id === id)?.name || id}：${currentPiChecks[id].messages.join('；')}`).join('\n')}\n\n是否仍要儲存人工紀錄？本次不視為 PI 查核通過。`)) return;
-
             const newReadings: Reading[] = [];
 
             for (const [tId, valStr] of entries) {
@@ -2136,7 +2107,6 @@ const DataEntryView: React.FC<{
                 // 若有現存紀錄，則重複使用其 ID 以進行覆蓋 (UPSERT)
                 const existingRecord = existingRecordsForDate.find(r => r.tankId === tId);
 
-                const piCheckForTank = currentPiChecks[tId];
                 newReadings.push({
                     id: existingRecord ? existingRecord.id : generateUUID(),
                     tankId: tId,
@@ -2148,14 +2118,11 @@ const DataEntryView: React.FC<{
                     supplyId: activeSup?.id,
                     addedAmountLiters: existingRecord?.addedAmountLiters || 0, // 保留原有的加藥量
                     operatorName: operator,
-                    readAt: readAtMs,
-                    piLevelCm: piCheckForTank?.piRawCm,
-                    piCheck: piCheckForTank
                 });
             }
 
             if (newReadings.length > 0) {
-                const anomalies = checkAnomalies(newReadings, currentPiChecks);
+                const anomalies = checkAnomalies(newReadings);
 
                 if (anomalies.length > 0) {
                     setImportAnomalies(anomalies);
@@ -2166,16 +2133,15 @@ const DataEntryView: React.FC<{
                     return; // Wait for user confirmation
                 }
 
-                await onBatchSave(newReadings);
+                await onBatchSave(newReadings, []);
                 setBatchLevels({}); // Clear inputs
-                setPiLiveChecks({});
-                alert(`已成功儲存 ${newReadings.length} 筆液位紀錄${unchecked.length ? `；其中 ${unchecked.length} 筆未完成 PI 查核` : ''}`);
+                alert(`已成功儲存 ${newReadings.length} 筆液位紀錄`);
             }
         } catch (e) {
             console.error(e);
             alert('儲存處理過程中發生錯誤');
         } finally {
-            setPiChecking(false);
+            setBatchSaving(false);
             onLoading(false);
         }
     };
@@ -3097,7 +3063,7 @@ const DataEntryView: React.FC<{
             }>
                 <Card
                     title={
-                        activeType === 'A' ? "手動輸入 - 液位紀錄 (批次)" :
+                        activeType === 'A' ? "手動輸入 - 每日液位紀錄 (批次)" :
                             activeType === 'B' ? "手動輸入 - 合約資料" :
                                 activeType === 'C' ? "手動輸入 - 冷卻水參數" : "手動輸入 - 鍋爐水參數"
                     }
@@ -3111,7 +3077,8 @@ const DataEntryView: React.FC<{
                             <div className="flex flex-wrap gap-3 items-center justify-between bg-blue-50 p-3 rounded-lg border border-blue-100 mb-4">
                                 <div className="flex flex-wrap items-center gap-4">
                                     <div>
-                                        <label className="block text-sm font-medium text-blue-900">抄表所屬日期</label>
+                                        <label className="block text-sm font-medium text-blue-900">用量所屬日期</label>
+                                        <p className="text-xs text-slate-400">填入本日結算液位；系統依桶槽形狀換算存量及日使用量。</p>
                                         <input
                                             type="date"
                                             value={date}
@@ -3120,12 +3087,6 @@ const DataEntryView: React.FC<{
                                             className="mt-1 block w-full rounded-md border-blue-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
                                             required
                                         />
-                                    </div>
-                                    <div>
-                                        <label className="block text-sm font-medium text-blue-900">實際抄表時間（台北）</label>
-                                        <input type="datetime-local" value={readAtInput} onChange={e => setReadAtInput(e.target.value)} required className="mt-1 block rounded-md border-blue-300 text-sm" />
-                                        <button type="button" className="text-xs text-blue-700" onClick={() => setReadAtInput(new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 16))}>帶入現在時間</button>
-                                        <p className="text-xs text-slate-500">補登或修改舊紀錄時，請填當時實際抄表時間。</p>
                                     </div>
                                     <div className="text-sm text-blue-700 pt-5">
                                         <span className="bg-blue-200 px-2 py-1 rounded text-xs mr-2">提示</span>
@@ -3143,14 +3104,14 @@ const DataEntryView: React.FC<{
                                     </Button>
                                     <Button
                                         type="submit"
-                                        disabled={piChecking}
+                                        disabled={batchSaving}
                                         className="shrink-0 justify-center text-sm py-2 px-6 shadow-lg flex items-center"
-                                        title="儲存液位紀錄，並自動連帶執行線上 PI 液位對照查核防呆"
+                                        title="儲存所有已輸入的液位紀錄"
                                     >
-                                        {piChecking ? (
+                                        {batchSaving ? (
                                             <>
                                                 <Icons.Activity className="w-4 h-4 mr-2 animate-spin" />
-                                                PI 對照檢查與儲存中...
+                                                儲存中...
                                             </>
                                         ) : (
                                             <>
@@ -3236,31 +3197,7 @@ const DataEntryView: React.FC<{
                                                                 <div className="absolute right-3 top-2.5 text-xs text-slate-400 font-bold pointer-events-none">
                                                                     {unitLabel}
                                                                 </div>
-                                                                {piLiveChecks[tank.id] && (() => {
-                                                                    const chk = piLiveChecks[tank.id];
-                                                                    if (chk.status === 'OK') {
-                                                                        return (
-                                                                            <div className="text-[10px] text-green-700 mt-1 flex items-center gap-1 font-medium bg-green-50 px-1.5 py-0.5 rounded border border-green-200">
-                                                                                <Icons.Check className="w-3 h-3 text-green-600 shrink-0" />
-                                                                                <span>PI參考: {chk.piRefInputUnit} (正常)</span>
-                                                                            </div>
-                                                                        );
-                                                                    }
-                                                                    if (chk.status === 'ERROR' || chk.status === 'WARN') {
-                                                                        return (
-                                                                            <div className="text-[10px] text-red-700 mt-1 bg-red-50 px-1.5 py-0.5 rounded border border-red-200 font-bold flex flex-col gap-0.5">
-                                                                                <div className="flex items-center gap-1">
-                                                                                    <Icons.Alert className="w-3 h-3 text-red-600 shrink-0" />
-                                                                                    <span>請確認是否KEY錯欄位或數字 (PI參考: {chk.piRefInputUnit})</span>
-                                                                                </div>
-                                                                                {chk.messages.map((m, mi) => (
-                                                                                    <div key={mi} className="text-[9px] text-slate-600 font-normal">・{m}</div>
-                                                                                ))}
-                                                                            </div>
-                                                                        );
-                                                                    }
-                                                                    return <div className="text-xs text-amber-800 mt-1">未完成 PI 查核：{chk.messages.join('；')}</div>;
-                                                                })()}
+
                                                             </div>
                                                         </div>
                                                     );
@@ -4910,12 +4847,12 @@ const AnalysisView: React.FC<{
                     }) || selectedTank.cwsParams; // Fallback only if tank.cwsParams exists (legacy), but ideally restrict like AnnualDataView
 
                     // Strict sync with AnnualDataView: AnnualDataView logic does NOT use fallback if logic was updated to match implementation plan
-                    // The implementation plan for AnnualDataView removed fallback. 
+                    // The implementation plan for AnnualDataView removed fallback.
                     // Let's check if we should be strict here too.
                     // The recent change to AnnualDataView REMOVED the fallback to tank.cwsParams if looking for weekly data fails to find one?
-                    // Actually, AnnualDataView implementation: 
+                    // Actually, AnnualDataView implementation:
                     // const cwsParam = tankCwsHistory.find(...) || tank.cwsParams;
-                    // It STILL has fallback in the code I inserted? 
+                    // It STILL has fallback in the code I inserted?
                     // Wait, looking at Step 134 diff:
                     // const cwsParam = tankCwsHistory.find(...) || tank.cwsParams; <-- REMOVED fallback? No, the diff showed:
                     // - }) || tank.cwsParams;
@@ -6251,7 +6188,6 @@ const ImportantNotesView: React.FC<{ thresholdWarningText?: string }> = ({ thres
 
 const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: () => void, onLoading: (loading: boolean) => void }> = ({ tanks, readings, onRefresh, onLoading }) => {
     const [editingTank, setEditingTank] = useState<Tank | null>(null);
-    const [showPiCalibModal, setShowPiCalibModal] = useState(false);
     const [currentSG, setCurrentSG] = useState<{ sg: number; chemicalName: string } | null>(null);
 
     // 當編輯儲槽變更時，載入該儲槽的當前藥劑比重
@@ -6792,7 +6728,7 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                                 {editingTank.inputUnit === 'LIQUID_PERCENT' && (
                                     <div className="mt-3 space-y-2">
                                         <p className="text-xs text-blue-600">
-                                            輸入值為 0–100 的百分比（例如電子液位計讀數）。系統將依下方係數換算為公分。
+                                            人工百分比輸入依下方係數換算為公分，請依現場量程填寫。
                                         </p>
                                         <div className="flex items-center gap-3">
                                             <label className="text-sm text-slate-600 whitespace-nowrap">
@@ -6802,14 +6738,14 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                                                 type="number"
                                                 step="0.01"
                                                 min="0.01"
-                                                value={editingTank.piPercentFactor ?? ((editingTank.dimensions?.height ?? 100) / 100).toFixed(2)}
-                                                onChange={e => updateTankField('piPercentFactor', Number(e.target.value))}
+                                                value={editingTank.piPercentFactor ?? ''}
+                                                onChange={e => updateTankField('piPercentFactor', e.target.value === '' ? undefined : Number(e.target.value))}
                                                 className={`${inputClassName} w-32`}
-                                                placeholder="例如 3.0"
+                                                placeholder="未手動設定"
                                             />
                                         </div>
                                         <p className="text-xs text-slate-500">
-                                            範例：CT-1 高度 300cm → 係數 3.0（即 50% × 3.0 = 150 cm）
+                                            此係數用於人工百分比輸入轉公分。
                                             {editingTank.piPercentFactor && (
                                                 <span className="text-slate-700 font-medium ml-2">
                                                     ｜當前：50% → {(50 * editingTank.piPercentFactor).toFixed(1)} cm
@@ -6820,87 +6756,12 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
                                 )}
                             </div>
 
-                            {/* PI Online Level Check Settings */}
-                            <div className="md:col-span-2 mt-4 p-3.5 bg-blue-50/70 rounded-lg border border-blue-200">
-                                <div className="flex items-center justify-between mb-2">
-                                    <label className="text-sm font-bold text-blue-900 flex items-center gap-1.5">
-                                        <Icons.Activity className="w-4 h-4 text-blue-600" />
-                                        PI 線上液位計對照設定 (輔助查核輸入依據)
-                                    </label>
-                                    <button
-                                        type="button"
-                                        onClick={() => setShowPiCalibModal(true)}
-                                        className="text-xs text-blue-700 hover:text-blue-900 font-bold flex items-center gap-1 bg-white px-2.5 py-1 rounded border border-blue-300 shadow-xs"
-                                    >
-                                        <Icons.Calculator className="w-3.5 h-3.5" />
-                                        查看/調校線性公式與歷程
-                                    </button>
-                                </div>
-                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                                    <div>
-                                        <label className="block text-slate-700 font-medium mb-1">PI Tag 名稱</label>
-                                        <input
-                                            type="text"
-                                            value={editingTank.piLevelTag || ''}
-                                            onChange={e => updateTankField('piLevelTag', e.target.value)}
-                                            placeholder="例如 W52_PH1-3_1.PV"
-                                            className={inputClassName}
-                                        />
-                                    </div>
-                                    <div>
-                                        <label className="block text-slate-700 font-medium mb-1">PI 原始單位</label>
-                                        <select
-                                            value={editingTank.piLevelUnit || 'PERCENT'}
-                                            onChange={e => updateTankField('piLevelUnit', e.target.value)}
-                                            className={inputClassName}
-                                        >
-                                            <option value="PERCENT">液位百分比 (0~100%)</option>
-                                            <option value="CM">公分 (cm)</option>
-                                        </select>
-                                    </div>
-                                    <div>
-                                        <label className="block text-slate-700 font-medium mb-1">容許誤差 (公分, 預設 5 cm)</label>
-                                        <input
-                                            type="number"
-                                            step="0.5"
-                                            value={editingTank.piCheckToleranceCm ?? ''}
-                                            onChange={e => updateTankField('piCheckToleranceCm', e.target.value ? Number(e.target.value) : undefined)}
-                                            placeholder="預設 5.0"
-                                            className={inputClassName}
-                                        />
-                                    </div>
-                                    <div className="flex items-end">
-                                        <button
-                                            type="button"
-                                            onClick={async () => {
-                                                if (!editingTank.piLevelTag) {
-                                                    alert('請先填寫 PI Tag 名稱');
-                                                    return;
-                                                }
-                                                try {
-                                                    const res = await API.testPiLevel(editingTank.piLevelTag);
-                                                    if (res.ok) {
-                                                        alert(`測試讀取成功！\nTag: ${res.tag}\n當前最新值: ${res.value}\n記錄時間: ${res.time}`);
-                                                    } else {
-                                                        alert(`測試失敗: ${res.error}`);
-                                                    }
-                                                } catch (e: any) {
-                                                    alert('測試失敗: ' + (e.message || String(e)));
-                                                }
-                                            }}
-                                            className="px-3 py-2 bg-blue-600 text-white rounded font-bold hover:bg-blue-700 transition-colors shadow-xs"
-                                        >
-                                            測試讀取 Tag 即時值
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
+
                         </div>
                     </div>
 
                     <hr className="border-slate-200" />
 
-                    <PiCalibrationModal isOpen={showPiCalibModal} onClose={() => setShowPiCalibModal(false)} />
 
                     {/* Calculation Logic */}
                     <div>
@@ -7115,6 +6976,7 @@ const SettingsView: React.FC<{ tanks: Tank[], readings: Reading[], onRefresh: ()
 
 // === PARAMS SETTINGS VIEW ===
 const ParamsSettingsView: React.FC<{
+    tanks: Tank[];
     appSettings: {
         usageCalcWeeks: number;
         lowLevelWarningText: string;
@@ -7122,10 +6984,9 @@ const ParamsSettingsView: React.FC<{
         possibleRefillText: string;
     };
     setAppSettings: React.Dispatch<React.SetStateAction<any>>;
-}> = ({ appSettings, setAppSettings }) => {
+}> = ({ tanks, appSettings, setAppSettings }) => {
     const [localSettings, setLocalSettings] = useState(appSettings);
     const [saved, setSaved] = useState(false);
-    const [showPiCalibModal, setShowPiCalibModal] = useState(false);
 
     // Sync local state when prop updates (e.g. from DB load)
     useEffect(() => {
@@ -7242,49 +7103,6 @@ const ParamsSettingsView: React.FC<{
                 </div>
             </Card>
 
-            {/* PI 線上液位校正公式與調校歷程 Card */}
-            <Card className="mt-6">
-                <div className="p-6 space-y-4">
-                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-                        <div className="flex items-center gap-3">
-                            <div className="p-2.5 bg-indigo-100 rounded-lg text-indigo-700 shrink-0">
-                                <Icons.Calculator className="w-6 h-6" />
-                            </div>
-                            <div>
-                                <h3 className="text-lg font-bold text-slate-800">
-                                    PI 線上液位校正公式與調校歷程
-                                </h3>
-                                <p className="text-sm text-slate-500">
-                                    管理冷卻水與鍋爐桶槽 PI 儀表讀值換算至現場液位之線性回歸模型（現場液位 = ax + b）與完整異動紀錄
-                                </p>
-                            </div>
-                        </div>
-                        <Button
-                            type="button"
-                            onClick={() => setShowPiCalibModal(true)}
-                            className="bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-2 px-4 py-2.5 shadow-sm shrink-0 justify-center"
-                        >
-                            <Icons.Calculator className="w-4 h-4" />
-                            開啟回歸公式與歷程管理
-                        </Button>
-                    </div>
-
-                    <div className="bg-slate-50 p-4 rounded-lg border border-slate-200 text-xs text-slate-600 space-y-2">
-                        <div className="font-semibold text-slate-700 flex items-center gap-1.5">
-                            <Icons.Info className="w-4 h-4 text-indigo-600" />
-                            功能說明與校正準則：
-                        </div>
-                        <ul className="list-disc pl-5 space-y-1 text-slate-600">
-                            <li><strong>校正公式計算</strong>：使用具有實際抄表時間的有效配對。少於 3 筆保留原公式；3～6 筆或 PI 變化不足 20 cm 僅校正偏移，其餘才進行線性回歸。</li>
-                            <li><strong>手動微調與歷程</strong>：若現場感測器校正或零點偏移，可手動微調參數，所有變動均會記錄於「調校歷程」中備查。</li>
-                            <li><strong>自動連帶防呆比對</strong>：於「數據輸入」點擊「批次儲存所有輸入」時，系統將自動套用此處校正公式連帶進行對照查核，即時比對是否 KEY 錯小數點或一二階欄位對調。</li>
-                        </ul>
-                    </div>
-                </div>
-            </Card>
-
-            {/* PI Calibration Modal */}
-            <PiCalibrationModal isOpen={showPiCalibModal} onClose={() => setShowPiCalibModal(false)} />
         </div>
     );
 };
@@ -7450,8 +7268,9 @@ const App: React.FC = () => {
         await refreshData();
     };
 
-    const handleBatchSaveReadings = async (newReadings: Reading[]) => {
-        await StorageService.saveReadingsBatch(newReadings);
+    const handleBatchSaveReadings = async (newReadings: Reading[], alerts?: Partial<FluctuationAlert>[]) => {
+        const notification = await StorageService.saveReadingsBatch(newReadings, alerts);
+        if (notification && !notification.sent) alert(notification.error);
         await refreshData();
     }
 
@@ -7473,7 +7292,7 @@ const App: React.FC = () => {
             case 'water-trends': return <WaterQualityTrendsView />;
             case 'instrument-management': return <InstrumentManagementView />;
             case 'import': return <ExcelImportView tanks={tanks} onComplete={refreshData} onLoading={setIsLoading} />;
-            case 'params': return <ParamsSettingsView appSettings={appSettings} setAppSettings={setAppSettings} />;
+            case 'params': return <ParamsSettingsView tanks={tanks} appSettings={appSettings} setAppSettings={setAppSettings} />;
             default: return <DashboardView tanks={tanks} readings={readings} onRefresh={refreshData} usageCalcWeeks={appSettings.usageCalcWeeks} lowLevelWarningText={appSettings.lowLevelWarningText} />;
         }
     };

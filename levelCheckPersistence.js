@@ -1,15 +1,27 @@
-import { fitCalibration } from './levelCheck.js';
+import { fitCalibration, requiresPiLevelCheck, calibrationSourceKey } from './levelCheck.js';
+
+/** 回歸與畫面共用相同有效樣本篩選條件。 */
+export async function getCalibrationPairs(client, tank) {
+    return (await client.query(`
+        SELECT pi_level_cm, level_cm FROM readings
+        WHERE tank_id = $1 AND pi_level_cm IS NOT NULL
+          AND (
+            (pi_check->'calibrationPair'->>'sourceKey' = $2
+             AND pi_check->'calibrationPair'->>'basis' IN ('MIDNIGHT_WINDOW', 'TIMED_WINDOW'))
+            OR (read_at IS NOT NULL AND pi_check->'calibrationPair' IS NULL
+                AND COALESCE(pi_check->>'basis', '') NOT IN ('DAILY_USAGE', 'DECLINE_RATE')
+                AND (pi_check IS NULL OR COALESCE(pi_check->>'status', '') NOT IN ('ERROR', 'NO_PI')))
+          )
+        ORDER BY timestamp DESC LIMIT 60`, [tank.id, calibrationSourceKey(tank)])).rows;
+}
 
 /** 呼叫端須在交易內執行，公式與歷程必須一起提交。 */
 export async function recalculateTank(client, tank, reason) {
-    const rows = (await client.query(`
-        SELECT pi_level_cm, level_cm FROM readings
-        WHERE tank_id = $1 AND pi_level_cm IS NOT NULL AND read_at IS NOT NULL
-          AND (pi_check IS NULL OR COALESCE(pi_check->>'status', '') NOT IN ('ERROR', 'NO_PI'))
-        ORDER BY timestamp DESC LIMIT 60`, [tank.id])).rows;
+    if (!requiresPiLevelCheck(tank)) return { tankId: tank.id, tankName: tank.name, updated: false, reason: '此藥劑免 PI 液位比對' };
+    const rows = await getCalibrationPairs(client, tank);
     const fit = fitCalibration(rows.map(r => ({ x: Number(r.pi_level_cm), y: Number(r.level_cm) })));
     if (fit.n < 3 || fit.mode === 'NONE') {
-        return { tankId: tank.id, tankName: tank.name, updated: false, reason: '有效配對不足 3 筆，保留原公式', fit };
+        return { tankId: tank.id, tankName: tank.name, updated: false, reason: `有效配對 ${fit.n} 筆，不足 3 筆；請先回補午夜時窗，穩定樣本不足時保留原公式`, fit };
     }
     const cur = (await client.query('SELECT slope, intercept FROM tank_calibrations WHERE tank_id = $1 FOR UPDATE', [tank.id])).rows[0];
     await client.query(`

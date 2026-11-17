@@ -99,11 +99,35 @@ export interface Tank {
   piRefillMinRiseCm?: number;
 }
 
-export type LevelCheckStatus = 'OK' | 'WARN' | 'ERROR' | 'NO_PI';
+export type LevelCheckStatus = 'OK' | 'WARN' | 'ERROR' | 'NO_PI' | 'SKIPPED';
 
 export interface LevelCheckResult {
   status: LevelCheckStatus;
-  readAt?: number; // 本次 PI 查核的實際抄表時間（毫秒）
+  readAt?: number; // 舊版定點查核時間；全天查核不填寫
+  basis?: 'DAILY_USAGE' | 'DECLINE_RATE';
+  usageDeviationPercent?: number | null;
+  usageThresholdPercent?: number;
+  piStartCm?: number;
+  piEndCm?: number;
+  piStartVolumeLiters?: number;
+  piEndVolumeLiters?: number;
+  piRateLitersPerHour?: number;
+  piRateMin?: number;
+  piRateMax?: number;
+  manualRateLitersPerHour?: number;
+  readingRateTolerance?: number;
+  allowedRateMin?: number;
+  allowedRateMax?: number;
+  calibrationPair?: { basis: string; target: number; halfWindowMs: number; spreadCm: number; sourceKey: string; estimated: boolean };
+  periodStart?: number;
+  periodEnd?: number;
+  usageDeviationLiters?: number;
+  toleranceLiters?: number;
+  timingToleranceLiters?: number;
+  readingToleranceLiters?: number;
+  timeUncertaintyHours?: number;
+  acceptableUsageMin?: number;
+  acceptableUsageMax?: number;
   manualCm?: number;
   piRawCm?: number;
   piRefCm?: number;
@@ -130,6 +154,7 @@ export interface TankCalibration {
   rSquared?: number;
   residualStd?: number;
   sampleCount: number;
+  validSampleCount?: number;
   mode: string;
   note?: string;
   updatedAt?: string;
