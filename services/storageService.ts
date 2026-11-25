@@ -2,7 +2,18 @@
 // 保持原有的介面，但底層改用 PostgreSQL API
 
 import * as API from './apiService';
-import { Tank, Reading, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, FluctuationAlert } from '../types';
+import {
+    Tank,
+    Reading,
+    ChemicalSupply,
+    CWSParameterRecord,
+    BWSParameterRecord,
+    ImportantNote,
+    FluctuationAlert,
+    DailyBWSParameterRecord,
+    DailyCWSParameterRecord,
+    DailyParamsSyncResponse
+} from '../types';
 
 export class StorageService {
     // 初始化 - 不再需要，但保留介面相容性
@@ -351,6 +362,52 @@ export class StorageService {
         }
     }
 
+    // ==================== Daily PI Params ====================
+
+    static async syncDailyParams(dateStr: string, force: boolean = false): Promise<DailyParamsSyncResponse> {
+        const res = await API.syncDailyParams(dateStr, force);
+        return {
+            status: res.status,
+            dateStr: res.dateStr,
+            window: res.window || null,
+            bws: (res.bws || []).map((p: any) => StorageService.convertDailyBWSFromAPI(p)),
+            cws: (res.cws || []).map((p: any) => StorageService.convertDailyCWSFromAPI(p)),
+            errors: res.errors || []
+        };
+    }
+
+    static async syncDailyParamsRange(
+        startDate: string,
+        endDate: string,
+        tankId?: string,
+        force: boolean = false
+    ): Promise<{
+        status: string;
+        syncedDays: number;
+        cachedDays: number;
+        bws: DailyBWSParameterRecord[];
+        cws: DailyCWSParameterRecord[];
+        errors: string[];
+    }> {
+        const res = await API.syncDailyParamsRange(startDate, endDate, tankId, force);
+        return {
+            status: res.status,
+            syncedDays: Number(res.syncedDays || 0),
+            cachedDays: Number(res.cachedDays || 0),
+            bws: (res.bws || []).map((p: any) => StorageService.convertDailyBWSFromAPI(p)),
+            cws: (res.cws || []).map((p: any) => StorageService.convertDailyCWSFromAPI(p)),
+            errors: res.errors || []
+        };
+    }
+
+    static async getDailyParams(params: { dateStr?: string; tankId?: string; startDate?: string; endDate?: string }): Promise<{ bws: DailyBWSParameterRecord[]; cws: DailyCWSParameterRecord[] }> {
+        const res = await API.fetchDailyParams(params);
+        return {
+            bws: (res.bws || []).map((p: any) => StorageService.convertDailyBWSFromAPI(p)),
+            cws: (res.cws || []).map((p: any) => StorageService.convertDailyCWSFromAPI(p))
+        };
+    }
+
     // ==================== Important Notes ====================
 
     static async getNotes(): Promise<ImportantNote[]> {
@@ -554,12 +611,23 @@ export class StorageService {
         };
     }
 
+    private static parseNullableFloat(val: any): number | null {
+        if (val === null || val === undefined || val === '') return null;
+        const parsed = parseFloat(val);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+
     private static convertBWSParamFromAPI(apiParam: any): BWSParameterRecord {
         return {
             id: apiParam.id,
             tankId: apiParam.tank_id,
             steamProduction: parseFloat(apiParam.steam_production || 0),
-            date: apiParam.date ? parseInt(apiParam.date) : undefined
+            date: apiParam.date ? parseInt(apiParam.date) : undefined,
+            feedwaterFlow: StorageService.parseNullableFloat(apiParam.feedwater_flow),
+            sprayWaterFlow: StorageService.parseNullableFloat(apiParam.spray_water_flow),
+            makeupWaterFlow: StorageService.parseNullableFloat(apiParam.makeup_water_flow),
+            blowdownFlow: StorageService.parseNullableFloat(apiParam.blowdown_flow),
+            condensateRecoveryRate: StorageService.parseNullableFloat(apiParam.condensate_recovery_rate)
         };
     }
 
@@ -571,6 +639,46 @@ export class StorageService {
             date: param.date
         };
     }
+    private static convertDailyBWSFromAPI(apiParam: any): DailyBWSParameterRecord {
+        return {
+            id: apiParam.id,
+            tankId: apiParam.tank_id,
+            dateStr: apiParam.date_str,
+            date: parseInt(apiParam.date),
+            steamProduction: parseFloat(apiParam.steam_production || 0),
+            feedwaterFlow: StorageService.parseNullableFloat(apiParam.feedwater_flow),
+            sprayWaterFlow: StorageService.parseNullableFloat(apiParam.spray_water_flow),
+            makeupWaterFlow: StorageService.parseNullableFloat(apiParam.makeup_water_flow),
+            blowdownFlow: StorageService.parseNullableFloat(apiParam.blowdown_flow),
+            condensateRecoveryRate: StorageService.parseNullableFloat(apiParam.condensate_recovery_rate),
+            windowStart: parseInt(apiParam.window_start),
+            windowEnd: parseInt(apiParam.window_end),
+            isFinal: Boolean(apiParam.is_final),
+            fetchMethod: apiParam.fetch_method || 'SUMMARY',
+            updatedAt: apiParam.updated_at
+        };
+    }
+
+    private static convertDailyCWSFromAPI(apiParam: any): DailyCWSParameterRecord {
+        return {
+            id: apiParam.id,
+            tankId: apiParam.tank_id,
+            dateStr: apiParam.date_str,
+            date: parseInt(apiParam.date),
+            circulationRate: parseFloat(apiParam.circulation_rate || 0),
+            tempOutlet: parseFloat(apiParam.temp_outlet || 0),
+            tempReturn: parseFloat(apiParam.temp_return || 0),
+            tempDiff: parseFloat(apiParam.temp_diff || 0),
+            concentrationCycles: parseFloat(apiParam.concentration_cycles || 8),
+            concentrationSourceDate: apiParam.concentration_source_date ? parseInt(apiParam.concentration_source_date) : null,
+            windowStart: parseInt(apiParam.window_start),
+            windowEnd: parseInt(apiParam.window_end),
+            isFinal: Boolean(apiParam.is_final),
+            fetchMethod: apiParam.fetch_method || 'SUMMARY',
+            updatedAt: apiParam.updated_at
+        };
+    }
+
     private static convertNoteFromAPI(apiNote: any): ImportantNote {
         return {
             id: apiNote.id,

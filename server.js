@@ -10,6 +10,14 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import * as backendUtils from './backendUtils.js';
 import { notifyBatchReadingResult } from './batchReadingNotification.js';
+import {
+    computeDailyPiWindow,
+    enumerateTaipeiDates,
+    integrateRecordedTotal,
+    computeRecordedAverage,
+    resolveConcentrationCycles,
+    calculateCondensateRecoveryRate
+} from './dailyParamsUtils.js';
 
 // 本地開發環境原生載入 .env 配置
 try {
@@ -507,6 +515,31 @@ const BWS_TAGS = [
     "W52_FI-MS27-D.PV"
 ];
 
+const BWS_CONDENSATE_TAGS = {
+    feedwater: [
+        "W52_FI-FW02-A.PV",
+        "W52_FI-FW02-B.PV",
+        "W52_FI-FW02-C.PV",
+        "W52_FI-FW02-D.PV"
+    ],
+    sprayWater: [
+        "W52_FI-FW11-A.PV",
+        "W52_FI-FW11-B.PV",
+        "W52_FI-FW11-C.PV",
+        "W52_FI-FW11-D.PV"
+    ],
+    makeupWater: [
+        "W52_FI-DW59-Z.PV",
+        "W52_FI-DW59-Y.PV"
+    ],
+    blowdown: [
+        "W52_FI-BC01-A.PV",
+        "W52_FI-BC01-B.PV",
+        "W52_FI-BC01-C.PV",
+        "W52_FI-BC01-D.PV"
+    ]
+};
+
 const CWS_TAGS_CONFIG = {
     'CT-1': {
         flow: ['W52_FI-CW56-Z.PV', 'W52_FI-CW57-Z.PV'],
@@ -655,7 +688,7 @@ ${requests.map((req, i) => `
         writeFileSync(tmpFile, psScript, { encoding: 'utf8', flag: 'w' });
         const stdout = execSync('powershell -NoProfile -ExecutionPolicy Bypass -File "' + tmpFile + '"', {
             encoding: 'utf8',
-            timeout: 120000,
+            timeout: 180000,
             maxBuffer: 50 * 1024 * 1024
         });
 
@@ -685,6 +718,221 @@ ${requests.map((req, i) => `
         const errMsg = (e.stderr || e.message || '').toString().trim().substring(0, 500);
         for (let i = 0; i < requests.length; i++) {
             resultMap.set(requests[i].tagName + '__' + i, { value: 0, error: errMsg.substring(0, 200) });
+        }
+    } finally {
+        try { unlinkSync(tmpFile); } catch (_) { }
+    }
+
+    return resultMap;
+};
+
+/**
+ * Batch fetch daily PI tag values in a SINGLE PowerShell process.
+ * Supports both 'SUMMARY' (for archived ranges >= 8h old) and 'RECORDED' (for recent/in-progress ranges).
+ */
+const piBatchFetchDaily = (requests) => {
+    const baseUrl = PI_BASE_URL;
+
+    const piUser = process.env.PI_USERNAME || '';
+    const piPass = process.env.PI_PASSWORD || '';
+    const piDomain = process.env.PI_DOMAIN || '';
+    const useEnvCred = piUser && piPass;
+
+    const fullUser = useEnvCred
+        ? (piDomain ? `${piDomain}\\${piUser}` : piUser)
+        : '';
+    const escapedPwd = useEnvCred ? piPass.replace(/'/g, "''") : '';
+
+    const psScript = `
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$OutputEncoding = [Text.Encoding]::UTF8
+chcp 65001 | Out-Null
+
+[Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+[Net.ServicePointManager]::Expect100Continue = $false
+[Net.ServicePointManager]::DefaultConnectionLimit = 100
+$ErrorActionPreference = 'Stop'
+
+${useEnvCred
+            ? `$secPwd = ConvertTo-SecureString '${escapedPwd}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential('${fullUser}', $secPwd)`
+            : `$cred = $null`
+        }
+$results = @{}
+$tagWebIdCache = @{}
+$debugLogs = @()
+
+function PiGet($url) {
+    $maxRetry = 3
+    for ($attempt = 1; $attempt -le $maxRetry; $attempt++) {
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($url)
+            $req.Method = 'GET'
+            $req.ContentType = 'application/json'
+            $req.Accept = 'application/json'
+            $req.KeepAlive = $true
+            $req.PreAuthenticate = $true
+            if ($null -ne $cred) {
+                $req.Credentials = $cred
+            } else {
+                $req.UseDefaultCredentials = $true
+            }
+            $req.Timeout = 30000
+
+            $resp = $req.GetResponse()
+            $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $body = $reader.ReadToEnd()
+            $reader.Close()
+            $resp.Close()
+            return ($body | ConvertFrom-Json)
+        } catch {
+            $errDetail = $_.Exception.Message
+            if ($_.Exception.InnerException) {
+                $errDetail += ' | Inner: ' + $_.Exception.InnerException.Message
+                if ($_.Exception.InnerException.InnerException) {
+                    $errDetail += ' | InnerInner: ' + $_.Exception.InnerException.InnerException.Message
+                }
+            }
+            if ($attempt -eq $maxRetry) {
+                throw [System.Exception]::new("Attempt $attempt failed for $url : $errDetail")
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
+try {
+    $servers = PiGet '${baseUrl}/dataservers'
+    if ($null -eq $servers -or $null -eq $servers.Items -or $servers.Items.Count -eq 0) {
+        throw "No data server found. Check permissions."
+    }
+    $serverId = $servers.Items[0].WebId
+    $results['_serverWebId'] = $serverId
+
+${requests.map((req, i) => {
+        const encStart = encodeURIComponent(req.startTime);
+        const encEnd = encodeURIComponent(req.endTime);
+        if (req.mode === 'RECORDED') {
+            return `
+    try {
+        $tagName = '${req.tagName}'
+        if ($tagWebIdCache.ContainsKey($tagName)) {
+            $webId = $tagWebIdCache[$tagName]
+        } else {
+            $searchUrl = "${baseUrl}/dataservers/$serverId/points?nameFilter=$tagName"
+            $search = PiGet $searchUrl
+            if ($search.Items.Count -eq 0) {
+                $results['${req.tagName}__${i}'] = @{ error = 'Tag Not Found'; points = @() }
+                continue
+            }
+            $webId = $search.Items[0].WebId
+            $tagWebIdCache[$tagName] = $webId
+        }
+        $recUrl = "${baseUrl}/streams/$webId/recorded?startTime=${encStart}&endTime=${encEnd}&boundaryType=Interpolated&maxCount=20000"
+        $rec = PiGet $recUrl
+        $pts = New-Object System.Collections.ArrayList
+        if ($rec -and $rec.Items) {
+            foreach ($it in $rec.Items) {
+                if ($it.Good -eq $false -or $null -eq $it.Value) { continue }
+                $vRaw = $it.Value
+                if ($vRaw -is [PSCustomObject] -and $vRaw.PSObject.Properties['Value']) { $vRaw = $vRaw.Value }
+                try {
+                    $numVal = [double]$vRaw
+                    if (-not [double]::IsNaN($numVal) -and -not [double]::IsInfinity($numVal)) {
+                        $tsMs = [DateTimeOffset]::Parse($it.Timestamp).ToUnixTimeMilliseconds()
+                        [void]$pts.Add(@{ t = $tsMs; v = $numVal })
+                    }
+                } catch {}
+            }
+        }
+        $results['${req.tagName}__${i}'] = @{ points = $pts; error = $null }
+    } catch {
+        $errMsg = $_.Exception.Message
+        $results['${req.tagName}__${i}'] = @{ error = $errMsg; points = @() }
+        $debugLogs += "ERROR ${req.tagName}: $errMsg"
+    }
+`;
+        }
+        return `
+    try {
+        $tagName = '${req.tagName}'
+        if ($tagWebIdCache.ContainsKey($tagName)) {
+            $webId = $tagWebIdCache[$tagName]
+        } else {
+            $searchUrl = "${baseUrl}/dataservers/$serverId/points?nameFilter=$tagName"
+            $search = PiGet $searchUrl
+            if ($search.Items.Count -eq 0) {
+                $results['${req.tagName}__${i}'] = @{ error = 'Tag Not Found'; value = 0 }
+                continue
+            }
+            $webId = $search.Items[0].WebId
+            $tagWebIdCache[$tagName] = $webId
+        }
+        $summaryUrl = "${baseUrl}/streams/$webId/summary?startTime=${encStart}&endTime=${encEnd}&summaryType=${req.summaryType}"
+        $summary = PiGet $summaryUrl
+        $item = $summary.Items[0]
+        $val = $item.Value
+        if ($val -is [PSCustomObject] -and $val.PSObject.Properties['Value']) { $val = $val.Value }
+        $results['${req.tagName}__${i}'] = @{ value = [double]$val; error = $null }
+    } catch {
+        $errMsg = $_.Exception.Message
+        $results['${req.tagName}__${i}'] = @{ error = $errMsg; value = 0 }
+        $debugLogs += "ERROR ${req.tagName}: $errMsg"
+    }
+`;
+    }).join('')}
+
+    $results['_debug'] = ($debugLogs -join ' || ')
+    $results | ConvertTo-Json -Depth 6 -Compress
+} catch {
+    $errDetail = $_.Exception.Message
+    if ($_.Exception.InnerException) {
+        $errDetail += ' | Inner: ' + $_.Exception.InnerException.Message
+    }
+    $errResults = @{ _authError = $errDetail; _debug = ($debugLogs -join ' || ') }
+    $errResults | ConvertTo-Json -Compress
+}
+`;
+    const tmpFile = join(tmpdir(), 'pi_daily_batch_' + Date.now() + '.ps1');
+    const resultMap = new Map();
+
+    try {
+        writeFileSync(tmpFile, psScript, { encoding: 'utf8', flag: 'w' });
+        const stdout = execSync('powershell -NoProfile -ExecutionPolicy Bypass -File "' + tmpFile + '"', {
+            encoding: 'utf8',
+            timeout: 180000,
+            maxBuffer: 50 * 1024 * 1024
+        });
+
+        const parsed = JSON.parse(stdout.trim());
+
+        if (parsed._debug) {
+            resultMap.set('_debug', parsed._debug);
+        }
+
+        if (parsed._authError) {
+            resultMap.set('_authError', parsed._authError);
+            for (let i = 0; i < requests.length; i++) {
+                resultMap.set(requests[i].tagName + '__' + i, { value: 0, points: [], error: parsed._authError });
+            }
+        } else {
+            for (let i = 0; i < requests.length; i++) {
+                const key = requests[i].tagName + '__' + i;
+                const r = parsed[key];
+                if (r) {
+                    const pts = Array.isArray(r.points) ? r.points : (r.points ? [r.points] : []);
+                    resultMap.set(key, { value: Number(r.value) || 0, points: pts, error: r.error || null });
+                } else {
+                    resultMap.set(key, { value: 0, points: [], error: 'No result returned' });
+                }
+            }
+        }
+    } catch (e) {
+        const errMsg = (e.stderr || e.message || '').toString().trim().substring(0, 500);
+        resultMap.set('_authError', errMsg);
+        for (let i = 0; i < requests.length; i++) {
+            resultMap.set(requests[i].tagName + '__' + i, { value: 0, points: [], error: errMsg.substring(0, 200) });
         }
     } finally {
         try { unlinkSync(tmpFile); } catch (_) { }
@@ -728,6 +976,18 @@ app.post('/api/pi-import', async (req, res) => {
             for (const tag of BWS_TAGS) {
                 allRequests.push({ tagName: tag, startTime: startStr, endTime: endStr, summaryType: 'Total', _group: 'BWS', _weekStart: week.start });
             }
+            for (const tag of BWS_CONDENSATE_TAGS.feedwater) {
+                allRequests.push({ tagName: tag, startTime: startStr, endTime: endStr, summaryType: 'Total', _group: 'BWS_FW', _weekStart: week.start });
+            }
+            for (const tag of BWS_CONDENSATE_TAGS.sprayWater) {
+                allRequests.push({ tagName: tag, startTime: startStr, endTime: endStr, summaryType: 'Total', _group: 'BWS_SH', _weekStart: week.start });
+            }
+            for (const tag of BWS_CONDENSATE_TAGS.makeupWater) {
+                allRequests.push({ tagName: tag, startTime: startStr, endTime: endStr, summaryType: 'Total', _group: 'BWS_DW', _weekStart: week.start });
+            }
+            for (const tag of BWS_CONDENSATE_TAGS.blowdown) {
+                allRequests.push({ tagName: tag, startTime: startStr, endTime: endStr, summaryType: 'Total', _group: 'BWS_CBD', _weekStart: week.start });
+            }
         }
 
         for (const week of targetWeeks) {
@@ -763,17 +1023,40 @@ app.post('/api/pi-import', async (req, res) => {
         const boilerTanks = boilerTanksRes.rows;
 
         for (const week of targetWeeks) {
-            let weekTotalSum = 0;
-            let errorCount = 0;
-            for (let i = 0; i < allRequests.length; i++) {
-                const req = allRequests[i];
-                if (req._group !== 'BWS' || req._weekStart.getTime() !== week.start.getTime()) continue;
-                const key = req.tagName + '__' + i;
-                const r = results.get(key);
-                if (r && r.error) errorCount++;
-                weekTotalSum += (r ? r.value || 0 : 0);
-            }
-            const safeTotal = Math.round(weekTotalSum * 24);
+            const sumWeeklyGroup = (groupName) => {
+                let sum = 0;
+                let okCount = 0;
+                let errCount = 0;
+                for (let i = 0; i < allRequests.length; i++) {
+                    const req = allRequests[i];
+                    if (req._group !== groupName || req._weekStart.getTime() !== week.start.getTime()) continue;
+                    const key = req.tagName + '__' + i;
+                    const r = results.get(key);
+                    if (r && r.error) errCount++;
+                    else {
+                        okCount++;
+                        sum += (r ? r.value || 0 : 0);
+                    }
+                }
+                return { total: okCount > 0 ? Math.round(sum * 24 * 100) / 100 : null, okCount, errCount };
+            };
+
+            const msRes = sumWeeklyGroup('BWS');
+            const fwRes = sumWeeklyGroup('BWS_FW');
+            const shRes = sumWeeklyGroup('BWS_SH');
+            const dwRes = sumWeeklyGroup('BWS_DW');
+            const cbdRes = sumWeeklyGroup('BWS_CBD');
+
+            const errorCount = msRes.errCount + fwRes.errCount + shRes.errCount + dwRes.errCount + cbdRes.errCount;
+            const safeTotal = Math.round((msRes.total || 0));
+            const condensateRecoveryRate = calculateCondensateRecoveryRate({
+                feedwaterFlow: fwRes.total,
+                sprayWaterFlow: shRes.total,
+                makeupWaterFlow: dwRes.total,
+                blowdownFlow: cbdRes.total,
+                steamProduction: safeTotal,
+                includeSprayWater: true
+            });
             const dateTs = week.start.getTime();
 
             let saveCount = 0;
@@ -792,10 +1075,22 @@ app.post('/api/pi-import', async (req, res) => {
 
                 if (existingSameDay.length > 0) {
                     for (const existing of existingSameDay) {
-                        await pool.query("UPDATE bws_parameters SET steam_production = $1, updated_at = NOW() WHERE id = $2", [safeTotal, existing.id]);
+                        await pool.query(
+                            `UPDATE bws_parameters
+                             SET steam_production = $1, feedwater_flow = $2, spray_water_flow = $3,
+                                 makeup_water_flow = $4, blowdown_flow = $5, condensate_recovery_rate = $6,
+                                 updated_at = NOW()
+                             WHERE id = $7`,
+                            [safeTotal, fwRes.total, shRes.total, dwRes.total, cbdRes.total, condensateRecoveryRate, existing.id]
+                        );
                     }
                 } else {
-                    await pool.query("INSERT INTO bws_parameters (id, tank_id, steam_production, date) VALUES ($1, $2, $3, $4)", [crypto.randomUUID(), tank.id, safeTotal, dateTs]);
+                    await pool.query(
+                        `INSERT INTO bws_parameters
+                            (id, tank_id, steam_production, date, feedwater_flow, spray_water_flow, makeup_water_flow, blowdown_flow, condensate_recovery_rate)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                        [crypto.randomUUID(), tank.id, safeTotal, dateTs, fwRes.total, shRes.total, dwRes.total, cbdRes.total, condensateRecoveryRate]
+                    );
                 }
                 saveCount++;
             }
@@ -889,6 +1184,466 @@ app.post('/api/pi-import', async (req, res) => {
         console.error('PI Import Error:', error);
         logs.push('CRITICAL ERROR: ' + error.message);
         res.status(500).json({ success: false, error: error.message, logs, message: `❌ PI Import Failed: ${error.message}` });
+    }
+});
+
+// ==================== Daily PI Parameters Sync API ====================
+
+const buildDailyPiRequestsForWindow = (win, scope = 'ALL') => {
+    const mode = win.useRecorded ? 'RECORDED' : 'SUMMARY';
+    const requests = [];
+
+    if (scope === 'ALL' || scope === 'BWS') {
+        for (const tag of BWS_TAGS) {
+            requests.push({
+                tagName: tag,
+                startTime: win.startIso,
+                endTime: win.endIso,
+                mode,
+                summaryType: 'Total',
+                _group: 'BWS',
+                _dateStr: win.dateStr
+            });
+        }
+        for (const tag of BWS_CONDENSATE_TAGS.feedwater) {
+            requests.push({ tagName: tag, startTime: win.startIso, endTime: win.endIso, mode, summaryType: 'Total', _group: 'BWS_FW', _dateStr: win.dateStr });
+        }
+        for (const tag of BWS_CONDENSATE_TAGS.sprayWater) {
+            requests.push({ tagName: tag, startTime: win.startIso, endTime: win.endIso, mode, summaryType: 'Total', _group: 'BWS_SH', _dateStr: win.dateStr });
+        }
+        for (const tag of BWS_CONDENSATE_TAGS.makeupWater) {
+            requests.push({ tagName: tag, startTime: win.startIso, endTime: win.endIso, mode, summaryType: 'Total', _group: 'BWS_DW', _dateStr: win.dateStr });
+        }
+        for (const tag of BWS_CONDENSATE_TAGS.blowdown) {
+            requests.push({ tagName: tag, startTime: win.startIso, endTime: win.endIso, mode, summaryType: 'Total', _group: 'BWS_CBD', _dateStr: win.dateStr });
+        }
+    }
+
+    if (scope === 'ALL' || scope === 'CWS') {
+        for (const [areaKey, config] of Object.entries(CWS_TAGS_CONFIG)) {
+            for (const tag of config.flow) {
+                requests.push({ tagName: tag, startTime: win.startIso, endTime: win.endIso, mode, summaryType: 'Average', _group: 'CWS_' + areaKey + '_flow', _dateStr: win.dateStr });
+            }
+            for (const tag of config.tempOut) {
+                requests.push({ tagName: tag, startTime: win.startIso, endTime: win.endIso, mode, summaryType: 'Average', _group: 'CWS_' + areaKey + '_tempOut', _dateStr: win.dateStr });
+            }
+            for (const tag of config.tempRet) {
+                requests.push({ tagName: tag, startTime: win.startIso, endTime: win.endIso, mode, summaryType: 'Average', _group: 'CWS_' + areaKey + '_tempRet', _dateStr: win.dateStr });
+            }
+        }
+    }
+    return requests;
+};
+
+const persistDailyPiWindowResults = async (win, indexedRequests, results, { boilerTanks, ct1Tanks, ct2Tanks, cwsHistByTank }) => {
+    const aggregateTotalGroup = (groupName) => {
+        let rawSum = 0;
+        let okCount = 0;
+        for (const { reqItem, idx } of indexedRequests) {
+            if (reqItem._group !== groupName) continue;
+            const r = results.get(reqItem.tagName + '__' + idx);
+            if (!r || r.error) continue;
+            okCount++;
+            if (win.useRecorded) {
+                rawSum += integrateRecordedTotal(r.points, win.windowStartMs, win.windowEndMs);
+            } else {
+                rawSum += (r.value || 0) * 24;
+            }
+        }
+        return { total: Math.round(rawSum * 100) / 100, okCount };
+    };
+
+    const msGroup = aggregateTotalGroup('BWS');
+    const fwGroup = aggregateTotalGroup('BWS_FW');
+    const shGroup = aggregateTotalGroup('BWS_SH');
+    const dwGroup = aggregateTotalGroup('BWS_DW');
+    const cbdGroup = aggregateTotalGroup('BWS_CBD');
+
+    const dailySteamTotal = msGroup.total;
+    const feedwaterFlow = fwGroup.okCount > 0 ? fwGroup.total : null;
+    const sprayWaterFlow = shGroup.okCount > 0 ? shGroup.total : null;
+    const makeupWaterFlow = dwGroup.okCount > 0 ? dwGroup.total : null;
+    const blowdownFlow = cbdGroup.okCount > 0 ? cbdGroup.total : null;
+    const condensateRecoveryRate = msGroup.okCount > 0
+        ? calculateCondensateRecoveryRate({
+            feedwaterFlow,
+            sprayWaterFlow,
+            makeupWaterFlow,
+            blowdownFlow,
+            steamProduction: dailySteamTotal,
+            includeSprayWater: true
+        })
+        : null;
+
+    if (msGroup.okCount > 0) {
+        for (const tank of boilerTanks) {
+            await pool.query(
+                `INSERT INTO bws_daily_parameters
+                    (id, tank_id, date_str, date, steam_production, feedwater_flow, spray_water_flow, makeup_water_flow, blowdown_flow, condensate_recovery_rate, window_start, window_end, is_final, fetch_method, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+                 ON CONFLICT (tank_id, date_str) DO UPDATE SET
+                    date = EXCLUDED.date,
+                    steam_production = EXCLUDED.steam_production,
+                    feedwater_flow = COALESCE(EXCLUDED.feedwater_flow, bws_daily_parameters.feedwater_flow),
+                    spray_water_flow = COALESCE(EXCLUDED.spray_water_flow, bws_daily_parameters.spray_water_flow),
+                    makeup_water_flow = COALESCE(EXCLUDED.makeup_water_flow, bws_daily_parameters.makeup_water_flow),
+                    blowdown_flow = COALESCE(EXCLUDED.blowdown_flow, bws_daily_parameters.blowdown_flow),
+                    condensate_recovery_rate = COALESCE(EXCLUDED.condensate_recovery_rate, bws_daily_parameters.condensate_recovery_rate),
+                    window_start = EXCLUDED.window_start,
+                    window_end = EXCLUDED.window_end,
+                    is_final = EXCLUDED.is_final,
+                    fetch_method = EXCLUDED.fetch_method,
+                    updated_at = NOW()`,
+                [
+                    crypto.randomUUID(),
+                    tank.id,
+                    win.dateStr,
+                    win.dayStartMs,
+                    dailySteamTotal,
+                    feedwaterFlow,
+                    sprayWaterFlow,
+                    makeupWaterFlow,
+                    blowdownFlow,
+                    condensateRecoveryRate,
+                    win.windowStartMs,
+                    win.windowEndMs,
+                    win.isFinal,
+                    win.fetchMethod
+                ]
+            );
+        }
+    }
+
+    const getDailyAreaData = (areaKey) => {
+        let flowSum = 0, flowOk = 0;
+        let tOutSum = 0, tOutCount = 0;
+        let tRetSum = 0, tRetCount = 0;
+
+        for (const { reqItem, idx } of indexedRequests) {
+            const r = results.get(reqItem.tagName + '__' + idx);
+            if (!r || r.error) continue;
+
+            const val = win.useRecorded
+                ? computeRecordedAverage(r.points, win.windowStartMs, win.windowEndMs)
+                : (r.value || 0);
+            if (val === null || !Number.isFinite(val)) continue;
+
+            if (reqItem._group === 'CWS_' + areaKey + '_flow') {
+                flowSum += val;
+                flowOk++;
+            } else if (reqItem._group === 'CWS_' + areaKey + '_tempOut') {
+                tOutSum += val;
+                tOutCount++;
+            } else if (reqItem._group === 'CWS_' + areaKey + '_tempRet') {
+                tRetSum += val;
+                tRetCount++;
+            }
+        }
+
+        const tOut = tOutCount > 0 ? tOutSum / tOutCount : 0;
+        const tRet = tRetCount > 0 ? tRetSum / tRetCount : 0;
+        return {
+            hasData: flowOk > 0 && tOutCount > 0 && tRetCount > 0,
+            circulationRate: Math.round(flowSum * 100) / 100,
+            tempOutlet: Math.round(tOut * 100) / 100,
+            tempReturn: Math.round(tRet * 100) / 100,
+            tempDiff: Math.round((tRet - tOut) * 100) / 100
+        };
+    };
+
+    const saveDailyCwsArea = async (tanksList, areaKey) => {
+        if (tanksList.length === 0) return;
+        const data = getDailyAreaData(areaKey);
+        if (!data.hasData) return;
+
+        for (const tank of tanksList) {
+            const histRows = cwsHistByTank.get(tank.id) || [];
+            const { cycles, sourceDate } = resolveConcentrationCycles(histRows, win.dayEndMs);
+
+            await pool.query(
+                `INSERT INTO cws_daily_parameters
+                    (id, tank_id, date_str, date, circulation_rate, temp_outlet, temp_return, temp_diff, concentration_cycles, concentration_source_date, window_start, window_end, is_final, fetch_method, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+                 ON CONFLICT (tank_id, date_str) DO UPDATE SET
+                    date = EXCLUDED.date,
+                    circulation_rate = EXCLUDED.circulation_rate,
+                    temp_outlet = EXCLUDED.temp_outlet,
+                    temp_return = EXCLUDED.temp_return,
+                    temp_diff = EXCLUDED.temp_diff,
+                    concentration_cycles = EXCLUDED.concentration_cycles,
+                    concentration_source_date = EXCLUDED.concentration_source_date,
+                    window_start = EXCLUDED.window_start,
+                    window_end = EXCLUDED.window_end,
+                    is_final = EXCLUDED.is_final,
+                    fetch_method = EXCLUDED.fetch_method,
+                    updated_at = NOW()`,
+                [
+                    crypto.randomUUID(),
+                    tank.id,
+                    win.dateStr,
+                    win.dayStartMs,
+                    data.circulationRate,
+                    data.tempOutlet,
+                    data.tempReturn,
+                    data.tempDiff,
+                    cycles,
+                    sourceDate,
+                    win.windowStartMs,
+                    win.windowEndMs,
+                    win.isFinal,
+                    win.fetchMethod
+                ]
+            );
+        }
+    };
+
+    await saveDailyCwsArea(ct1Tanks, 'CT-1');
+    await saveDailyCwsArea(ct2Tanks, 'CT-2');
+};
+
+const loadCwsHistoryMap = async (cwsTanks) => {
+    const map = new Map();
+    if (cwsTanks.length === 0) return map;
+    const allRes = await pool.query(
+        "SELECT tank_id, cws_hardness, makeup_hardness, concentration_cycles, date, updated_at FROM cws_parameters"
+    );
+    for (const row of allRes.rows) {
+        if (!map.has(row.tank_id)) map.set(row.tank_id, []);
+        map.get(row.tank_id).push(row);
+    }
+    return map;
+};
+
+const isBwsDailyRowComplete = (r) => Boolean(
+    r && r.is_final && (r.condensate_recovery_rate !== null || r.feedwater_flow !== null)
+);
+
+const syncDailyParamsForDate = async (dateStr, { force = false, nowMs = Date.now() } = {}) => {
+    const win = computeDailyPiWindow(dateStr, nowMs);
+    if (!win.valid) {
+        return { status: win.reason, dateStr, window: null, bws: [], cws: [], errors: [] };
+    }
+
+    const boilerTanks = (await pool.query("SELECT * FROM tanks WHERE system_type LIKE '%鍋爐%'")).rows;
+    const cwsTanks = (await pool.query("SELECT * FROM tanks WHERE system_type LIKE '%冷卻%'")).rows;
+
+    const existingBws = (await pool.query("SELECT * FROM bws_daily_parameters WHERE date_str = $1", [dateStr])).rows;
+    const existingCws = (await pool.query("SELECT * FROM cws_daily_parameters WHERE date_str = $1", [dateStr])).rows;
+
+    const hasAllFinalBws = boilerTanks.every(t => existingBws.some(r => r.tank_id === t.id && isBwsDailyRowComplete(r)));
+    const hasAllFinalCws = cwsTanks.every(t => existingCws.some(r => r.tank_id === t.id && r.is_final));
+    if (!force && (boilerTanks.length + cwsTanks.length) > 0 && hasAllFinalBws && hasAllFinalCws) {
+        return { status: 'CACHED', dateStr, window: win, bws: existingBws, cws: existingCws, errors: [] };
+    }
+
+    const allRequests = buildDailyPiRequestsForWindow(win, 'ALL');
+    const results = piBatchFetchDaily(allRequests);
+    const errors = [];
+    let errorCount = 0;
+
+    for (let i = 0; i < allRequests.length; i++) {
+        const reqItem = allRequests[i];
+        const r = results.get(reqItem.tagName + '__' + i);
+        if (r && r.error) {
+            errorCount++;
+            errors.push(`${reqItem.tagName}: ${r.error}`);
+        }
+    }
+
+    if (results.get('_authError') || (allRequests.length > 0 && errorCount === allRequests.length)) {
+        return { status: 'PI_ERROR', dateStr, window: win, bws: existingBws, cws: existingCws, errors };
+    }
+
+    const ct1Tanks = cwsTanks.filter(t => t.name.includes('CWS-1') || t.name.includes('CT-1') || (t.description || '').includes('\u4e00\u968e'));
+    const ct2Tanks = cwsTanks.filter(t => !ct1Tanks.find(ct1 => ct1.id === t.id));
+    const cwsHistByTank = await loadCwsHistoryMap(cwsTanks);
+    const indexedRequests = allRequests.map((reqItem, idx) => ({ reqItem, idx }));
+
+    await persistDailyPiWindowResults(win, indexedRequests, results, { boilerTanks, ct1Tanks, ct2Tanks, cwsHistByTank });
+
+    const finalBws = (await pool.query("SELECT * FROM bws_daily_parameters WHERE date_str = $1", [dateStr])).rows;
+    const finalCws = (await pool.query("SELECT * FROM cws_daily_parameters WHERE date_str = $1", [dateStr])).rows;
+
+    return {
+        status: errors.length > 0 ? 'PARTIAL_ERROR' : 'SYNCED',
+        dateStr,
+        window: win,
+        bws: finalBws,
+        cws: finalCws,
+        errors
+    };
+};
+
+const syncDailyParamsForRange = async (startDate, endDate, { force = false, nowMs = Date.now(), scope = 'ALL' } = {}) => {
+    const dates = enumerateTaipeiDates(startDate, endDate, 62);
+    const windows = dates.map(d => computeDailyPiWindow(d, nowMs)).filter(w => w.valid);
+    if (windows.length === 0) {
+        return { status: 'NO_VALID_DATES', syncedDays: 0, cachedDays: 0, bws: [], cws: [], errors: [] };
+    }
+
+    const minDate = windows[0].dateStr;
+    const maxDate = windows[windows.length - 1].dateStr;
+
+    const boilerTanks = (await pool.query("SELECT * FROM tanks WHERE system_type LIKE '%鍋爐%'")).rows;
+    const cwsTanks = (await pool.query("SELECT * FROM tanks WHERE system_type LIKE '%冷卻%'")).rows;
+
+    const existingBws = (await pool.query("SELECT * FROM bws_daily_parameters WHERE date_str >= $1 AND date_str <= $2 ORDER BY date ASC", [minDate, maxDate])).rows;
+    const existingCws = (await pool.query("SELECT * FROM cws_daily_parameters WHERE date_str >= $1 AND date_str <= $2 ORDER BY date ASC", [minDate, maxDate])).rows;
+
+    const finalBwsByDate = new Map();
+    for (const row of existingBws) {
+        if (!isBwsDailyRowComplete(row)) continue;
+        if (!finalBwsByDate.has(row.date_str)) finalBwsByDate.set(row.date_str, new Set());
+        finalBwsByDate.get(row.date_str).add(row.tank_id);
+    }
+    const finalCwsByDate = new Map();
+    for (const row of existingCws) {
+        if (!row.is_final) continue;
+        if (!finalCwsByDate.has(row.date_str)) finalCwsByDate.set(row.date_str, new Set());
+        finalCwsByDate.get(row.date_str).add(row.tank_id);
+    }
+
+    const windowsToFetch = windows.filter(w => {
+        if (force) return true;
+        const bSet = finalBwsByDate.get(w.dateStr);
+        const cSet = finalCwsByDate.get(w.dateStr);
+        const allBwsFinal = scope === 'CWS' ? true : boilerTanks.every(t => bSet && bSet.has(t.id));
+        const allCwsFinal = scope === 'BWS' ? true : cwsTanks.every(t => cSet && cSet.has(t.id));
+        return !(allBwsFinal && allCwsFinal);
+    });
+
+    const cachedDays = windows.length - windowsToFetch.length;
+    if (windowsToFetch.length === 0) {
+        return { status: 'CACHED', syncedDays: 0, cachedDays, bws: existingBws, cws: existingCws, errors: [] };
+    }
+
+    const allRequests = [];
+    const requestsByDate = new Map();
+    for (const w of windowsToFetch) {
+        const winReqs = buildDailyPiRequestsForWindow(w, scope);
+        const indexed = [];
+        for (const reqItem of winReqs) {
+            const idx = allRequests.length;
+            allRequests.push(reqItem);
+            indexed.push({ reqItem, idx });
+        }
+        requestsByDate.set(w.dateStr, indexed);
+    }
+
+    const results = piBatchFetchDaily(allRequests);
+    const errors = [];
+    let errorCount = 0;
+
+    for (let i = 0; i < allRequests.length; i++) {
+        const reqItem = allRequests[i];
+        const r = results.get(reqItem.tagName + '__' + i);
+        if (r && r.error) {
+            errorCount++;
+            errors.push(`${reqItem._dateStr} ${reqItem.tagName}: ${r.error}`);
+        }
+    }
+
+    if (results.get('_authError') || (allRequests.length > 0 && errorCount === allRequests.length)) {
+        return { status: 'PI_ERROR', syncedDays: 0, cachedDays, bws: existingBws, cws: existingCws, errors };
+    }
+
+    const ct1Tanks = cwsTanks.filter(t => t.name.includes('CWS-1') || t.name.includes('CT-1') || (t.description || '').includes('\u4e00\u968e'));
+    const ct2Tanks = cwsTanks.filter(t => !ct1Tanks.find(ct1 => ct1.id === t.id));
+    const cwsHistByTank = await loadCwsHistoryMap(cwsTanks);
+
+    for (const w of windowsToFetch) {
+        await persistDailyPiWindowResults(w, requestsByDate.get(w.dateStr) || [], results, {
+            boilerTanks,
+            ct1Tanks,
+            ct2Tanks,
+            cwsHistByTank
+        });
+    }
+
+    const finalBws = (await pool.query("SELECT * FROM bws_daily_parameters WHERE date_str >= $1 AND date_str <= $2 ORDER BY date ASC", [minDate, maxDate])).rows;
+    const finalCws = (await pool.query("SELECT * FROM cws_daily_parameters WHERE date_str >= $1 AND date_str <= $2 ORDER BY date ASC", [minDate, maxDate])).rows;
+
+    return {
+        status: errors.length > 0 ? 'PARTIAL_ERROR' : 'SYNCED',
+        syncedDays: windowsToFetch.length,
+        cachedDays,
+        bws: finalBws,
+        cws: finalCws,
+        errors
+    };
+};
+
+app.post('/api/daily-params/sync', async (req, res) => {
+    try {
+        const { dateStr, force = false } = req.body || {};
+        if (!dateStr || typeof dateStr !== 'string') {
+            return res.status(400).json({ error: 'Missing dateStr (YYYY-MM-DD)' });
+        }
+        const payload = await syncDailyParamsForDate(dateStr, { force: Boolean(force) });
+        res.json(payload);
+    } catch (error) {
+        console.error('Daily PI Sync Error:', error);
+        res.status(500).json({ status: 'ERROR', error: error.message, bws: [], cws: [] });
+    }
+});
+
+app.post('/api/daily-params/sync-range', async (req, res) => {
+    try {
+        const { startDate, endDate, tankId, force = false } = req.body || {};
+        if (!startDate || !endDate || typeof startDate !== 'string' || typeof endDate !== 'string') {
+            return res.status(400).json({ error: 'Missing startDate or endDate (YYYY-MM-DD)' });
+        }
+        let scope = 'ALL';
+        if (tankId) {
+            const tankRes = await pool.query('SELECT calculation_method FROM tanks WHERE id = $1', [String(tankId)]);
+            const calcMethod = tankRes.rows[0]?.calculation_method;
+            if (calcMethod === 'BWS_STEAM') scope = 'BWS';
+            else if (calcMethod === 'CWS_BLOWDOWN') scope = 'CWS';
+        }
+        const payload = await syncDailyParamsForRange(startDate, endDate, { force: Boolean(force), scope });
+        if (tankId) {
+            const tid = String(tankId);
+            payload.bws = (payload.bws || []).filter(r => r.tank_id === tid);
+            payload.cws = (payload.cws || []).filter(r => r.tank_id === tid);
+        }
+        res.json(payload);
+    } catch (error) {
+        console.error('Daily PI Range Sync Error:', error);
+        res.status(500).json({ status: 'ERROR', syncedDays: 0, cachedDays: 0, error: error.message, bws: [], cws: [], errors: [error.message] });
+    }
+});
+
+app.get('/api/daily-params', async (req, res) => {
+    try {
+        const { dateStr, tankId, startDate, endDate } = req.query;
+        const conditions = [];
+        const params = [];
+
+        if (dateStr) {
+            params.push(String(dateStr));
+            conditions.push(`date_str = $${params.length}`);
+        }
+        if (tankId) {
+            params.push(String(tankId));
+            conditions.push(`tank_id = $${params.length}`);
+        }
+        if (startDate) {
+            params.push(String(startDate));
+            conditions.push(`date_str >= $${params.length}`);
+        }
+        if (endDate) {
+            params.push(String(endDate));
+            conditions.push(`date_str <= $${params.length}`);
+        }
+
+        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+        const bwsRes = await pool.query(`SELECT * FROM bws_daily_parameters ${whereClause} ORDER BY date DESC`, params);
+        const cwsRes = await pool.query(`SELECT * FROM cws_daily_parameters ${whereClause} ORDER BY date DESC`, params);
+
+        res.json({ bws: bwsRes.rows, cws: cwsRes.rows });
+    } catch (error) {
+        console.error('Fetch Daily Params Error:', error);
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -1464,6 +2219,18 @@ app.post('/api/readings/batch', async (req, res) => {
         }
         await client.query('COMMIT');
         const notificationResult = notification ? await notifyBatchReadingResult(results, alerts) : undefined;
+        // 液位批次存檔完成後，非同步確保當日 PI 日參數已寫入（不阻塞回應）
+        const uniqueDates = Array.from(new Set(
+            results
+                .map(r => Number(r.timestamp))
+                .filter(ts => Number.isFinite(ts))
+                .map(ts => getTaipeiDateString(new Date(ts)))
+        ));
+        for (const dStr of uniqueDates) {
+            syncDailyParamsForDate(dStr).catch(err => {
+                console.warn(`Background daily PI sync failed for ${dStr}:`, err.message);
+            });
+        }
         res.status(201).json({ count: results.length, data: results, notification: notificationResult });
     } catch (err) {
         await client.query('ROLLBACK');
@@ -1539,6 +2306,12 @@ const migrateDatabase = async () => {
         await client.query('ALTER TABLE bws_parameters ADD COLUMN IF NOT EXISTS date BIGINT');
         // Ensure updated_at column exists
         await client.query('ALTER TABLE bws_parameters ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP');
+        // Condensate recovery columns on bws_parameters
+        await client.query('ALTER TABLE bws_parameters ADD COLUMN IF NOT EXISTS feedwater_flow NUMERIC');
+        await client.query('ALTER TABLE bws_parameters ADD COLUMN IF NOT EXISTS spray_water_flow NUMERIC');
+        await client.query('ALTER TABLE bws_parameters ADD COLUMN IF NOT EXISTS makeup_water_flow NUMERIC');
+        await client.query('ALTER TABLE bws_parameters ADD COLUMN IF NOT EXISTS blowdown_flow NUMERIC');
+        await client.query('ALTER TABLE bws_parameters ADD COLUMN IF NOT EXISTS condensate_recovery_rate NUMERIC');
 
         // 3. Tanks table - validation_threshold column
         console.log('Ensuring validation_threshold column in tanks table...');
@@ -1586,6 +2359,54 @@ const migrateDatabase = async () => {
                 action_type TEXT,
                 reason TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // 4d. 每日 PI 製程參數資料表 (獨立於每週資料表，避免干擾既有週報)
+        console.log('Ensuring daily parameter tables...');
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS bws_daily_parameters (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                tank_id TEXT NOT NULL REFERENCES tanks(id) ON DELETE CASCADE,
+                date_str TEXT NOT NULL,
+                date BIGINT NOT NULL,
+                steam_production NUMERIC NOT NULL DEFAULT 0,
+                feedwater_flow NUMERIC,
+                spray_water_flow NUMERIC,
+                makeup_water_flow NUMERIC,
+                blowdown_flow NUMERIC,
+                condensate_recovery_rate NUMERIC,
+                window_start BIGINT NOT NULL,
+                window_end BIGINT NOT NULL,
+                is_final BOOLEAN NOT NULL DEFAULT FALSE,
+                fetch_method TEXT NOT NULL DEFAULT 'SUMMARY',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (tank_id, date_str)
+            );
+        `);
+        await client.query('ALTER TABLE bws_daily_parameters ADD COLUMN IF NOT EXISTS feedwater_flow NUMERIC');
+        await client.query('ALTER TABLE bws_daily_parameters ADD COLUMN IF NOT EXISTS spray_water_flow NUMERIC');
+        await client.query('ALTER TABLE bws_daily_parameters ADD COLUMN IF NOT EXISTS makeup_water_flow NUMERIC');
+        await client.query('ALTER TABLE bws_daily_parameters ADD COLUMN IF NOT EXISTS blowdown_flow NUMERIC');
+        await client.query('ALTER TABLE bws_daily_parameters ADD COLUMN IF NOT EXISTS condensate_recovery_rate NUMERIC');
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS cws_daily_parameters (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                tank_id TEXT NOT NULL REFERENCES tanks(id) ON DELETE CASCADE,
+                date_str TEXT NOT NULL,
+                date BIGINT NOT NULL,
+                circulation_rate NUMERIC NOT NULL DEFAULT 0,
+                temp_outlet NUMERIC DEFAULT 0,
+                temp_return NUMERIC DEFAULT 0,
+                temp_diff NUMERIC NOT NULL DEFAULT 0,
+                concentration_cycles NUMERIC NOT NULL DEFAULT 8,
+                concentration_source_date BIGINT,
+                window_start BIGINT NOT NULL,
+                window_end BIGINT NOT NULL,
+                is_final BOOLEAN NOT NULL DEFAULT FALSE,
+                fetch_method TEXT NOT NULL DEFAULT 'SUMMARY',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (tank_id, date_str)
             );
         `);
 
@@ -3209,85 +4030,85 @@ app.get('/api/manual-water-quality/is-admin', async (req, res) => {
     }
 });
 
-// 預設控制限值定義 (基於最新一週 0623 工作表標準)
+// 預設控制限值定義 (依據最新週報標準與實際 JSONB 指標名稱對齊)
 const PRESET_WATER_LIMITS = [
-    // CW: 冷卻水
+    // CW: 冷卻水 (台灣開廣控制界線，僅套用 CW_1、CW_2)
     { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'pH', min_value: 7.4, max_value: 7.8 },
     { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Calcium Hardness                             as CaCO3  ppm (鈣硬度)', min_value: 900.0, max_value: 1000.0 },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Chloride                                   as Cl ppm(氯)', min_value: null, max_value: 300.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Chloride                                   as Cl ppm(氯化鹽)', min_value: null, max_value: 300.0 },
     { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Silica                                        as SiO2 ppm (矽酸鹽)', min_value: null, max_value: 150.0 },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Organic Phosphate                as  PO4  ppm (有機磷)', min_value: 1.0, max_value: 5.0 },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Ortho Phosphate                           as  PO4  ppm (正磷酸鹽)', min_value: 1.0, max_value: 5.0 },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2', 'TW'], metric_name: 'Total Iron as Fe, ppm (鐵)', min_value: null, max_value: 1.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Organic Phosphate                as  PO4  ppm (有機磷酸鹽)', min_value: 1.0, max_value: 5.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Ortho Phosphate                           as  PO4  ppm (磷酸鹽)', min_value: 1.0, max_value: 5.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Total Iron as Fe, ppm (全鐵)', min_value: null, max_value: 1.0 },
     { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Zinc as Zn+2, ppm (鋅)', min_value: 1.0, max_value: null },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'ppm TKC-3635', min_value: 45.0, max_value: 55.0 },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'ppm 阻垢劑', min_value: 1.5, max_value: null },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2', 'TW'], metric_name: 'SS, ppm (懸浮物)', min_value: null, max_value: 10.0 },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2', 'TW'], metric_name: '殘留氯 (R-Cl) ppm', min_value: 0.02, max_value: 0.15 },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: '細菌數 (colonies/mL)', min_value: null, max_value: 10000.0 },
-    { water_type: 'CW', sample_points: ['CW_1', 'CW_2', 'TW'], metric_name: 'Turbidity, NTU  (渾濁度)', min_value: null, max_value: 10.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'ppm 分散劑TKC-3635', min_value: 45.0, max_value: 55.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'ppm 銅腐蝕抑制劑', min_value: 1.5, max_value: null },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'SS, ppm (懸浮固體物)', min_value: null, max_value: 10.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: '殘餘氯 (R-Cl) ppm', min_value: 0.02, max_value: 0.15 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: '菌落數 (colonies/mL)', min_value: null, max_value: 10000.0 },
+    { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'Turbidity, NTU  (混濁度)', min_value: null, max_value: 10.0 },
     { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'LSI', min_value: null, max_value: 2.5 },
     { water_type: 'CW', sample_points: ['CW_1', 'CW_2'], metric_name: 'RSI', min_value: 5.5, max_value: 7.0 },
 
     // BW: 鍋爐水
     // 1. DMP (除礦水)
-    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'pH at 25°C', min_value: 6.5, max_value: 7.5 },
-    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 0.2 },
-    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 10.0 },
-    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
-    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Na+  ,ppb (鈉)', min_value: null, max_value: 10.0 },
-    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Copper as Cu, ppb (銅)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'pH at 25℃', min_value: 6.5, max_value: 7.5 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Specific Conductance                     μs/㎝ 25℃(電導度)', min_value: null, max_value: 0.2 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Silica as SiO2 ,ppb (矽酸鹽)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Total iron as Fe ,ppb (全鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Na+  ,ppb (鈉離子)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['DMP'], metric_name: 'Copper as Cu, ppb (銅離子)', min_value: null, max_value: 10.0 },
 
     // 2. LP (低壓)
-    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
-    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
-    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
-    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'pH at 25℃', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'Specific Conductance                     μs/㎝ 25℃(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'Silica as SiO2 ,ppb (矽酸鹽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_LP', 'BLR2_LP', 'BLR3_LP', 'BLR4_LP'], metric_name: 'Total iron as Fe ,ppb (全鐵)', min_value: null, max_value: 10.0 },
 
     // 3. DEA (脫氣)
-    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
-    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
-    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
-    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'pH at 25℃', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'Specific Conductance                     μs/㎝ 25℃(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'Silica as SiO2 ,ppb (矽酸鹽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'Total iron as Fe ,ppb (全鐵)', min_value: null, max_value: 10.0 },
     { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'OS5613, ppm (脫氧劑)', min_value: 0.1, max_value: 0.5 },
-    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'DO ,ppb (溶氧)', min_value: null, max_value: 7.0 },
+    { water_type: 'BW', sample_points: ['BLR1_DEA', 'BLR2_DEA', 'BLR3_DEA', 'BLR4_DEA'], metric_name: 'DO ,ppb (溶氧量)', min_value: null, max_value: 7.0 },
 
     // 4. SS (飽和蒸汽)
-    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
-    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
-    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
-    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
-    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Na+  ,ppb (鈉)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'pH at 25℃', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Specific Conductance                     μs/㎝ 25℃(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Silica as SiO2 ,ppb (矽酸鹽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Total iron as Fe ,ppb (全鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_SS', 'BLR2_SS', 'BLR3_SS', 'BLR4_SS'], metric_name: 'Na+  ,ppb (鈉離子)', min_value: null, max_value: 10.0 },
 
     // 5. BFW (給水)
-    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
-    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
-    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
-    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'pH at 25℃', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'Specific Conductance                     μs/㎝ 25℃(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'Silica as SiO2 ,ppb (矽酸鹽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_BFW', 'BLR2_BFW', 'BLR3_BFW', 'BLR4_BFW'], metric_name: 'Total iron as Fe ,ppb (全鐵)', min_value: null, max_value: 20.0 },
 
     // 6. MS (主蒸汽)
-    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
-    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
-    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
-    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
-    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Na+  ,ppb (鈉)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'pH at 25℃', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Specific Conductance                     μs/㎝ 25℃(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Silica as SiO2 ,ppb (矽酸鹽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Total iron as Fe ,ppb (全鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_MS', 'BLR2_MS', 'BLR3_MS', 'BLR4_MS'], metric_name: 'Na+  ,ppb (鈉離子)', min_value: null, max_value: 10.0 },
 
     // 7. CBD (爐水)
-    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'pH at 25°C', min_value: 9.0, max_value: 9.5 },
-    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: 5.0, max_value: 20.0 },
-    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 300.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'pH at 25℃', min_value: 9.0, max_value: 9.5 },
+    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'Specific Conductance                     μs/㎝ 25℃(電導度)', min_value: 5.0, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'Silica as SiO2 ,ppb (矽酸鹽)', min_value: null, max_value: 300.0 },
     { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'OPO4 as PO4 ,ppm (磷酸鹽)', min_value: 1.0, max_value: 4.0 },
-    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CBD', 'BLR2_CBD', 'BLR3_CBD', 'BLR4_CBD'], metric_name: 'Total iron as Fe ,ppb (全鐵)', min_value: null, max_value: 10.0 },
 
     // 8. CD (冷凝水)
-    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'pH at 25°C', min_value: 8.8, max_value: 9.2 },
-    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Specific Conductance                     μs/cm 25°C(電導度)', min_value: null, max_value: 5.0 },
-    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Silica as SiO2 ,ppb (矽)', min_value: null, max_value: 20.0 },
-    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Total iron as Fe ,ppb (鐵)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'pH at 25℃', min_value: 8.8, max_value: 9.2 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Specific Conductance                     μs/㎝ 25℃(電導度)', min_value: null, max_value: 5.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Silica as SiO2 ,ppb (矽酸鹽)', min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Total iron as Fe ,ppb (全鐵)', min_value: null, max_value: 10.0 },
     { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'NH3 ,ppm (氨)', min_value: null, max_value: 0.3 },
-    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Copper as Cu, ppb (銅)', min_value: null, max_value: 10.0 },
-    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Total Hardness as CaCO3 ppb (總硬度)', min_value: null, max_value: 20.0 },
-    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'DO ,ppb (溶氧)', min_value: null, max_value: 7.0 }
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'Copper as Cu, ppb (銅離子)', min_value: null, max_value: 10.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: "'Total Hardness                                       as CaCO3 ppb (總硬度)", min_value: null, max_value: 20.0 },
+    { water_type: 'BW', sample_points: ['BLR1_CD', 'BLR2_CD', 'BLR3_CD', 'BLR4_CD'], metric_name: 'DO ,ppb (溶氧量)', min_value: null, max_value: 7.0 }
 ];
 
 // 取得控制標準 (若為空，後端會自動讀取 0623 預設限值進行寫入初始化)

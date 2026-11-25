@@ -54,6 +54,11 @@ export interface BWSParameterRecord {
   tankId: string; // Foreign Key
   steamProduction: number; // Tons/Week (Weekly Total)
   date?: number; // Last Updated Timestamp
+  feedwaterFlow?: number | null;
+  sprayWaterFlow?: number | null;
+  makeupWaterFlow?: number | null;
+  blowdownFlow?: number | null;
+  condensateRecoveryRate?: number | null;
 }
 
 // Table E: Tank Settings (Frontend Combined Object)
@@ -309,4 +314,65 @@ export interface FluctuationAlert {
   source: 'IMPORT' | 'MANUAL';
   note?: string;
   createdAt?: string;
+}
+
+export interface DailyBWSParameterRecord {
+  id: string;
+  tankId: string;
+  dateStr: string;
+  date: number;
+  steamProduction: number;
+  feedwaterFlow?: number | null;
+  sprayWaterFlow?: number | null;
+  makeupWaterFlow?: number | null;
+  blowdownFlow?: number | null;
+  condensateRecoveryRate?: number | null;
+  windowStart: number;
+  windowEnd: number;
+  isFinal: boolean;
+  fetchMethod: 'RECORDED' | 'SUMMARY' | string;
+  updatedAt?: string;
+}
+
+export interface DailyCWSParameterRecord {
+  id: string;
+  tankId: string;
+  dateStr: string;
+  date: number;
+  circulationRate: number;
+  tempOutlet: number;
+  tempReturn: number;
+  tempDiff: number;
+  concentrationCycles: number;
+  concentrationSourceDate?: number | null;
+  windowStart: number;
+  windowEnd: number;
+  isFinal: boolean;
+  fetchMethod: 'RECORDED' | 'SUMMARY' | string;
+  updatedAt?: string;
+}
+
+export interface DailyPiWindow {
+  valid: boolean;
+  reason?: string;
+  dateStr?: string;
+  dayStartMs?: number;
+  dayEndMs?: number;
+  windowStartMs?: number;
+  windowEndMs?: number;
+  startIso?: string;
+  endIso?: string;
+  isFinal?: boolean;
+  windowMode?: 'FULL_DAY' | 'ROLLING_24H' | string;
+  useRecorded?: boolean;
+  fetchMethod?: 'RECORDED' | 'SUMMARY' | string;
+}
+
+export interface DailyParamsSyncResponse {
+  status: string;
+  dateStr: string;
+  window: DailyPiWindow | null;
+  bws: DailyBWSParameterRecord[];
+  cws: DailyCWSParameterRecord[];
+  errors?: string[];
 }

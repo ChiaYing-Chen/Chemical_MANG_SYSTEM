@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { StorageService } from './services/storageService';
 import * as API from './services/apiService';
-import { calculateTankVolume } from './utils/calculationUtils';
-import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType, FluctuationAlert } from './types';
+import { calculateTankVolume, calculateCWSUsage } from './utils/calculationUtils';
+import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType, FluctuationAlert, DailyBWSParameterRecord, DailyCWSParameterRecord, DailyParamsSyncResponse } from './types';
 import { Icons } from './components/Icons';
 import { LoadingOverlay } from './components/LoadingOverlay';
 import { ImportAnomalyModal, ImportAnomaly } from './components/ImportAnomalyModal';
@@ -18,6 +18,7 @@ import InstrumentManagementView from './views/InstrumentManagementView';
 import { FluctuationAlertsView } from './components/FluctuationAlertsView';
 import { LevelUsageCalculatorModal } from './components/LevelUsageCalculatorModal';
 import { formatAnomalyMessage } from './utils/textUtils';
+import { aggregateWeeklyCondensateRecovery } from './dailyParamsUtils.js';
 
 // --- Helper Components ---
 
@@ -1402,6 +1403,121 @@ const DataEntryView: React.FC<{
     const [convertedCountInfo, setConvertedCountInfo] = useState<number>(0);
     const [batchSaving, setBatchSaving] = useState(false);
 
+    // Daily PI Parameters & Supplies for Level Entry Check
+    const [allSupplies, setAllSupplies] = useState<ChemicalSupply[]>([]);
+    const [dailyParams, setDailyParams] = useState<{
+        dateStr: string;
+        status: string;
+        window: DailyParamsSyncResponse['window'];
+        bwsByTank: Record<string, DailyBWSParameterRecord>;
+        cwsByTank: Record<string, DailyCWSParameterRecord>;
+        errors?: string[];
+    } | null>(null);
+    const [dailyParamsLoading, setDailyParamsLoading] = useState(false);
+    const [dailySyncNonce, setDailySyncNonce] = useState(0);
+
+    useEffect(() => {
+        let cancelled = false;
+        StorageService.getSupplies()
+            .then(list => {
+                if (!cancelled) setAllSupplies(list);
+            })
+            .catch(err => console.warn('載入藥劑合約列表失敗:', err));
+        return () => { cancelled = true; };
+    }, []);
+
+    useEffect(() => {
+        if (activeType !== 'A' || !date) return;
+        let cancelled = false;
+        setDailyParamsLoading(true);
+        const forceSync = dailySyncNonce > 0;
+        StorageService.syncDailyParams(date, forceSync)
+            .then(res => {
+                if (cancelled) return;
+                const bwsByTank: Record<string, DailyBWSParameterRecord> = {};
+                const cwsByTank: Record<string, DailyCWSParameterRecord> = {};
+                (res.bws || []).forEach(b => { bwsByTank[b.tankId] = b; });
+                (res.cws || []).forEach(c => { cwsByTank[c.tankId] = c; });
+                setDailyParams({
+                    dateStr: date,
+                    status: res.status,
+                    window: res.window,
+                    bwsByTank,
+                    cwsByTank,
+                    errors: res.errors
+                });
+            })
+            .catch(err => {
+                if (cancelled) return;
+                console.warn('PI 日參數自動同步失敗:', err);
+                setDailyParams({
+                    dateStr: date,
+                    status: 'PI_ERROR',
+                    window: null,
+                    bwsByTank: {},
+                    cwsByTank: {},
+                    errors: [err?.message || 'PI 連線失敗']
+                });
+            })
+            .finally(() => {
+                if (!cancelled) setDailyParamsLoading(false);
+            });
+        return () => { cancelled = true; };
+    }, [activeType, date, dailySyncNonce]);
+
+    const formatTaipeiShortHm = (ms: number) => {
+        const d = new Date(ms + 8 * 3600 * 1000);
+        const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+        const day = String(d.getUTCDate()).padStart(2, '0');
+        const h = String(d.getUTCHours()).padStart(2, '0');
+        const min = String(d.getUTCMinutes()).padStart(2, '0');
+        return `${m}/${day} ${h}:${min}`;
+    };
+
+    const getDailyTheoreticalUsageKg = (tank: Tank, targetDateStr: string): { valueKg: number; windowLabel: string; isRolling: boolean } | null => {
+        if (!dailyParams || dailyParams.dateStr !== targetDateStr) return null;
+        if (!tank.calculationMethod || tank.calculationMethod === 'NONE') return null;
+
+        const endOfDayTs = Date.parse(`${targetDateStr}T23:59:59+08:00`);
+        if (!Number.isFinite(endOfDayTs)) return null;
+
+        const supply = allSupplies
+            .filter(s => s.tankId === tank.id && s.startDate <= endOfDayTs)
+            .sort((a, b) => b.startDate - a.startDate)[0];
+        const targetPpm = Number(supply?.targetPpm || 0);
+        if (!targetPpm) return null;
+
+        if (tank.calculationMethod === 'BWS_STEAM') {
+            const bws = dailyParams.bwsByTank[tank.id];
+            if (!bws) return null;
+            const valueKg = (bws.steamProduction * targetPpm) / 1000;
+            const isRolling = !bws.isFinal;
+            const windowLabel = isRolling
+                ? `滾動24h (${formatTaipeiShortHm(bws.windowStart)}–${formatTaipeiShortHm(bws.windowEnd)})`
+                : '00:00–24:00';
+            return { valueKg, windowLabel, isRolling };
+        }
+
+        if (tank.calculationMethod === 'CWS_BLOWDOWN') {
+            const cws = dailyParams.cwsByTank[tank.id];
+            if (!cws) return null;
+            const valueKg = calculateCWSUsage(
+                cws.circulationRate,
+                cws.tempDiff,
+                cws.concentrationCycles,
+                targetPpm,
+                1
+            );
+            const isRolling = !cws.isFinal;
+            const windowLabel = isRolling
+                ? `滾動24h (${formatTaipeiShortHm(cws.windowStart)}–${formatTaipeiShortHm(cws.windowEnd)})`
+                : '00:00–24:00';
+            return { valueKg, windowLabel, isRolling };
+        }
+
+        return null;
+    };
+
     const getRecentDailyUsageKg = (tankId: string) => {
         const usageCalcWeeks = appSettings?.usageCalcWeeks || 4;
         const now = Date.now();
@@ -1423,6 +1539,105 @@ const DataEntryView: React.FC<{
             return ((totalUsageLiters / daysCovered) * sg).toFixed(1);
         }
         return '0.0';
+    };
+
+    const evaluateReadingAnomaly = (
+        tank: Tank,
+        newReading: Reading,
+        prev: Reading | null,
+        next: Reading | null,
+        dailyThreshold: number,
+        appendKeyHint: boolean
+    ): ImportAnomaly | null => {
+        if (!prev) return null;
+
+        const d1 = new Date(newReading.timestamp);
+        d1.setHours(0, 0, 0, 0);
+        const d2 = new Date(prev.timestamp);
+        d2.setHours(0, 0, 0, 0);
+        const calendarDays = (d1.getTime() - d2.getTime()) / (1000 * 60 * 60 * 24);
+        const daysDiff = Math.max(1, calendarDays);
+        if (daysDiff < 1) return null;
+
+        const addedAmount = newReading.addedAmountLiters || 0;
+        const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
+        const dailyChange = Math.abs(levelChange) / daysDiff;
+        const sg = newReading.appliedSpecificGravity || 1.0;
+        const dailyChangeKg = dailyChange * sg;
+        const dailyThresholdKg = dailyThreshold * sg;
+        const recentDailyUsageKg = getRecentDailyUsageKg(tank.id);
+        const readingDateStr = getTaipeiDateString(newReading.timestamp);
+        const theoreticalInfo = getDailyTheoreticalUsageKg(tank, readingDateStr);
+        const signedDailyUsageKg = (levelChange / daysDiff) * sg;
+
+        const rawAlertPct = Number(appSettings?.theoreticalUsageAlertPercent);
+        const theoreticalAlertPct = Number.isFinite(rawAlertPct) && rawAlertPct > 0 ? rawAlertPct : 5;
+        const theoreticalDevPct = (theoreticalInfo && theoreticalInfo.valueKg > 0 && signedDailyUsageKg > 0)
+            ? ((signedDailyUsageKg - theoreticalInfo.valueKg) / theoreticalInfo.valueKg) * 100
+            : null;
+        const exceedsTheoreticalThreshold = theoreticalDevPct !== null && theoreticalDevPct > theoreticalAlertPct;
+
+        if (dailyChange > dailyThreshold) {
+            const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
+            const warnText = isPossibleRefill
+                ? (appSettings?.possibleRefillText || '可能為補藥紀錄({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認')
+                : (appSettings?.thresholdWarningText || '液位變化異常({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認');
+
+            let anomalyReason = formatAnomalyMessage(warnText, {
+                text: isPossibleRefill ? '可能為補藥紀錄' : '液位變化異常，請確認',
+                diff: dailyChangeKg.toFixed(0),
+                limit: dailyThresholdKg.toFixed(0),
+                unit: 'kg',
+                recentUsage: recentDailyUsageKg
+            });
+
+            if (theoreticalInfo) {
+                anomalyReason += `，當日理論用量約 ${theoreticalInfo.valueKg.toFixed(1)} kg`;
+                if (exceedsTheoreticalThreshold && theoreticalDevPct !== null) {
+                    anomalyReason += `，高於理論值 +${theoreticalDevPct.toFixed(1)}%（超過 ${theoreticalAlertPct}% 門檻）`;
+                }
+            }
+
+            return {
+                id: newReading.id,
+                tankId: tank.id,
+                date: new Date(newReading.timestamp).toLocaleDateString(),
+                tankName: tank.name,
+                reason: (appendKeyHint && !isPossibleRefill) ? `${anomalyReason}（請確認是否KEY錯欄位或數字）` : anomalyReason,
+                currentValue: newReading.calculatedVolume,
+                prevDate: new Date(prev.timestamp).toLocaleDateString(),
+                prevValue: prev.calculatedVolume,
+                nextDate: next ? new Date(next.timestamp).toLocaleDateString() : undefined,
+                nextValue: next ? next.calculatedVolume : undefined,
+                isPossibleRefill,
+                actualDailyUsageKg: Number(signedDailyUsageKg.toFixed(1)),
+                recentDailyUsageKg: Number(recentDailyUsageKg),
+                theoreticalDailyUsageKg: theoreticalInfo ? Number(theoreticalInfo.valueKg.toFixed(1)) : null,
+                theoreticalWindowLabel: theoreticalInfo?.windowLabel
+            };
+        }
+
+        if (exceedsTheoreticalThreshold && theoreticalInfo && theoreticalDevPct !== null) {
+            return {
+                id: newReading.id,
+                tankId: tank.id,
+                date: new Date(newReading.timestamp).toLocaleDateString(),
+                tankName: tank.name,
+                reason: `實際日用量(${signedDailyUsageKg.toFixed(1)} kg)高於理論用量(${theoreticalInfo.valueKg.toFixed(1)} kg) +${theoreticalDevPct.toFixed(1)}%，超過設定門檻 ${theoreticalAlertPct}%，近期日均為 ${recentDailyUsageKg} kg，請確認`,
+                currentValue: newReading.calculatedVolume,
+                prevDate: new Date(prev.timestamp).toLocaleDateString(),
+                prevValue: prev.calculatedVolume,
+                nextDate: next ? new Date(next.timestamp).toLocaleDateString() : undefined,
+                nextValue: next ? next.calculatedVolume : undefined,
+                isPossibleRefill: false,
+                actualDailyUsageKg: Number(signedDailyUsageKg.toFixed(1)),
+                recentDailyUsageKg: Number(recentDailyUsageKg),
+                theoreticalDailyUsageKg: Number(theoreticalInfo.valueKg.toFixed(1)),
+                theoreticalWindowLabel: theoreticalInfo.windowLabel
+            };
+        }
+
+        return null;
     };
 
     const checkAnomalies = (newReadings: Reading[]): ImportAnomaly[] => {
@@ -1469,78 +1684,12 @@ const DataEntryView: React.FC<{
                 const idx = allReadings.findIndex(r => r.id === newReading.id);
                 if (idx === -1) continue;
 
-                let anomalyReason = null;
                 const prev = idx > 0 ? allReadings[idx - 1] : null;
                 const next = idx < allReadings.length - 1 ? allReadings[idx + 1] : null;
 
-                // 1. Check vs Prev
-                if (prev) {
-                    const d1 = new Date(newReading.timestamp);
-                    d1.setHours(0, 0, 0, 0);
-                    const d2 = new Date(prev.timestamp);
-                    d2.setHours(0, 0, 0, 0);
-                    const calendarDays = (d1.getTime() - d2.getTime()) / (1000 * 60 * 60 * 24);
-                    // Use actual time difference if greater than 1, otherwise use at least 1, but if it's multiple calendar days, use calendar days
-                    const daysDiff = Math.max(1, calendarDays);
-
-                    if (daysDiff >= 1) { // Will always be true now
-                        const addedAmount = newReading.addedAmountLiters || 0;
-                        const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
-                        const dailyChange = Math.abs(levelChange) / daysDiff;
-
-                        if (dailyChange > dailyThreshold) {
-                            // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
-                            const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
-                            // Use SG from the reading to display Kg
-                            const sg = newReading.appliedSpecificGravity || 1.0;
-                            const dailyChangeKg = dailyChange * sg;
-                            const dailyThresholdKg = dailyThreshold * sg;
-
-                            console.log('[AnomalyCheck]', {
-                                tank: tank.name,
-                                isPossibleRefill,
-                                settings: appSettings,
-                                refillText: appSettings?.possibleRefillText,
-                                warnText: appSettings?.thresholdWarningText
-                            });
-
-                            const recentDailyUsageKg = getRecentDailyUsageKg(tank.id);
-
-                            if (isPossibleRefill) {
-                                const warnText = appSettings?.possibleRefillText || '可能為補藥紀錄({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認';
-                                anomalyReason = formatAnomalyMessage(warnText, {
-                                    text: '可能為補藥紀錄',
-                                    diff: dailyChangeKg.toFixed(0),
-                                    limit: dailyThresholdKg.toFixed(0),
-                                    unit: 'kg',
-                                    recentUsage: recentDailyUsageKg
-                                });
-                            } else {
-                                const warnText = appSettings?.thresholdWarningText || '液位變化異常({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認';
-                                anomalyReason = formatAnomalyMessage(warnText, {
-                                    text: '液位變化異常，請確認',
-                                    diff: dailyChangeKg.toFixed(0),
-                                    limit: dailyThresholdKg.toFixed(0),
-                                    unit: 'kg',
-                                    recentUsage: recentDailyUsageKg
-                                });
-                            }
-
-                            anomalies.push({
-                                id: newReading.id,
-                                tankId: tank.id,
-                                date: new Date(newReading.timestamp).toLocaleDateString(),
-                                tankName: tank.name,
-                                reason: isPossibleRefill ? anomalyReason : `${anomalyReason}（請確認是否KEY錯欄位或數字）`,
-                                currentValue: newReading.calculatedVolume,
-                                prevDate: prev ? new Date(prev.timestamp).toLocaleDateString() : undefined,
-                                prevValue: prev ? prev.calculatedVolume : undefined,
-                                nextDate: next ? new Date(next.timestamp).toLocaleDateString() : undefined,
-                                nextValue: next ? next.calculatedVolume : undefined,
-                                isPossibleRefill,
-                            });
-                        }
-                    }
+                const anomaly = evaluateReadingAnomaly(tank, newReading, prev, next, dailyThreshold, true);
+                if (anomaly) {
+                    anomalies.push(anomaly);
                 }
             }
         });
@@ -1971,68 +2120,7 @@ const DataEntryView: React.FC<{
         const thresholdPercent = tank.validationThreshold ?? 30; // Default 30% if not set
         const dailyThreshold = tankCapacity * (thresholdPercent / 100);
 
-        let anomalyReason = null;
-
-        if (prev) {
-            const d1 = new Date(newReading.timestamp);
-            d1.setHours(0, 0, 0, 0);
-            const d2 = new Date(prev.timestamp);
-            d2.setHours(0, 0, 0, 0);
-            const calendarDays = (d1.getTime() - d2.getTime()) / (1000 * 60 * 60 * 24);
-            const daysDiff = Math.max(1, calendarDays);
-
-            if (daysDiff >= 1) {
-                const addedAmount = newReading.addedAmountLiters || 0;
-                const levelChange = (prev.calculatedVolume + addedAmount) - newReading.calculatedVolume;
-                const dailyChange = Math.abs(levelChange) / daysDiff;
-
-                if (dailyChange > dailyThreshold) {
-                    const sg = newReading.appliedSpecificGravity || 1.0;
-                    const dailyChangeKg = dailyChange * sg;
-                    const dailyThresholdKg = dailyThreshold * sg;
-                    const recentDailyUsageKg = getRecentDailyUsageKg(tank.id);
-
-                    // 判斷是否為「可能補藥」：液位上升（levelChange < 0）且超過閾值12倍以上
-                    const isPossibleRefill = levelChange < 0 && dailyChange > dailyThreshold * 12;
-
-                    let warnText = '';
-                    if (isPossibleRefill) {
-                        warnText = appSettings?.possibleRefillText || '可能為補藥紀錄({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認';
-                        anomalyReason = formatAnomalyMessage(warnText, {
-                            text: '可能為補藥紀錄',
-                            diff: dailyChangeKg.toFixed(0),
-                            limit: dailyThresholdKg.toFixed(0),
-                            unit: 'kg',
-                            recentUsage: recentDailyUsageKg
-                        });
-                    } else {
-                        warnText = appSettings?.thresholdWarningText || '液位變化異常({diff} kg)，超過閥值{limit} {unit}，近期日用量為{recentUsage} kg請確認';
-                        anomalyReason = formatAnomalyMessage(warnText, {
-                            text: '液位變化異常，請確認',
-                            diff: dailyChangeKg.toFixed(0),
-                            limit: dailyThresholdKg.toFixed(0),
-                            unit: 'kg',
-                            recentUsage: recentDailyUsageKg
-                        });
-                    }
-
-                    return {
-                        id: newReading.id,
-                        tankId: tank.id,
-                        date: new Date(newReading.timestamp).toLocaleDateString(),
-                        tankName: tank.name,
-                        reason: anomalyReason,
-                        currentValue: newReading.calculatedVolume,
-                        prevDate: prev ? new Date(prev.timestamp).toLocaleDateString() : undefined,
-                        prevValue: prev ? prev.calculatedVolume : undefined,
-                        nextDate: next ? new Date(next.timestamp).toLocaleDateString() : undefined,
-                        nextValue: next ? next.calculatedVolume : undefined,
-                        isPossibleRefill
-                    };
-                }
-            }
-        }
-        return null;
+        return evaluateReadingAnomaly(tank, newReading, prev, next, dailyThreshold, false);
     };
 
     const handleSubmitReadings = async (e: React.FormEvent) => {
@@ -3092,6 +3180,40 @@ const DataEntryView: React.FC<{
                                         <span className="bg-blue-200 px-2 py-1 rounded text-xs mr-2">提示</span>
                                         <span className="font-bold">PERCENT</span>（公尺×100）和 <span className="font-bold">LIQUID_PERCENT</span>（百分比0-100）的桶槽轉換後均存為公分。
                                     </div>
+                                    <div className="pt-5 flex items-center gap-2">
+                                        {dailyParamsLoading ? (
+                                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-sky-100 text-sky-700 border border-sky-200">
+                                                <Icons.Activity className="w-3.5 h-3.5 animate-spin" />
+                                                PI 日參數同步中...
+                                            </span>
+                                        ) : dailyParams && dailyParams.dateStr === date ? (
+                                            dailyParams.status === 'PI_ERROR' ? (
+                                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-amber-100 text-amber-800 border border-amber-200">
+                                                    PI 同步失敗（不影響存檔）
+                                                </span>
+                                            ) : dailyParams.status === 'FUTURE_DATE' ? (
+                                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-slate-100 text-slate-600 border border-slate-200">
+                                                    尚未到來日期，無 PI 參數
+                                                </span>
+                                            ) : (
+                                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                                    {dailyParams.window?.windowMode === 'ROLLING_24H' && dailyParams.window.windowStartMs && dailyParams.window.windowEndMs
+                                                        ? `PI 日參數已同步 · 滾動24h (${formatTaipeiShortHm(dailyParams.window.windowStartMs)}–${formatTaipeiShortHm(dailyParams.window.windowEndMs)})`
+                                                        : 'PI 日參數已同步 (00:00–24:00)'}
+                                                </span>
+                                            )
+                                        ) : null}
+                                        {!dailyParamsLoading && (
+                                            <button
+                                                type="button"
+                                                onClick={() => setDailySyncNonce(n => n + 1)}
+                                                className="text-xs px-2 py-1 rounded border border-blue-300 bg-white text-blue-700 hover:bg-blue-100 transition-colors"
+                                                title="重新向 PI 同步當日蒸汽量、流量與溫差"
+                                            >
+                                                重新同步
+                                            </button>
+                                        )}
+                                    </div>
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <Button
@@ -3174,10 +3296,38 @@ const DataEntryView: React.FC<{
                                                     const unitLabel = isMeters ? '公尺' : isPercent ? '%' : '公分';
                                                     const placeholder = isMeters ? 'M' : isPercent ? '0-100' : 'cm';
                                                     const stepVal = isMeters ? '0.01' : isPercent ? '0.1' : '0.1';
+                                                    const theoreticalInfo = getDailyTheoreticalUsageKg(tank, date);
+
+                                                    const rawInputStr = batchLevels[tank.id] || '';
+                                                    let impliedDailyKg: number | null = null;
+                                                    if (rawInputStr !== '' && Number.isFinite(parseFloat(rawInputStr))) {
+                                                        let cmVal = parseFloat(rawInputStr);
+                                                        if (isMeters) cmVal = cmVal * 100;
+                                                        else if (isPercent) {
+                                                            const factor = tank.piPercentFactor ?? ((tank.dimensions?.height ?? 100) / 100);
+                                                            cmVal = cmVal * factor;
+                                                        }
+                                                        const currVol = calculateTankVolume(tank, cmVal);
+                                                        const prevReading = readings
+                                                            .filter(r => r.tankId === tank.id && getTaipeiDateString(r.timestamp) < date)
+                                                            .sort((a, b) => b.timestamp - a.timestamp)[0];
+                                                        if (prevReading) {
+                                                            const prevDateStr = getTaipeiDateString(prevReading.timestamp);
+                                                            const dayDiff = Math.max(1, Math.round((Date.parse(`${date}T00:00:00+08:00`) - Date.parse(`${prevDateStr}T00:00:00+08:00`)) / 86400000));
+                                                            const endDayTs = Date.parse(`${date}T23:59:59+08:00`);
+                                                            const activeSup = allSupplies
+                                                                .filter(s => s.tankId === tank.id && s.startDate <= endDayTs)
+                                                                .sort((a, b) => b.startDate - a.startDate)[0];
+                                                            const sg = activeSup?.specificGravity || prevReading.appliedSpecificGravity || 1;
+                                                            const existingToday = readings.find(r => r.tankId === tank.id && getTaipeiDateString(r.timestamp) === date);
+                                                            const addedL = existingToday?.addedAmountLiters || 0;
+                                                            impliedDailyKg = ((prevReading.calculatedVolume + addedL - currVol) / dayDiff) * sg;
+                                                        }
+                                                    }
 
                                                     return (
-                                                        <div key={tank.id} className="flex items-center gap-3">
-                                                            <div className="w-1/3 text-right">
+                                                        <div key={tank.id} className="flex items-start gap-3">
+                                                            <div className="w-1/3 text-right pt-1.5">
                                                                 <div className={`text-sm font-medium truncate ${tank.system === SystemType.BOILER ? 'text-red-800 font-semibold' :
                                                                     tank.system === SystemType.DENOX ? 'text-green-800 font-semibold' :
                                                                         (tank.name.includes('微生物') || tank.name.includes('消泡')) ? 'text-amber-700 font-semibold' :
@@ -3185,19 +3335,36 @@ const DataEntryView: React.FC<{
                                                                     }`} title={tank.name}>{tank.name}</div>
                                                                 <div className="text-[10px] text-slate-400">{tank.system}</div>
                                                             </div>
-                                                            <div className="w-2/3 relative">
-                                                                <input
-                                                                    type="number"
-                                                                    step={stepVal}
-                                                                    placeholder={placeholder}
-                                                                    value={batchLevels[tank.id] || ''}
-                                                                    onChange={(e) => setBatchLevels(prev => ({ ...prev, [tank.id]: e.target.value }))}
-                                                                    className={`${inputClassName} pr-12`}
-                                                                />
-                                                                <div className="absolute right-3 top-2.5 text-xs text-slate-400 font-bold pointer-events-none">
-                                                                    {unitLabel}
+                                                            <div className="w-2/3">
+                                                                <div className="relative">
+                                                                    <input
+                                                                        type="number"
+                                                                        step={stepVal}
+                                                                        placeholder={placeholder}
+                                                                        value={rawInputStr}
+                                                                        onChange={(e) => setBatchLevels(prev => ({ ...prev, [tank.id]: e.target.value }))}
+                                                                        className={`${inputClassName} pr-12`}
+                                                                    />
+                                                                    <div className="absolute right-3 top-2.5 text-xs text-slate-400 font-bold pointer-events-none">
+                                                                        {unitLabel}
+                                                                    </div>
                                                                 </div>
-
+                                                                {(theoreticalInfo || impliedDailyKg !== null) && (
+                                                                    <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] font-mono">
+                                                                        {theoreticalInfo && (
+                                                                            <span className="text-emerald-600" title={theoreticalInfo.windowLabel}>
+                                                                                理論: {theoreticalInfo.valueKg.toFixed(1)} kg
+                                                                            </span>
+                                                                        )}
+                                                                        {impliedDailyKg !== null && (
+                                                                            <span className={impliedDailyKg < 0 ? 'text-blue-600' : 'text-slate-500'}>
+                                                                                {impliedDailyKg < 0
+                                                                                    ? `上升: ${Math.abs(impliedDailyKg).toFixed(1)} kg`
+                                                                                    : `推算: ${impliedDailyKg.toFixed(1)} kg`}
+                                                                            </span>
+                                                                        )}
+                                                                    </div>
+                                                                )}
                                                             </div>
                                                         </div>
                                                     );
@@ -4499,8 +4666,8 @@ const AnalysisView: React.FC<{
         const endOfLastMonth = new Date(year, month, 0); // Last day of previous month
 
         return {
-            start: startOfLastMonth.toLocaleDateString('zh-CA'), // YYYY-MM-DD
-            end: endOfLastMonth.toLocaleDateString('zh-CA'),
+            start: getLocalDateKey(startOfLastMonth.getTime()), // YYYY-MM-DD
+            end: getLocalDateKey(endOfLastMonth.getTime()),
             yearMonth: `${startOfLastMonth.getFullYear()}-${String(startOfLastMonth.getMonth() + 1).padStart(2, '0')}`
         };
     };
@@ -4527,8 +4694,8 @@ const AnalysisView: React.FC<{
                 const startDate = new Date(year, month - 1, 1);
                 const endDate = new Date(year, month, 0);
 
-                const startStr = startDate.toLocaleDateString('zh-CA');
-                const endStr = endDate.toLocaleDateString('zh-CA');
+                const startStr = getLocalDateKey(startDate.getTime());
+                const endStr = getLocalDateKey(endDate.getTime());
 
                 const newRange = { start: startStr, end: endStr };
                 setTempDateRange(newRange);
@@ -4542,7 +4709,8 @@ const AnalysisView: React.FC<{
 
 
     // Help Tooltip State
-    const [helpTopic, setHelpTopic] = useState<'weekly' | 'monthly' | null>(null);
+    const [helpTopic, setHelpTopic] = useState<'daily' | 'weekly' | 'monthly' | null>(null);
+    const [detailGranularity, setDetailGranularity] = useState<'daily' | 'weekly'>('daily');
 
     const handleMonthChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const val = e.target.value; // YYYY-MM
@@ -4553,8 +4721,8 @@ const AnalysisView: React.FC<{
             const endDate = new Date(year, month, 0);
 
             // Adjust to local timezone string YYYY-MM-DD
-            const startStr = startDate.toLocaleDateString('zh-CA'); // YYYY-MM-DD
-            const endStr = endDate.toLocaleDateString('zh-CA');
+            const startStr = getLocalDateKey(startDate.getTime()); // YYYY-MM-DD
+            const endStr = getLocalDateKey(endDate.getTime());
 
             const newRange = { start: startStr, end: endStr };
             setTempDateRange(newRange);
@@ -4572,9 +4740,21 @@ const AnalysisView: React.FC<{
     const [metric, setMetric] = useState<'KG' | 'L' | '$'>('KG');
     const [bwsParamsHistory, setBwsParamsHistory] = useState<BWSParameterRecord[]>([]);
     const [cwsParamsHistory, setCwsParamsHistory] = useState<CWSParameterRecord[]>([]);
+    const [dailyBwsParams, setDailyBwsParams] = useState<DailyBWSParameterRecord[]>([]);
+    const [dailyCwsParams, setDailyCwsParams] = useState<DailyCWSParameterRecord[]>([]);
+    const [dailyRangeSyncing, setDailyRangeSyncing] = useState(false);
+    const [dailyRangeSyncError, setDailyRangeSyncError] = useState<string | null>(null);
+    const [dailyRangeSyncNonce, setDailyRangeSyncNonce] = useState(0);
+    const forceRangeSyncRef = React.useRef(false);
     const [suppliesHistory, setSuppliesHistory] = useState<ChemicalSupply[]>([]);
 
     const selectedTank = tanks.find(t => t.id === selectedTankId);
+    const BOILER_WATER_CHEMICAL_KEYWORDS = ['中和胺', '脫氧劑', '清罐劑'];
+    const showCondensateRecovery = Boolean(
+        selectedTank &&
+        selectedTank.calculationMethod === 'BWS_STEAM' &&
+        BOILER_WATER_CHEMICAL_KEYWORDS.some(k => selectedTank.name.includes(k))
+    );
 
     // 載入該儲槽的參數歷史記錄和藥劑合約歷史
     useEffect(() => {
@@ -4594,6 +4774,123 @@ const AnalysisView: React.FC<{
         };
         loadParamsHistory();
     }, [selectedTankId]);
+
+    // 載入並自動補抓選定範圍的每日 PI 參數
+    useEffect(() => {
+        if (!selectedTankId || !appliedDateRange.start || !appliedDateRange.end) return;
+        let cancelled = false;
+
+        let startDate = appliedDateRange.start;
+        let endDate = appliedDateRange.end;
+
+        if (showCondensateRecovery) {
+            const [sy, sm, sd] = appliedDateRange.start.split('-').map(Number);
+            const [ey, em, ed] = appliedDateRange.end.split('-').map(Number);
+            if (sy && sm && sd && ey && em && ed) {
+                const userStart = new Date(sy, sm - 1, sd);
+                const userEnd = new Date(ey, em - 1, ed);
+                const extStart = new Date(userStart);
+                extStart.setDate(userStart.getDate() - ((userStart.getDay() + 6) % 7));
+                const extEnd = new Date(userEnd);
+                extEnd.setDate(userEnd.getDate() + ((7 - userEnd.getDay()) % 7));
+                startDate = getLocalDateKey(extStart.getTime());
+                const todayTaipei = getTaipeiDateString();
+                const extEndStr = getLocalDateKey(extEnd.getTime());
+                endDate = todayTaipei && extEndStr > todayTaipei ? todayTaipei : extEndStr;
+            }
+        }
+
+        const canCalc = selectedTank?.calculationMethod === 'BWS_STEAM' || selectedTank?.calculationMethod === 'CWS_BLOWDOWN';
+        const forceSync = forceRangeSyncRef.current;
+        forceRangeSyncRef.current = false;
+
+        setDailyRangeSyncError(null);
+
+        const loadAndSync = async () => {
+            let initialBws: DailyBWSParameterRecord[] = [];
+            let initialCws: DailyCWSParameterRecord[] = [];
+            try {
+                const cached = await StorageService.getDailyParams({
+                    tankId: selectedTankId,
+                    startDate,
+                    endDate
+                });
+                if (cancelled) return;
+                initialBws = cached.bws || [];
+                initialCws = cached.cws || [];
+                setDailyBwsParams(initialBws);
+                setDailyCwsParams(initialCws);
+            } catch (err) {
+                if (cancelled) return;
+                console.warn('載入每日 PI 參數失敗:', err);
+                setDailyBwsParams([]);
+                setDailyCwsParams([]);
+            }
+
+            if (!canCalc) return;
+
+            const startMs = Date.parse(`${startDate}T00:00:00+08:00`);
+            const endMs = Date.parse(`${endDate}T00:00:00+08:00`);
+            const nowMs = Date.now();
+            let needsSync = forceSync;
+
+            if (!needsSync && Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs) {
+                const DAY_MS = 24 * 60 * 60 * 1000;
+                const finalSet = new Set(
+                    (selectedTank?.calculationMethod === 'BWS_STEAM'
+                        ? initialBws.filter(p => p.isFinal && (!showCondensateRecovery || p.condensateRecoveryRate !== null && p.condensateRecoveryRate !== undefined || p.feedwaterFlow !== null && p.feedwaterFlow !== undefined))
+                        : initialCws.filter(p => p.isFinal)
+                    ).map(p => p.dateStr)
+                );
+                for (let t = startMs, count = 0; t <= endMs && count < 62; t += DAY_MS, count++) {
+                    if (t > nowMs) break;
+                    const dStr = new Date(t + 8 * 3600000).toISOString().slice(0, 10);
+                    if (!finalSet.has(dStr)) {
+                        needsSync = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!needsSync) return;
+
+            setDailyRangeSyncing(true);
+            try {
+                const synced = await StorageService.syncDailyParamsRange(startDate, endDate, selectedTankId, forceSync);
+                if (cancelled) return;
+                let nextBws = synced.bws || [];
+                let nextCws = synced.cws || [];
+                if (synced.status !== 'PI_ERROR' && nextBws.length === 0 && nextCws.length === 0) {
+                    const refreshed = await StorageService.getDailyParams({
+                        tankId: selectedTankId,
+                        startDate,
+                        endDate
+                    });
+                    if (cancelled) return;
+                    nextBws = refreshed.bws || [];
+                    nextCws = refreshed.cws || [];
+                }
+                setDailyBwsParams(nextBws);
+                setDailyCwsParams(nextCws);
+                if (synced.status === 'PI_ERROR') {
+                    setDailyRangeSyncError('PI 連線失敗');
+                } else if (synced.status === 'PARTIAL_ERROR') {
+                    setDailyRangeSyncError('部分日期 PI 讀取異常');
+                } else if (synced.status === 'NO_VALID_DATES') {
+                    setDailyRangeSyncError('日期範圍無效或尚未到來');
+                }
+            } catch (err: any) {
+                if (cancelled) return;
+                console.warn('補抓每日 PI 參數失敗:', err);
+                setDailyRangeSyncError(err?.message || 'PI 同步失敗');
+            } finally {
+                if (!cancelled) setDailyRangeSyncing(false);
+            }
+        };
+
+        loadAndSync();
+        return () => { cancelled = true; };
+    }, [selectedTankId, selectedTank?.calculationMethod, showCondensateRecovery, appliedDateRange.start, appliedDateRange.end, dailyRangeSyncNonce]);
 
     // 1. Process readings into daily continuous data (Extended for Weekly View)
     // We strictly follow "Weekly View should show complete weeks (Mon-Sun)".
@@ -5027,6 +5324,40 @@ const AnalysisView: React.FC<{
             const sgArray = Array.from(sgSet);
             const priceArray = Array.from(priceSet);
 
+            // 計算鍋爐水藥劑之週冷凝水回收率 (優先由日參數總流量加權，無日資料時回退至 bws_parameters 週紀錄)
+            let condensateRecoveryRate: number | null = null;
+            let feedwaterFlow: number | null = null;
+            let sprayWaterFlow: number | null = null;
+            let makeupWaterFlow: number | null = null;
+            let blowdownFlow: number | null = null;
+            let recoveryCoveredDays = 0;
+
+            if (showCondensateRecovery) {
+                const weekStartTaipeiMs = Date.parse(`${getLocalDateKey(week.date.getTime())}T00:00:00+08:00`);
+                const weekEndTaipeiMs = weekStartTaipeiMs + 7 * 24 * 60 * 60 * 1000;
+                const weeklyAgg = aggregateWeeklyCondensateRecovery(dailyBwsParams, weekStartTaipeiMs, weekEndTaipeiMs, true);
+                if (weeklyAgg && weeklyAgg.condensateRecoveryRate !== null) {
+                    condensateRecoveryRate = weeklyAgg.condensateRecoveryRate;
+                    feedwaterFlow = weeklyAgg.feedwaterFlow;
+                    sprayWaterFlow = weeklyAgg.sprayWaterFlow;
+                    makeupWaterFlow = weeklyAgg.makeupWaterFlow;
+                    blowdownFlow = weeklyAgg.blowdownFlow;
+                    recoveryCoveredDays = weeklyAgg.coveredDays;
+                } else {
+                    const weekRecord = bwsParamsHistory.find(p => {
+                        const pDate = p.date || 0;
+                        return pDate >= weekStartTime && pDate < weekEndTime;
+                    });
+                    if (weekRecord && weekRecord.condensateRecoveryRate !== null && weekRecord.condensateRecoveryRate !== undefined) {
+                        condensateRecoveryRate = weekRecord.condensateRecoveryRate;
+                        feedwaterFlow = weekRecord.feedwaterFlow ?? null;
+                        sprayWaterFlow = weekRecord.sprayWaterFlow ?? null;
+                        makeupWaterFlow = weekRecord.makeupWaterFlow ?? null;
+                        blowdownFlow = weekRecord.blowdownFlow ?? null;
+                    }
+                }
+            }
+
             return {
                 dateStr: week.dateStr,
                 date: week.date,
@@ -5036,12 +5367,122 @@ const AnalysisView: React.FC<{
                 specificGravity: sgArray.length === 1 ? sgArray[0] : undefined,
                 specificGravityMultiple: sgArray.length > 1 ? sgArray : undefined,
                 price: priceArray.length === 1 ? priceArray[0] : undefined,
-                priceMultiple: priceArray.length > 1 ? priceArray : undefined
+                priceMultiple: priceArray.length > 1 ? priceArray : undefined,
+                condensateRecoveryRate,
+                feedwaterFlow,
+                sprayWaterFlow,
+                makeupWaterFlow,
+                blowdownFlow,
+                recoveryCoveredDays
             };
         }).sort((a, b) => a.date.getTime() - b.date.getTime());
-    }, [weeklyData, selectedTank, bwsParamsHistory, cwsParamsHistory, suppliesHistory, metric]);
+    }, [weeklyData, selectedTank, bwsParamsHistory, cwsParamsHistory, suppliesHistory, metric, dailyBwsParams, showCondensateRecovery]);
 
     const hasCalculation = selectedTank && selectedTank.calculationMethod && selectedTank.calculationMethod !== 'NONE';
+
+    // 5. Daily Comparison Data (Actual vs Theoretical using direct Daily PI params only)
+    const dailyComparisonData = useMemo(() => {
+        if (!selectedTank || dailyData.length === 0) return [];
+
+        const userStart = getNormalizedTimestamp(appliedDateRange.start);
+        const userEnd = getNormalizedTimestamp(appliedDateRange.end);
+        if (userStart === null || userEnd === null) return [];
+        const userEndInclusive = userEnd + (24 * 60 * 60 * 1000 - 1);
+
+        const dailyBwsMap = new Map<string, DailyBWSParameterRecord>();
+        dailyBwsParams.forEach(p => dailyBwsMap.set(p.dateStr, p));
+        const dailyCwsMap = new Map<string, DailyCWSParameterRecord>();
+        dailyCwsParams.forEach(p => dailyCwsMap.set(p.dateStr, p));
+
+        const DAY_MS = 24 * 60 * 60 * 1000;
+
+        return dailyData
+            .filter(d => {
+                const t = d.date.getTime();
+                return t >= userStart && t <= userEndInclusive;
+            })
+            .map(day => {
+                const dateKey = getLocalDateKey(day.date.getTime());
+                const dayStartTs = normalizeTimestampToLocalDayStart(day.date.getTime());
+                const dayEndTs = dayStartTs + DAY_MS - 1;
+                const activeSupply = suppliesHistory.find(s => s.startDate <= dayEndTs);
+                const targetPpm = Number(activeSupply?.targetPpm || 0);
+                const price = Number(activeSupply?.price || 0);
+                const sg = Number(activeSupply?.specificGravity || 1);
+
+                let theoreticalKg: number | null = null;
+                let sourceLabel: 'PI日實測' | 'PI滾動24h' | '待同步' = '待同步';
+                let steamProduction: number | null = null;
+                let circulationRate: number | null = null;
+                let tempDiff: number | null = null;
+                let concentrationCycles: number | null = null;
+                let condensateRecoveryRate: number | null = null;
+                let feedwaterFlow: number | null = null;
+                let sprayWaterFlow: number | null = null;
+                let makeupWaterFlow: number | null = null;
+                let blowdownFlow: number | null = null;
+
+                if (selectedTank.calculationMethod === 'BWS_STEAM') {
+                    const dailyBws = dailyBwsMap.get(dateKey);
+                    if (dailyBws) {
+                        steamProduction = dailyBws.steamProduction;
+                        if (targetPpm > 0) {
+                            theoreticalKg = (steamProduction * targetPpm) / 1000;
+                        }
+                        sourceLabel = dailyBws.isFinal ? 'PI日實測' : 'PI滾動24h';
+                        if (showCondensateRecovery) {
+                            condensateRecoveryRate = dailyBws.condensateRecoveryRate ?? null;
+                            feedwaterFlow = dailyBws.feedwaterFlow ?? null;
+                            sprayWaterFlow = dailyBws.sprayWaterFlow ?? null;
+                            makeupWaterFlow = dailyBws.makeupWaterFlow ?? null;
+                            blowdownFlow = dailyBws.blowdownFlow ?? null;
+                        }
+                    }
+                } else if (selectedTank.calculationMethod === 'CWS_BLOWDOWN' && targetPpm > 0) {
+                    const dailyCws = dailyCwsMap.get(dateKey);
+                    if (dailyCws) {
+                        circulationRate = dailyCws.circulationRate;
+                        tempDiff = dailyCws.tempDiff;
+                        concentrationCycles = dailyCws.concentrationCycles;
+                        theoreticalKg = calculateCWSUsage(circulationRate, tempDiff, concentrationCycles, targetPpm, 1);
+                        sourceLabel = dailyCws.isFinal ? 'PI日實測' : 'PI滾動24h';
+                    }
+                }
+
+                let theoretical: number | null = theoreticalKg;
+                if (theoreticalKg !== null) {
+                    if (metric === '$') {
+                        theoretical = theoreticalKg * price;
+                    } else if (metric === 'L') {
+                        theoretical = sg > 0 ? theoreticalKg / sg : theoreticalKg;
+                    }
+                }
+
+                const actual = day.usage;
+                const deviation = theoretical !== null && theoretical > 0 ? ((actual - theoretical) / theoretical) * 100 : 0;
+
+                return {
+                    date: day.date,
+                    dateKey,
+                    dateStr: `${day.date.getMonth() + 1}/${day.date.getDate()}`,
+                    actual,
+                    theoretical,
+                    deviation,
+                    targetPpm,
+                    sourceLabel,
+                    steamProduction,
+                    circulationRate,
+                    tempDiff,
+                    concentrationCycles,
+                    condensateRecoveryRate,
+                    feedwaterFlow,
+                    sprayWaterFlow,
+                    makeupWaterFlow,
+                    blowdownFlow
+                };
+            })
+            .sort((a, b) => a.date.getTime() - b.date.getTime());
+    }, [dailyData, selectedTank, metric, suppliesHistory, dailyBwsParams, dailyCwsParams, appliedDateRange, showCondensateRecovery]);
 
     // Theoretical Calculation Details Card
     const TheoreticalUsageCard: React.FC<{ tank: Tank, weeklyData: any[] }> = ({ tank, weeklyData }) => {
@@ -5316,6 +5757,9 @@ const AnalysisView: React.FC<{
                                 <tr className="bg-slate-200">
                                     <th className="p-2 font-semibold text-slate-800">週次</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">蒸汽總產量 (ton)</th>
+                                    {showCondensateRecovery && (
+                                        <th className="p-2 font-semibold text-slate-800 text-right">冷凝水回收率 (%)</th>
+                                    )}
                                     <th className="p-2 font-semibold text-slate-800 text-right">目標濃度 (ppm)</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">理論用量 ({metric})</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">實際用量 ({metric})</th>
@@ -5346,11 +5790,21 @@ const AnalysisView: React.FC<{
                                     const diffPercent = theoryUsage > 0 ? ((actualUsage - theoryUsage) / theoryUsage * 100) : 0;
                                     const diffColor = Math.abs(diffPercent) > 20 ? 'text-red-600' :
                                         Math.abs(diffPercent) > 10 ? 'text-yellow-600' : 'text-green-600';
+                                    const weekComp = showCondensateRecovery
+                                        ? weeklyComparisonData.find(w => w.dateStr === week.dateStr)
+                                        : undefined;
 
                                     return (
                                         <tr key={idx} className={idx % 2 === 0 ? 'bg-slate-50' : 'bg-white'}>
                                             <td className="p-2 font-medium text-slate-700">{week.dateStr}</td>
                                             <td className="p-2 text-right font-mono text-orange-700">{steamProduction.toFixed(1)}</td>
+                                            {showCondensateRecovery && (
+                                                <td className="p-2 text-right font-mono font-semibold text-emerald-700">
+                                                    {weekComp?.condensateRecoveryRate !== null && weekComp?.condensateRecoveryRate !== undefined
+                                                        ? `${weekComp.condensateRecoveryRate.toFixed(1)}%`
+                                                        : '-'}
+                                                </td>
+                                            )}
                                             <td className="p-2 text-right font-mono">{targetPpm.toFixed(1)}</td>
                                             <td className="p-2 text-right font-bold text-red-600">{theoryUsage.toFixed(1)}</td>
                                             <td className="p-2 text-right font-bold text-blue-600">{actualUsage.toFixed(1)}</td>
@@ -5504,6 +5958,146 @@ const AnalysisView: React.FC<{
                 </div>
             </div>
 
+            {/* Daily Comparison Chart - Full Width */}
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                <div className="px-6 py-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-2 bg-slate-50/50">
+                    <h3 className="font-semibold text-slate-800 flex items-center gap-2">
+                        {hasCalculation ? `日用量 vs 理論值 (${metric})` : `日用量趨勢 (${metric})`}
+                        <button onClick={() => setHelpTopic('daily')} className="text-slate-400 hover:text-brand-500 transition-colors">
+                            <Icons.Help className="w-4 h-4" />
+                        </button>
+                    </h3>
+                    {hasCalculation && (
+                        <div className="flex items-center gap-2 text-xs">
+                            {dailyRangeSyncing && (
+                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-sky-100 text-sky-700 border border-sky-200">
+                                    <Icons.Activity className="w-3.5 h-3.5 animate-spin" />
+                                    正在向 PI 同步區間每日數據...
+                                </span>
+                            )}
+                            {!dailyRangeSyncing && dailyRangeSyncError && (
+                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
+                                    {dailyRangeSyncError}
+                                </span>
+                            )}
+                            <button
+                                type="button"
+                                disabled={dailyRangeSyncing}
+                                onClick={() => {
+                                    forceRangeSyncRef.current = true;
+                                    setDailyRangeSyncNonce(n => n + 1);
+                                }}
+                                className="px-2.5 py-1 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-50 transition-colors"
+                            >
+                                同步每日PI數據
+                            </button>
+                        </div>
+                    )}
+                </div>
+                <div className="px-6 pt-4 pb-2" style={{ height: '320px' }}>
+                    {dailyComparisonData.length > 0 ? (
+                        <ResponsiveContainer width="100%" height="100%" minHeight={260}>
+                            <ComposedChart
+                                key={`daily-${selectedTankId}-${appliedDateRange.start}-${appliedDateRange.end}-${metric}-${dailyBwsParams.length}-${dailyCwsParams.length}`}
+                                data={dailyComparisonData}
+                                margin={{ top: 20, right: 30, left: 20, bottom: 20 }}
+                            >
+                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#2d3b55" />
+                                <XAxis dataKey="dateStr" tick={{ fill: '#cbd5e1', fontSize: 11 }} />
+                                <YAxis yAxisId="left" tick={{ fill: '#cbd5e1', fontSize: 11 }} />
+                                {showCondensateRecovery && (
+                                    <YAxis
+                                        yAxisId="right"
+                                        orientation="right"
+                                        unit="%"
+                                        domain={[0, (dataMax: number) => Math.max(100, Math.ceil((dataMax || 100) / 10) * 10)]}
+                                        tick={{ fill: '#10b981', fontSize: 11 }}
+                                    />
+                                )}
+                                <Tooltip
+                                    content={({ active, payload }: any) => {
+                                        if (!active || !payload?.length) return null;
+                                        const d = payload[0]?.payload;
+                                        const devColor = Math.abs(d.deviation) > 20 ? 'text-red-400' : Math.abs(d.deviation) > 5 ? 'text-amber-400' : 'text-emerald-400';
+                                        const totalFw = d.feedwaterFlow !== null && d.feedwaterFlow !== undefined
+                                            ? Number(d.feedwaterFlow) + Number(d.sprayWaterFlow || 0)
+                                            : null;
+                                        return (
+                                            <div className="bg-slate-900 border border-slate-700 rounded-lg p-3 text-xs text-slate-100 shadow-lg space-y-1 min-w-48">
+                                                <div className="font-bold text-slate-200 border-b border-slate-700 pb-1 flex justify-between gap-3">
+                                                    <span>{d.dateKey}</span>
+                                                    <span className="text-slate-400 font-normal">{d.sourceLabel}</span>
+                                                </div>
+                                                <div className="flex justify-between gap-4">
+                                                    <span className="text-blue-400">實際用量</span>
+                                                    <span className="font-mono font-bold">{Number(d.actual).toFixed(1)} {metric}</span>
+                                                </div>
+                                                {hasCalculation && (
+                                                    <>
+                                                        <div className="flex justify-between gap-4">
+                                                            <span className="text-sky-400">理論預估</span>
+                                                            <span className="font-mono font-bold">
+                                                                {d.theoretical !== null ? `${Number(d.theoretical).toFixed(1)} ${metric}` : '-'}
+                                                            </span>
+                                                        </div>
+                                                        {d.theoretical !== null && d.theoretical > 0 && (
+                                                            <div className="flex justify-between gap-4">
+                                                                <span className="text-slate-400">差異 %</span>
+                                                                <span className={`font-mono font-bold ${devColor}`}>
+                                                                    {d.deviation > 0 ? '+' : ''}{Number(d.deviation).toFixed(1)}%
+                                                                </span>
+                                                            </div>
+                                                        )}
+                                                    </>
+                                                )}
+                                                {showCondensateRecovery && (
+                                                    <div className="pt-1 mt-1 border-t border-slate-700/80 space-y-0.5">
+                                                        <div className="flex justify-between gap-4">
+                                                            <span className="text-emerald-400">冷凝水回收率</span>
+                                                            <span className="font-mono font-bold text-emerald-300">
+                                                                {d.condensateRecoveryRate !== null && d.condensateRecoveryRate !== undefined
+                                                                    ? `${Number(d.condensateRecoveryRate).toFixed(1)}%`
+                                                                    : '-'}
+                                                            </span>
+                                                        </div>
+                                                        {totalFw !== null && d.steamProduction !== null && (
+                                                            <div className="text-[11px] text-slate-400 font-mono">
+                                                                給水 {totalFw.toFixed(0)} / 補給 {Number(d.makeupWaterFlow || 0).toFixed(0)} / 排污 {Number(d.blowdownFlow || 0).toFixed(0)} / 產汽 {Number(d.steamProduction).toFixed(0)} t
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        );
+                                    }}
+                                />
+                                <Legend verticalAlign="top" />
+                                {hasCalculation && metric === 'KG' && (
+                                    <Area yAxisId="left" type="monotone" dataKey="theoretical" connectNulls={false} isAnimationActive={false} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
+                                )}
+                                <Bar yAxisId="left" dataKey="actual" barSize={14} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
+                                {showCondensateRecovery && (
+                                    <Line
+                                        yAxisId="right"
+                                        type="monotone"
+                                        dataKey="condensateRecoveryRate"
+                                        stroke="#10b981"
+                                        strokeWidth={2}
+                                        dot={{ r: 3, fill: '#10b981' }}
+                                        activeDot={{ r: 5 }}
+                                        connectNulls={false}
+                                        isAnimationActive={false}
+                                        name="冷凝水回收率 (%)"
+                                    />
+                                )}
+                            </ComposedChart>
+                        </ResponsiveContainer>
+                    ) : (
+                        <div className="h-full flex items-center justify-center text-slate-400">此時間範圍內無足夠日用量數據</div>
+                    )}
+                </div>
+            </div>
+
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {/* Weekly Comparison Chart - Left */}
                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
@@ -5541,17 +6135,82 @@ const AnalysisView: React.FC<{
                                             );
                                         }}
                                     />
-                                    <YAxis tick={{ fill: '#cbd5e1', fontSize: 11 }} />
+                                    <YAxis yAxisId="left" tick={{ fill: '#cbd5e1', fontSize: 11 }} />
+                                    {showCondensateRecovery && (
+                                        <YAxis
+                                            yAxisId="right"
+                                            orientation="right"
+                                            unit="%"
+                                            domain={[0, (dataMax: number) => Math.max(100, Math.ceil((dataMax || 100) / 10) * 10)]}
+                                            tick={{ fill: '#10b981', fontSize: 11 }}
+                                        />
+                                    )}
                                     <Tooltip
-                                        contentStyle={{ backgroundColor: '#0f172a', borderColor: '#2d3b55', borderRadius: '8px', color: '#f8fafc' }}
-                                        formatter={(value: number) => [value.toFixed(1), '用量']}
+                                        content={({ active, payload }: any) => {
+                                            if (!active || !payload?.length) return null;
+                                            const d = payload[0]?.payload;
+                                            const devColor = Math.abs(d.deviation) > 20 ? 'text-red-400' : Math.abs(d.deviation) > 10 ? 'text-amber-400' : 'text-emerald-400';
+                                            return (
+                                                <div className="bg-slate-900 border border-slate-700 rounded-lg p-3 text-xs text-slate-100 shadow-lg space-y-1 min-w-44">
+                                                    <div className="font-bold text-slate-200 border-b border-slate-700 pb-1 flex justify-between gap-3">
+                                                        <span>週起始 {d.dateStr}</span>
+                                                    </div>
+                                                    <div className="flex justify-between gap-4">
+                                                        <span className="text-blue-400">實際用量</span>
+                                                        <span className="font-mono font-bold">{Number(d.actual).toFixed(1)} {metric}</span>
+                                                    </div>
+                                                    {hasCalculation && (
+                                                        <>
+                                                            <div className="flex justify-between gap-4">
+                                                                <span className="text-sky-400">理論預估</span>
+                                                                <span className="font-mono font-bold">{Number(d.theoretical).toFixed(1)} {metric}</span>
+                                                            </div>
+                                                            {d.theoretical > 0 && (
+                                                                <div className="flex justify-between gap-4">
+                                                                    <span className="text-slate-400">差異 %</span>
+                                                                    <span className={`font-mono font-bold ${devColor}`}>
+                                                                        {d.deviation > 0 ? '+' : ''}{Number(d.deviation).toFixed(1)}%
+                                                                    </span>
+                                                                </div>
+                                                            )}
+                                                        </>
+                                                    )}
+                                                    {showCondensateRecovery && (
+                                                        <div className="pt-1 mt-1 border-t border-slate-700/80 flex justify-between gap-4">
+                                                            <span className="text-emerald-400">
+                                                                冷凝水回收率{d.recoveryCoveredDays ? ` (${d.recoveryCoveredDays}天)` : ''}
+                                                            </span>
+                                                            <span className="font-mono font-bold text-emerald-300">
+                                                                {d.condensateRecoveryRate !== null && d.condensateRecoveryRate !== undefined
+                                                                    ? `${Number(d.condensateRecoveryRate).toFixed(1)}%`
+                                                                    : '-'}
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        }}
                                     />
                                     <Legend verticalAlign="top" />
 
                                     {hasCalculation && metric === 'KG' && (
-                                        <Area type="monotone" dataKey="theoretical" fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
+                                        <Area yAxisId="left" type="monotone" dataKey="theoretical" fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
                                     )}
-                                    <Bar dataKey="actual" barSize={20} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
+                                    <Bar yAxisId="left" dataKey="actual" barSize={20} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
+                                    {showCondensateRecovery && (
+                                        <Line
+                                            yAxisId="right"
+                                            type="monotone"
+                                            dataKey="condensateRecoveryRate"
+                                            stroke="#10b981"
+                                            strokeWidth={2}
+                                            dot={{ r: 3, fill: '#10b981' }}
+                                            activeDot={{ r: 5 }}
+                                            connectNulls={false}
+                                            isAnimationActive={false}
+                                            name="冷凝水回收率 (%)"
+                                        />
+                                    )}
                                 </ComposedChart>
                             </ResponsiveContainer>
                         ) : (
@@ -5708,7 +6367,117 @@ const AnalysisView: React.FC<{
                 </div>
             </div>
 
-            <TheoreticalUsageCard tank={selectedTank} weeklyData={weeklyData} />
+            {hasCalculation && (
+                <div className="flex items-center justify-end gap-2">
+                    <div className="bg-slate-100 border rounded-lg p-0.5 flex">
+                        <button
+                            onClick={() => setDetailGranularity('daily')}
+                            className={`px-3 py-1 rounded text-xs font-medium transition-colors ${detailGranularity === 'daily' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'}`}
+                        >
+                            每日基礎
+                        </button>
+                        <button
+                            onClick={() => setDetailGranularity('weekly')}
+                            className={`px-3 py-1 rounded text-xs font-medium transition-colors ${detailGranularity === 'weekly' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'}`}
+                        >
+                            每週基礎
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {hasCalculation && detailGranularity === 'daily' ? (
+                dailyComparisonData.length > 0 ? (
+                    <Card
+                        title="理論用量計算展示 (每日基礎)"
+                        className={`mt-2 border-l-4 ${selectedTank.calculationMethod === 'BWS_STEAM' ? 'border-l-orange-500' : 'border-l-sky-500'}`}
+                    >
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full text-sm text-left border-collapse">
+                                <thead>
+                                    <tr className="bg-slate-200">
+                                        <th className="p-2 font-semibold text-slate-800">日期</th>
+                                        {selectedTank.calculationMethod === 'BWS_STEAM' ? (
+                                            <>
+                                                <th className="p-2 font-semibold text-slate-800 text-right">日蒸汽量 (ton)</th>
+                                                {showCondensateRecovery && (
+                                                    <th className="p-2 font-semibold text-slate-800 text-right">冷凝水回收率 (%)</th>
+                                                )}
+                                            </>
+                                        ) : (
+                                            <>
+                                                <th className="p-2 font-semibold text-slate-800 text-right">循環水量 R (m³/h)</th>
+                                                <th className="p-2 font-semibold text-slate-800 text-right">溫差 ΔT (°C)</th>
+                                                <th className="p-2 font-semibold text-slate-800 text-right">濃縮倍數 N</th>
+                                            </>
+                                        )}
+                                        <th className="p-2 font-semibold text-slate-800 text-right">目標濃度 (ppm)</th>
+                                        <th className="p-2 font-semibold text-slate-800 text-right">理論用量 ({metric})</th>
+                                        <th className="p-2 font-semibold text-slate-800 text-right">實際用量 ({metric})</th>
+                                        <th className="p-2 font-semibold text-slate-800 text-right">差異 %</th>
+                                        <th className="p-2 font-semibold text-slate-800 text-center">數據來源</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {dailyComparisonData.map((d, idx) => {
+                                        const diffColor = Math.abs(d.deviation) > 20 ? 'text-red-600' :
+                                            Math.abs(d.deviation) > 5 ? 'text-yellow-600' : 'text-green-600';
+                                        const badgeClass =
+                                            d.sourceLabel === 'PI日實測' ? 'bg-emerald-100 text-emerald-700' :
+                                                d.sourceLabel === 'PI滾動24h' ? 'bg-sky-100 text-sky-700' :
+                                                    'bg-gray-100 text-gray-500';
+
+                                        return (
+                                            <tr key={d.dateKey} className={idx % 2 === 0 ? 'bg-slate-50' : 'bg-white'}>
+                                                <td className="p-2 font-medium text-slate-700 font-mono">{d.dateKey}</td>
+                                                {selectedTank.calculationMethod === 'BWS_STEAM' ? (
+                                                    <>
+                                                        <td className="p-2 text-right font-mono text-orange-700">
+                                                            {d.steamProduction !== null ? d.steamProduction.toFixed(1) : '-'}
+                                                        </td>
+                                                        {showCondensateRecovery && (
+                                                            <td className="p-2 text-right font-mono font-semibold text-emerald-700">
+                                                                {d.condensateRecoveryRate !== null && d.condensateRecoveryRate !== undefined
+                                                                    ? `${d.condensateRecoveryRate.toFixed(1)}%`
+                                                                    : '-'}
+                                                            </td>
+                                                        )}
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <td className="p-2 text-right font-mono text-slate-600">
+                                                            {d.circulationRate !== null ? d.circulationRate.toFixed(1) : '-'}
+                                                        </td>
+                                                        <td className="p-2 text-right font-mono text-slate-600">
+                                                            {d.tempDiff !== null ? d.tempDiff.toFixed(2) : '-'}
+                                                        </td>
+                                                        <td className="p-2 text-right font-mono text-slate-600">
+                                                            {d.concentrationCycles !== null ? d.concentrationCycles.toFixed(1) : '-'}
+                                                        </td>
+                                                    </>
+                                                )}
+                                                <td className="p-2 text-right font-mono">{d.targetPpm.toFixed(1)}</td>
+                                                <td className="p-2 text-right font-bold text-red-600">
+                                                    {d.theoretical !== null ? d.theoretical.toFixed(1) : '-'}
+                                                </td>
+                                                <td className="p-2 text-right font-bold text-blue-600">{d.actual.toFixed(1)}</td>
+                                                <td className={`p-2 text-right font-bold ${diffColor}`}>
+                                                    {d.theoretical !== null && d.theoretical > 0 ? `${d.deviation > 0 ? '+' : ''}${d.deviation.toFixed(1)}%` : '-'}
+                                                </td>
+                                                <td className="p-2 text-center">
+                                                    <span className={`text-xs px-2 py-1 rounded ${badgeClass}`}>{d.sourceLabel}</span>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    </Card>
+                ) : null
+            ) : (
+                <TheoreticalUsageCard tank={selectedTank} weeklyData={weeklyData} />
+            )}
 
             {/* Help Modal */}
             {
@@ -5718,14 +6487,41 @@ const AnalysisView: React.FC<{
                             <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-lg">
                                 <h3 className="text-lg font-bold text-slate-800 flex items-center">
                                     <Icons.Help className="w-5 h-5 mr-2 text-brand-500" />
-                                    {helpTopic === 'weekly' ? '週理論用量計算說明' : '月理論用量計算說明'}
+                                    {helpTopic === 'daily' ? '日理論用量計算說明' : helpTopic === 'weekly' ? '週理論用量計算說明' : '月理論用量計算說明'}
                                 </h3>
                                 <button onClick={() => setHelpTopic(null)} className="text-slate-400 hover:text-slate-600">
                                     <Icons.X className="w-5 h-5" />
                                 </button>
                             </div>
                             <div className="p-6 space-y-4 text-slate-700 text-sm">
-                                {helpTopic === 'weekly' ? (
+                                {helpTopic === 'daily' ? (
+                                    <div className="space-y-4">
+                                        <h4 className="font-bold text-brand-700">每日 PI 計算說明</h4>
+                                        <ul className="list-disc pl-5 space-y-2">
+                                            <li>
+                                                <span className="font-semibold text-emerald-700">PI日實測</span>：每日各自抓取 00:00~24:00 完整區間之 PI 蒸汽總量／平均流量與溫差計算，不使用週均推算。
+                                            </li>
+                                            <li>
+                                                <span className="font-semibold text-sky-700">PI滾動24h</span>：當日尚未結束時，由同步時間往前推滿 24 小時之暫估值。
+                                            </li>
+                                            <li>
+                                                <span className="font-semibold text-slate-700">待同步</span>：該日尚未取得 PI 日參數（可按右上角「同步每日PI數據」重新同步）。
+                                            </li>
+                                        </ul>
+                                        <p className="text-xs text-slate-500">實際用量取自現場液位紀錄差值（跨日未抄表時依區間天數平均分攤）。</p>
+                                        {showCondensateRecovery && (
+                                            <div className="pt-3 border-t border-slate-200 space-y-2">
+                                                <h4 className="font-bold text-emerald-700">冷凝水回收率 (%)</h4>
+                                                <div className="bg-emerald-50 p-3 rounded font-mono text-xs border border-emerald-200 text-emerald-900">
+                                                    回收率 (%) = ((鍋爐飼水 + S/H減溫噴水 - DW補水 - CBD排污) / MS產汽) × 100%
+                                                </div>
+                                                <p className="text-xs text-slate-600">
+                                                    僅於鍋爐水藥劑（中和胺、脫氧劑、清罐劑）顯示，採四部爐與一/二階 DW 之 PI 每日總量計算。
+                                                </p>
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : helpTopic === 'weekly' ? (
                                     <div className="space-y-4">
                                         <h4 className="font-bold text-brand-700">冷卻水系統 (CWS)</h4>
                                         <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
@@ -5738,6 +6534,18 @@ const AnalysisView: React.FC<{
                                             (當週蒸氣總產量 × 目標濃度(ppm)) / 1000
                                         </div>
                                         <p>直接依據流量計回傳的蒸氣總量計算。</p>
+
+                                        {showCondensateRecovery && (
+                                            <>
+                                                <h4 className="font-bold text-emerald-700 mt-4">週冷凝水回收率 (%)</h4>
+                                                <div className="bg-emerald-50 p-3 rounded font-mono text-xs border border-emerald-200 text-emerald-900">
+                                                    週回收率 (%) = ((∑給水 - ∑補給 - ∑排污) / ∑產汽) × 100%
+                                                </div>
+                                                <p className="text-xs text-slate-600">
+                                                    以該週內所有具備完整日 PI 流量之天數進行總流量加權計算。
+                                                </p>
+                                            </>
+                                        )}
 
                                         <h4 className="font-bold text-amber-700 mt-4">比重與單價說明</h4>
                                         <ul className="list-disc pl-5 space-y-2">
@@ -6979,6 +7787,7 @@ const ParamsSettingsView: React.FC<{
     tanks: Tank[];
     appSettings: {
         usageCalcWeeks: number;
+        theoreticalUsageAlertPercent?: number;
         lowLevelWarningText: string;
         thresholdWarningText: string;
         possibleRefillText: string;
@@ -7033,6 +7842,29 @@ const ParamsSettingsView: React.FC<{
                             <span className="text-slate-500">週</span>
                         </div>
                         <p className="text-xs text-slate-400 mt-1">用於計算每個儲槽的平均日用量（建議 4-12 週）</p>
+                    </div>
+
+                    {/* 理論用量超標警報門檻 */}
+                    <div>
+                        <label className="block text-sm font-medium text-slate-700 mb-2">
+                            理論用量超標警報門檻（每日液位檢查）
+                        </label>
+                        <div className="flex items-center gap-3">
+                            <input
+                                type="number"
+                                min="1"
+                                max="200"
+                                step="1"
+                                value={localSettings.theoreticalUsageAlertPercent ?? 5}
+                                onChange={e => setLocalSettings(prev => ({
+                                    ...prev,
+                                    theoreticalUsageAlertPercent: Math.max(1, Math.min(200, Number(e.target.value) || 1))
+                                }))}
+                                className={`${inputClassName} w-32`}
+                            />
+                            <span className="text-slate-500">%</span>
+                        </div>
+                        <p className="text-xs text-slate-400 mt-1">實際日用量高於理論用量超過此比例時，自動觸發異常與通知（預設 5%）</p>
                     </div>
 
                     <hr className="border-slate-200" />
@@ -7135,6 +7967,7 @@ const App: React.FC = () => {
     // App Settings
     const [appSettings, setAppSettings] = useState({
         usageCalcWeeks: 8,
+        theoreticalUsageAlertPercent: 5,
         lowLevelWarningText: '存量偏低，請叫藥',
         thresholdWarningText: '液位變化異常，請確認',
         possibleRefillText: '可能為補藥紀錄'
