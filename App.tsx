@@ -4756,6 +4756,80 @@ const AnalysisView: React.FC<{
         BOILER_WATER_CHEMICAL_KEYWORDS.some(k => selectedTank.name.includes(k))
     );
 
+    const RECOVERY_SCALE_STORAGE_KEY = 'wtca_condensate_recovery_y_scale';
+    const [recoveryYScale, setRecoveryYScale] = useState<{ min: number | null; max: number | null }>(() => {
+        try {
+            const raw = localStorage.getItem(RECOVERY_SCALE_STORAGE_KEY);
+            if (!raw) return { min: null, max: null };
+            const parsed = JSON.parse(raw);
+            const min = parsed?.min === null || parsed?.min === undefined ? null : Number(parsed.min);
+            const max = parsed?.max === null || parsed?.max === undefined ? null : Number(parsed.max);
+            if ((min !== null && !Number.isFinite(min)) || (max !== null && !Number.isFinite(max))) {
+                return { min: null, max: null };
+            }
+            if (min !== null && max !== null && min >= max) {
+                return { min: null, max: null };
+            }
+            return { min, max };
+        } catch {
+            return { min: null, max: null };
+        }
+    });
+    const [showRecoveryScaleModal, setShowRecoveryScaleModal] = useState(false);
+    const [scaleMinDraft, setScaleMinDraft] = useState('');
+    const [scaleMaxDraft, setScaleMaxDraft] = useState('');
+    const [scaleDraftError, setScaleDraftError] = useState<string | null>(null);
+
+    const saveRecoveryYScale = (next: { min: number | null; max: number | null }) => {
+        setRecoveryYScale(next);
+        try {
+            if (next.min === null && next.max === null) {
+                localStorage.removeItem(RECOVERY_SCALE_STORAGE_KEY);
+            } else {
+                localStorage.setItem(RECOVERY_SCALE_STORAGE_KEY, JSON.stringify(next));
+            }
+        } catch {
+            // ignore storage errors
+        }
+    };
+
+    const openRecoveryScaleModal = () => {
+        setScaleMinDraft(recoveryYScale.min !== null ? String(recoveryYScale.min) : '');
+        setScaleMaxDraft(recoveryYScale.max !== null ? String(recoveryYScale.max) : '');
+        setScaleDraftError(null);
+        setShowRecoveryScaleModal(true);
+    };
+
+    const applyRecoveryScale = () => {
+        const minTrim = scaleMinDraft.trim();
+        const maxTrim = scaleMaxDraft.trim();
+        const minVal = minTrim === '' ? null : Number(minTrim);
+        const maxVal = maxTrim === '' ? null : Number(maxTrim);
+
+        if ((minVal !== null && !Number.isFinite(minVal)) || (maxVal !== null && !Number.isFinite(maxVal))) {
+            setScaleDraftError('請輸入有效數值');
+            return;
+        }
+        if (minVal !== null && maxVal !== null && minVal >= maxVal) {
+            setScaleDraftError('低點必須小於高點');
+            return;
+        }
+        saveRecoveryYScale({ min: minVal, max: maxVal });
+        setScaleDraftError(null);
+        setShowRecoveryScaleModal(false);
+    };
+
+    const hasCustomRecoveryScale = recoveryYScale.min !== null || recoveryYScale.max !== null;
+    const recoveryYAxisDomain: [number, number | ((dataMax: number) => number)] = [
+        recoveryYScale.min !== null ? recoveryYScale.min : 0,
+        recoveryYScale.max !== null
+            ? recoveryYScale.max
+            : (dataMax: number) => Math.max(100, Math.ceil((dataMax || 100) / 10) * 10)
+    ];
+    const recoveryScaleButtonLabel = hasCustomRecoveryScale
+        ? `回收率Y軸: ${recoveryYScale.min ?? '自動'}~${recoveryYScale.max ?? '自動'}%`
+        : '回收率Y軸: 自動';
+
     // 載入該儲槽的參數歷史記錄和藥劑合約歷史
     useEffect(() => {
         const loadParamsHistory = async () => {
@@ -5980,6 +6054,16 @@ const AnalysisView: React.FC<{
                                     {dailyRangeSyncError}
                                 </span>
                             )}
+                            {showCondensateRecovery && (
+                                <button
+                                    type="button"
+                                    onClick={openRecoveryScaleModal}
+                                    className="px-2.5 py-1 rounded border border-emerald-500/50 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50 transition-colors"
+                                    title="調整冷凝水回收率右側 Y 軸顯示範圍（日／週圖表同步套用）"
+                                >
+                                    {recoveryScaleButtonLabel}
+                                </button>
+                            )}
                             <button
                                 type="button"
                                 disabled={dailyRangeSyncing}
@@ -5998,7 +6082,7 @@ const AnalysisView: React.FC<{
                     {dailyComparisonData.length > 0 ? (
                         <ResponsiveContainer width="100%" height="100%" minHeight={260}>
                             <ComposedChart
-                                key={`daily-${selectedTankId}-${appliedDateRange.start}-${appliedDateRange.end}-${metric}-${dailyBwsParams.length}-${dailyCwsParams.length}`}
+                                key={`daily-${selectedTankId}-${appliedDateRange.start}-${appliedDateRange.end}-${metric}-${dailyBwsParams.length}-${dailyCwsParams.length}-${recoveryYScale.min ?? 'auto'}-${recoveryYScale.max ?? 'auto'}`}
                                 data={dailyComparisonData}
                                 margin={{ top: 20, right: 30, left: 20, bottom: 20 }}
                             >
@@ -6010,7 +6094,8 @@ const AnalysisView: React.FC<{
                                         yAxisId="right"
                                         orientation="right"
                                         unit="%"
-                                        domain={[0, (dataMax: number) => Math.max(100, Math.ceil((dataMax || 100) / 10) * 10)]}
+                                        domain={recoveryYAxisDomain}
+                                        allowDataOverflow={hasCustomRecoveryScale}
                                         tick={{ fill: '#10b981', fontSize: 11 }}
                                     />
                                 )}
@@ -6073,7 +6158,7 @@ const AnalysisView: React.FC<{
                                 />
                                 <Legend verticalAlign="top" />
                                 {hasCalculation && metric === 'KG' && (
-                                    <Area yAxisId="left" type="monotone" dataKey="theoretical" connectNulls={false} isAnimationActive={false} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
+                                    <Area yAxisId="left" type="monotone" dataKey="theoretical" connectNulls={false} strokeWidth={2} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
                                 )}
                                 <Bar yAxisId="left" dataKey="actual" barSize={14} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
                                 {showCondensateRecovery && (
@@ -6101,7 +6186,7 @@ const AnalysisView: React.FC<{
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {/* Weekly Comparison Chart - Left */}
                 <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                    <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                    <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center gap-2 bg-slate-50/50">
                         <h3 className="font-semibold text-slate-800 flex items-center gap-2">
                             {hasCalculation ? `週用量 vs 理論值 (${metric})` : `週用量趨勢 (${metric})`}
                             {hasCalculation && (
@@ -6110,11 +6195,25 @@ const AnalysisView: React.FC<{
                                 </button>
                             )}
                         </h3>
+                        {showCondensateRecovery && (
+                            <button
+                                type="button"
+                                onClick={openRecoveryScaleModal}
+                                className="px-2.5 py-1 rounded border border-emerald-500/50 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50 text-xs transition-colors"
+                                title="調整冷凝水回收率右側 Y 軸顯示範圍（日／週圖表同步套用）"
+                            >
+                                {recoveryScaleButtonLabel}
+                            </button>
+                        )}
                     </div>
                     <div className="px-6 pt-4" style={{ height: '340px' }}>
                         {weeklyComparisonData.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%" minHeight={280}>
-                                <ComposedChart data={weeklyComparisonData} margin={{ top: 20, right: 30, left: 20, bottom: 50 }}>
+                                <ComposedChart
+                                    key={`weekly-${selectedTankId}-${appliedDateRange.start}-${appliedDateRange.end}-${metric}-${weeklyComparisonData.length}-${recoveryYScale.min ?? 'auto'}-${recoveryYScale.max ?? 'auto'}`}
+                                    data={weeklyComparisonData}
+                                    margin={{ top: 20, right: 30, left: 20, bottom: 50 }}
+                                >
                                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#2d3b55" />
                                     <XAxis
                                         dataKey="dateStr"
@@ -6141,7 +6240,8 @@ const AnalysisView: React.FC<{
                                             yAxisId="right"
                                             orientation="right"
                                             unit="%"
-                                            domain={[0, (dataMax: number) => Math.max(100, Math.ceil((dataMax || 100) / 10) * 10)]}
+                                            domain={recoveryYAxisDomain}
+                                            allowDataOverflow={hasCustomRecoveryScale}
                                             tick={{ fill: '#10b981', fontSize: 11 }}
                                         />
                                     )}
@@ -6194,7 +6294,7 @@ const AnalysisView: React.FC<{
                                     <Legend verticalAlign="top" />
 
                                     {hasCalculation && metric === 'KG' && (
-                                        <Area yAxisId="left" type="monotone" dataKey="theoretical" fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
+                                        <Area yAxisId="left" type="monotone" dataKey="theoretical" strokeWidth={2} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
                                     )}
                                     <Bar yAxisId="left" dataKey="actual" barSize={20} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
                                     {showCondensateRecovery && (
@@ -6596,6 +6696,101 @@ const AnalysisView: React.FC<{
                             </div>
                             <div className="px-6 py-4 bg-slate-50 rounded-b-lg flex justify-end">
                                 <Button onClick={() => setHelpTopic(null)}>關閉</Button>
+                            </div>
+                        </div>
+                    </div>
+                )
+            }
+
+            {/* Condensate Recovery Y-Axis Scale Modal */}
+            {
+                showRecoveryScaleModal && (
+                    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4" onClick={() => setShowRecoveryScaleModal(false)}>
+                        <div className="bg-white rounded-lg shadow-xl w-full max-w-md animate-in fade-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
+                            <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-lg">
+                                <div>
+                                    <h3 className="text-base font-bold text-slate-800">設定冷凝水回收率 Y 軸範圍</h3>
+                                    <p className="text-xs text-slate-500 mt-0.5">同步套用於日用量與週用量圖表右側 Y 軸 (%)</p>
+                                </div>
+                                <button onClick={() => setShowRecoveryScaleModal(false)} className="text-slate-400 hover:text-slate-600">
+                                    <Icons.X className="w-5 h-5" />
+                                </button>
+                            </div>
+                            <div className="p-6 space-y-4 text-sm">
+                                <div>
+                                    <div className="text-xs text-slate-500 mb-2">快速預設範圍</div>
+                                    <div className="flex flex-wrap gap-2">
+                                        {[
+                                            { label: '自動 (0~100%)', min: '', max: '' },
+                                            { label: '60~100%', min: '60', max: '100' },
+                                            { label: '75~100%', min: '75', max: '100' },
+                                            { label: '80~95%', min: '80', max: '95' }
+                                        ].map(preset => (
+                                            <button
+                                                key={preset.label}
+                                                type="button"
+                                                onClick={() => {
+                                                    setScaleMinDraft(preset.min);
+                                                    setScaleMaxDraft(preset.max);
+                                                    setScaleDraftError(null);
+                                                }}
+                                                className="px-2.5 py-1 rounded border border-slate-300 text-xs text-slate-700 hover:border-emerald-500 hover:text-emerald-400 transition-colors"
+                                            >
+                                                {preset.label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-600 mb-1">低點 (%)</label>
+                                        <input
+                                            type="number"
+                                            step="1"
+                                            placeholder="自動"
+                                            value={scaleMinDraft}
+                                            onChange={e => {
+                                                setScaleMinDraft(e.target.value);
+                                                setScaleDraftError(null);
+                                            }}
+                                            className={`${inputClassName} text-sm`}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-medium text-slate-600 mb-1">高點 (%)</label>
+                                        <input
+                                            type="number"
+                                            step="1"
+                                            placeholder="自動"
+                                            value={scaleMaxDraft}
+                                            onChange={e => {
+                                                setScaleMaxDraft(e.target.value);
+                                                setScaleDraftError(null);
+                                            }}
+                                            className={`${inputClassName} text-sm`}
+                                        />
+                                    </div>
+                                </div>
+
+                                {scaleDraftError && (
+                                    <div className="text-xs text-red-400 font-medium">{scaleDraftError}</div>
+                                )}
+                            </div>
+                            <div className="px-6 py-4 bg-slate-50 rounded-b-lg flex justify-between items-center gap-2">
+                                <Button
+                                    variant="secondary"
+                                    onClick={() => {
+                                        saveRecoveryYScale({ min: null, max: null });
+                                        setShowRecoveryScaleModal(false);
+                                    }}
+                                >
+                                    重設自動
+                                </Button>
+                                <div className="flex gap-2">
+                                    <Button variant="secondary" onClick={() => setShowRecoveryScaleModal(false)}>取消</Button>
+                                    <Button onClick={applyRecoveryScale}>套用</Button>
+                                </div>
                             </div>
                         </div>
                     </div>
