@@ -34,7 +34,8 @@ import {
     computeWeeklyWaterQualityAverage,
     calculateCwsBlowdownM3,
     buildDailyEventMap,
-    formatTooltipEvents
+    formatTooltipEvents,
+    getDailyAxisTickDisplay
 } from './analysisDiagnosticUtils.js';
 
 // --- Helper Components ---
@@ -6768,13 +6769,16 @@ const AnalysisView: React.FC<{
                                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#2d3b55" />
                                 <XAxis
                                     dataKey="dateStr"
+                                    interval={0}
                                     height={showEventMarkers ? 42 : 28}
                                     tick={(props: any) => {
-                                        const { x, y, payload } = props;
-                                        const row = dailyComparisonData.find(item => item.dateStr === payload.value);
+                                        const { x, y, payload, index } = props;
+                                        const row = dailyComparisonData[index] || dailyComparisonData.find(item => item.dateStr === payload.value);
+                                        const { showDateText, fontSize } = getDailyAxisTickDisplay(dailyComparisonData.length, index ?? 0);
                                         const icons = showEventMarkers && row?.events?.length
                                             ? Array.from(new Set(row.events.map((ev: any) => ev.icon))).slice(0, 3).join('')
                                             : '';
+                                        if (!showDateText && !icons) return <g />;
                                         return (
                                             <g
                                                 transform={`translate(${x},${y})`}
@@ -6783,9 +6787,11 @@ const AnalysisView: React.FC<{
                                                     if (row?.dateKey) setSelectedEventDayKey(row.dateKey);
                                                 }}
                                             >
-                                                <text x={0} y={0} dy={12} textAnchor="middle" fill="#cbd5e1" fontSize={11}>
-                                                    {payload.value}
-                                                </text>
+                                                {showDateText && (
+                                                    <text x={0} y={0} dy={12} textAnchor="middle" fill="#cbd5e1" fontSize={fontSize}>
+                                                        {payload.value}
+                                                    </text>
+                                                )}
                                                 {icons && (
                                                     <text x={0} y={16} dy={12} textAnchor="middle" fontSize={11}>
                                                         {icons}

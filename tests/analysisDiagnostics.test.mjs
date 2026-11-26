@@ -12,7 +12,8 @@ import {
     buildDailyEventMap,
     formatTooltipEvents,
     normalizeCmDecimalsInText,
-    formatAlertTextForDisplay
+    formatAlertTextForDisplay,
+    getDailyAxisTickDisplay
 } from '../analysisDiagnosticUtils.js';
 
 test('parseWaterQualityNumber 與 normalizeMetricLabel 正確清洗數值與指標別名', () => {
@@ -199,4 +200,16 @@ test('normalizeCmDecimalsInText 與 buildDailyEventMap 將公分數據精簡至�
     const withNote = formatAlertTextForDisplay(`${rawAlert} 檢查原因為 : 泵浦行程偏高`);
     assert.ok(withNote.includes('備註說明：檢查原因為 : 泵浦行程偏高'));
     assert.equal(formatAlertTextForDisplay('液位變化異常(15 kg)，超過閾值12 kg'), '液位變化異常(15 kg)，超過閾值12 kg');
+});
+
+test('getDailyAxisTickDisplay 確保 31 天單月完整顯示所有日期，並保留跨月事件顯示', () => {
+    for (let i = 0; i < 31; i++) {
+        const res = getDailyAxisTickDisplay(31, i);
+        assert.equal(res.showDateText, true);
+        assert.equal(res.fontSize, 10);
+    }
+    assert.equal(getDailyAxisTickDisplay(14, 3).fontSize, 11);
+    assert.equal(getDailyAxisTickDisplay(45, 0).showDateText, true);
+    assert.equal(getDailyAxisTickDisplay(45, 1).showDateText, false);
+    assert.equal(getDailyAxisTickDisplay(45, 44).showDateText, true);
 });

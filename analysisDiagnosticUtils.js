@@ -520,3 +520,19 @@ export function formatTooltipEvents(events, maxItems = 2, maxDetailChars = 42) {
         totalCount: events.length
     };
 }
+
+/**
+ * Determine Daily X-axis label visibility and font size so 1-month views (up to 35 days, e.g. Oct 31 days)
+ * show every date and multi-month views thin date labels while keeping event icons visible.
+ * @param {number} totalDays
+ * @param {number} index
+ * @returns {{ showDateText: boolean, fontSize: number }}
+ */
+export function getDailyAxisTickDisplay(totalDays, index) {
+    const count = Math.max(0, Number(totalDays) || 0);
+    const idx = Math.max(0, Number(index) || 0);
+    const stride = count > 62 ? 3 : count > 35 ? 2 : 1;
+    const showDateText = stride === 1 || idx % stride === 0 || idx === count - 1;
+    const fontSize = count >= 28 ? 10 : 11;
+    return { showDateText, fontSize };
+}
