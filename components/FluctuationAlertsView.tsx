@@ -3,6 +3,7 @@ import { Icons } from './Icons';
 import { ImportAnomaly } from './ImportAnomalyModal';
 import { StorageService } from '../services/storageService';
 import { Tank, FluctuationAlert } from '../types';
+import { formatAlertTextForDisplay } from '../analysisDiagnosticUtils.js';
 
 interface FluctuationAlertsViewProps {
     alerts: FluctuationAlert[];
@@ -183,10 +184,10 @@ export const FluctuationAlertsView: React.FC<FluctuationAlertsViewProps> = ({ al
                                             </td>
                                             <td className="px-4 py-3 align-top">
                                                 <div className={`text-sm font-medium mb-1 ${alert.isPossibleRefill ? 'text-blue-600' : 'text-red-600'}`}>
-                                                    <div className={`text-sm font-medium mb-1 ${alert.isPossibleRefill ? 'text-blue-600' : 'text-red-600'}`}>
+                                                    <div className={`text-sm font-medium mb-1 whitespace-pre-line ${alert.isPossibleRefill ? 'text-blue-600' : 'text-red-600'}`}>
                                                         {(() => {
-                                                            // 1. Convert Units (L -> kg)
-                                                            let text = alert.reason.replace(/(\d+)\s*L/g, (match, p1) => {
+                                                            // 1. Format PI/cm text & Convert Units (L -> kg)
+                                                            let text = formatAlertTextForDisplay(alert.reason).replace(/(\d+)\s*L/g, (match, p1) => {
                                                                 const kg = convertToKg(parseFloat(p1), alert.tankId);
                                                                 return kg ? `${kg.toFixed(0)} kg` : match;
                                                             });
@@ -210,7 +211,7 @@ export const FluctuationAlertsView: React.FC<FluctuationAlertsViewProps> = ({ al
                                                 {alert.note && (
                                                     <div className="mt-2 p-2 bg-yellow-50 border border-yellow-100 rounded text-xs text-yellow-800 flex gap-2 items-start">
                                                         <Icons.Notes className="w-3 h-3 mt-0.5 shrink-0" />
-                                                        <span>{alert.note}</span>
+                                                        <span className="whitespace-pre-wrap">{formatAlertTextForDisplay(alert.note)}</span>
                                                     </div>
                                                 )}
 

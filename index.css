@@ -343,3 +343,45 @@ dialog.level-calc-dialog :is(input, select, button):focus-visible {
   outline: 2px solid #38bdf8;
   outline-offset: 2px;
 }
+
+/* 用量分析圖表卡片：允許懸浮視窗超出邊界且 hover 時置頂，避免被截斷或遮掩 */
+.chart-card {
+  position: relative;
+  overflow: visible !important;
+}
+
+.chart-card:hover {
+  z-index: 30;
+  transform: none !important;
+}
+
+/* 圖表懸浮視窗：顯式深色高對比樣式，不受 @theme slate 反轉影響 */
+.chart-tooltip-card {
+  background-color: #0b1220;
+  border: 1px solid #334155;
+  color: #f1f5f9;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.72);
+}
+
+.chart-tooltip-title {
+  color: #f8fafc;
+}
+
+.chart-tooltip-body {
+  color: #e2e8f0;
+}
+
+.chart-tooltip-muted {
+  color: #94a3b8;
+}
+
+.chart-tooltip-divider {
+  border-color: #24324a;
+}
+
+/* 點擊圖表長條時隱藏 SVG 預設外框，僅保留鍵盤 focus-visible */
+.recharts-wrapper:focus:not(:focus-visible),
+.recharts-surface:focus:not(:focus-visible),
+.recharts-wrapper svg:focus:not(:focus-visible) {
+  outline: none;
+}

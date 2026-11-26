@@ -12,7 +12,7 @@ function formatDate(d) {
 }
 
 const timestamp = formatDate(new Date());
-const backupDir = path.join(remoteRoot, 'deploy-backups', `${timestamp}-level-check-calibration`);
+const backupDir = path.join(remoteRoot, 'deploy-backups', `${timestamp}-daily-pi-params`);
 
 console.log('==========================================');
 console.log('開始佈署 WTCA 至遠端伺服器 (10.122.51.61)');
@@ -24,7 +24,7 @@ fs.mkdirSync(backupDir, { recursive: true });
 
 // 2. 備份現有檔案
 console.log('\n[2/5] 備份遠端現有檔案...');
-const backendFiles = ['server.js', 'levelCheck.js', 'levelCheckPersistence.js', 'package.json'];
+const backendFiles = ['server.js', 'dailyParamsUtils.js', 'batchReadingNotification.js', 'levelCheck.js', 'levelCheckPersistence.js', 'package.json'];
 for (const file of backendFiles) {
     const remoteFile = path.join(remoteRoot, file);
     if (fs.existsSync(remoteFile)) fs.copyFileSync(remoteFile, path.join(backupDir, file));
@@ -70,6 +70,7 @@ console.log('\n[5/5] 同步原始碼檔案...');
 const sourceFiles = [
     'App.tsx',
     'types.ts',
+    'analysisDiagnosticUtils.js',
     path.join('components', 'ImportAnomalyModal.tsx'),
     path.join('components', 'PiCalibrationModal.tsx'),
     path.join('services', 'apiService.ts'),
@@ -79,6 +80,7 @@ const sourceFiles = [
 
 for (const rel of sourceFiles) {
     const src = path.join(localRoot, rel);
+    if (!fs.existsSync(src)) continue;
     const dst = path.join(remoteRoot, rel);
     const parent = path.dirname(dst);
     if (!fs.existsSync(parent)) {

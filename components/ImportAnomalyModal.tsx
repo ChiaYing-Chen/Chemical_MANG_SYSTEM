@@ -13,7 +13,12 @@ export interface ImportAnomaly {
     prevValue?: number;
     nextDate?: string;
     nextValue?: number;
+    nextValue?: number;
     isPossibleRefill?: boolean; // 當液位上升超過閾值15倍以上，判斷為可能補藥
+    actualDailyUsageKg?: number;
+    recentDailyUsageKg?: number;
+    theoreticalDailyUsageKg?: number | null;
+    theoreticalWindowLabel?: string;
 }
 
 interface ImportAnomalyModalProps {
@@ -132,6 +137,32 @@ export const ImportAnomalyModal: React.FC<ImportAnomalyModalProps> = ({
                                                     <div className="my-1.5 text-xs font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-md flex items-center gap-1.5 shadow-xs">
                                                         <Icons.Alert className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                                                         <span>請核對輸入數據與補藥紀錄</span>
+                                                    </div>
+                                                )}
+                                                {(item.actualDailyUsageKg !== undefined || item.recentDailyUsageKg !== undefined || (item.theoreticalDailyUsageKg !== undefined && item.theoreticalDailyUsageKg !== null)) && (
+                                                    <div className="my-1.5 flex flex-wrap items-center gap-1.5 text-xs">
+                                                        {item.actualDailyUsageKg !== undefined && (
+                                                            <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200 font-mono">
+                                                                {item.actualDailyUsageKg >= 0
+                                                                    ? `本次日用量 ${item.actualDailyUsageKg.toFixed(1)} kg`
+                                                                    : `液位上升 ${Math.abs(item.actualDailyUsageKg).toFixed(1)} kg`}
+                                                            </span>
+                                                        )}
+                                                        {item.recentDailyUsageKg !== undefined && (
+                                                            <span className="px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 font-mono">
+                                                                近期日均 {item.recentDailyUsageKg.toFixed(1)} kg
+                                                            </span>
+                                                        )}
+                                                        {item.theoreticalDailyUsageKg !== undefined && item.theoreticalDailyUsageKg !== null && (
+                                                            <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 font-mono">
+                                                                理論用量 {item.theoreticalDailyUsageKg.toFixed(1)} kg
+                                                                {item.actualDailyUsageKg !== undefined && item.actualDailyUsageKg >= 0 && item.theoreticalDailyUsageKg > 0 && (() => {
+                                                                    const devPct = ((item.actualDailyUsageKg - item.theoreticalDailyUsageKg) / item.theoreticalDailyUsageKg) * 100;
+                                                                    return ` (${devPct > 0 ? '+' : ''}${devPct.toFixed(1)}%)`;
+                                                                })()}
+                                                                {item.theoreticalWindowLabel ? ` · ${item.theoreticalWindowLabel}` : ''}
+                                                            </span>
+                                                        )}
                                                     </div>
                                                 )}
                                                 {onAddNote && (

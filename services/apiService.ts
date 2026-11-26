@@ -120,7 +120,7 @@ export const createReading = async (reading: any): Promise<any> => {
     return await response.json();
 };
 
-export const createReadingsBatch = async (readings: any[], notification?: { alerts: any[] }): Promise<any> => {
+export const createReadingsBatch = async (readings: any[], notification?: { alerts: any[]; usageSummaries?: any[] }): Promise<any> => {
     const response = await fetch(`${API_BASE_URL}/readings/batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -294,6 +294,45 @@ export const deleteBWSParams = async (id: string): Promise<any> => {
     return await response.json();
 };
 
+
+// --- Daily PI Params ---
+export const syncDailyParams = async (dateStr: string, force: boolean = false): Promise<any> => {
+    const response = await fetch(`${API_BASE_URL}/daily-params/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dateStr, force })
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Failed to sync daily params: ${response.status} ${errText}`);
+    }
+    return await response.json();
+};
+
+export const syncDailyParamsRange = async (startDate: string, endDate: string, tankId?: string, force: boolean = false): Promise<any> => {
+    const response = await fetch(`${API_BASE_URL}/daily-params/sync-range`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ startDate, endDate, tankId, force })
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Failed to sync daily params range: ${response.status} ${errText}`);
+    }
+    return await response.json();
+};
+
+export const fetchDailyParams = async (params: { dateStr?: string; tankId?: string; startDate?: string; endDate?: string }): Promise<{ bws: any[]; cws: any[] }> => {
+    const search = new URLSearchParams();
+    if (params.dateStr) search.set('dateStr', params.dateStr);
+    if (params.tankId) search.set('tankId', params.tankId);
+    if (params.startDate) search.set('startDate', params.startDate);
+    if (params.endDate) search.set('endDate', params.endDate);
+    const qs = search.toString();
+    const response = await fetch(`${API_BASE_URL}/daily-params${qs ? `?${qs}` : ''}`);
+    if (!response.ok) throw new Error('Failed to fetch daily params');
+    return await response.json();
+};
 
 // ==================== Important Notes ====================
 

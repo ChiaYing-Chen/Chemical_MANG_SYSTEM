@@ -376,3 +376,11 @@ export interface DailyParamsSyncResponse {
   cws: DailyCWSParameterRecord[];
   errors?: string[];
 }
+
+export interface BatchUsageSummaryItem {
+  tankId: string;
+  tankName: string;
+  actualDailyUsageKg: number | null;
+  theoreticalDailyUsageKg: number | null;
+  deviationPercent: number | null;
+}

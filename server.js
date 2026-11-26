@@ -16,7 +16,8 @@ import {
     integrateRecordedTotal,
     computeRecordedAverage,
     resolveConcentrationCycles,
-    calculateCondensateRecoveryRate
+    calculateCondensateRecoveryRate,
+    getReadingPeriodEndMs
 } from './dailyParamsUtils.js';
 
 // 本地開發環境原生載入 .env 配置
@@ -113,7 +114,7 @@ const calculateActualUsageKgFromLevel = (tank, periodReadings, supplies) => {
 
     const firstReading = orderedReadings[0];
     const lastReading = orderedReadings[orderedReadings.length - 1];
-    const elapsedDays = Math.max(1, (Number(lastReading.timestamp) - Number(firstReading.timestamp)) / DAY_MS);
+    const elapsedDays = Math.max(1, (getReadingPeriodEndMs(lastReading) - getReadingPeriodEndMs(firstReading)) / DAY_MS);
     const estimatedDailyUsageLiters = intervals.reduce((sum, interval) => sum + interval.decreaseLiters, 0) / elapsedDays;
     const likelyRefillRiseThresholdLiters = estimatedDailyUsageLiters * LIKELY_REFILL_RISE_DAYS;
 
@@ -2172,10 +2173,12 @@ app.post('/api/readings/batch', async (req, res) => {
     try {
         const { readings, notification } = req.body;
         if (!Array.isArray(readings) || readings.length === 0 ||
-            (notification !== undefined && (!notification || !Array.isArray(notification.alerts)))) {
+            (notification !== undefined && (!notification || !Array.isArray(notification.alerts) ||
+                (notification.usageSummaries !== undefined && !Array.isArray(notification.usageSummaries))))) {
             return res.status(400).json({ error: '批次資料或通知格式錯誤' });
         }
         const alerts = notification?.alerts || [];
+        const usageSummaries = Array.isArray(notification?.usageSummaries) ? notification.usageSummaries : [];
         if (alerts.some(a => !a || !readings.some(r => r.tank_id === a.tank_id))) {
             return res.status(400).json({ error: '警報必須屬於本批次儲槽' });
         }
@@ -2218,7 +2221,7 @@ app.post('/api/readings/batch', async (req, res) => {
             );
         }
         await client.query('COMMIT');
-        const notificationResult = notification ? await notifyBatchReadingResult(results, alerts) : undefined;
+        const notificationResult = notification ? await notifyBatchReadingResult(results, alerts, { usageSummaries }) : undefined;
         // 液位批次存檔完成後，非同步確保當日 PI 日參數已寫入（不阻塞回應）
         const uniqueDates = Array.from(new Set(
             results
@@ -4672,9 +4675,10 @@ app.get('/api/weekly-usage-report', async (req, res) => {
             if (!activeSupply || !activeSupply.target_ppm || Number(activeSupply.target_ppm) === 0) continue;
             if (!(tank.system_type && (tank.system_type.includes('冷卻') || tank.system_type.includes('鍋爐')))) continue;
 
+            // 方向 A：D 日抄表代表 D 日結束（24:00），故本週需取「上週日結束（startTime - 1日）」至「本週日結束（endTime）」
             const weekReadingsRes = await pool.query(
                 "SELECT * FROM readings WHERE tank_id = $1 AND timestamp >= $2 AND timestamp <= $3 ORDER BY timestamp ASC",
-                [tank.id, startTime, endTime]
+                [tank.id, startTime - DAY_MS, endTime]
             );
             const periodReadings = [...weekReadingsRes.rows]
                 .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
@@ -4806,9 +4810,10 @@ app.get('/api/monthly-usage-report', async (req, res) => {
             if (!activeSupply || !activeSupply.target_ppm || Number(activeSupply.target_ppm) === 0) continue;
             if (!(tank.system_type && (tank.system_type.includes('冷卻') || tank.system_type.includes('鍋爐')))) continue;
 
+            // 方向 A：D 日抄表代表 D 日結束（24:00），故上月實際用量需取「前月底（startTime - 1日）」至「上月底（endTime）」
             const monthReadingsRes = await pool.query(
                 "SELECT * FROM readings WHERE tank_id = $1 AND timestamp >= $2 AND timestamp <= $3 ORDER BY timestamp ASC",
-                [tank.id, startTime, endTime]
+                [tank.id, startTime - DAY_MS, endTime]
             );
             const periodReadings = monthReadingsRes.rows
                 .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)

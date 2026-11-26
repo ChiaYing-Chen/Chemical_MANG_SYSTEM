@@ -21,7 +21,7 @@ function setup(tank, existing=[], confirmed=true) {
         API:new Proxy({}, {get(){throw Error('不得呼叫 PI');}}),
         StorageService:{getActiveSupply:async()=>({specificGravity:1.2})},
         calculateTankVolume:(_t,cm)=>cm*10,generateUUID:()=> 'new',
-        checkAnomalies:()=>[],onBatchSave:async rows=>calls.saved.push(...rows),setBatchLevels(){},
+        checkAnomalies:()=>[],buildBatchUsageSummaries:()=>[],onBatchSave:async rows=>calls.saved.push(...rows),setBatchLevels(){},
     };
     const handler = new Function(...Object.keys(dependencies),js+';return handler;')(...Object.values(dependencies));
     return {calls,handler};

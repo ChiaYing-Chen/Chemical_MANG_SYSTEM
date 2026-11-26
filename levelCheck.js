@@ -269,7 +269,7 @@ export function findSustainedRises(points, period, minRise=5) {
                 if(samples[j].t<=period.start)break;
                 if(samples[j].t>period.end)break;
                 if(samples[i].t>=period.end)break;
-                return [{startT:samples[i].t,at:samples[j].t,confirmedAt:next.t,riseCm:round(rise,3)}];
+                return [{startT:samples[i].t,at:samples[j].t,confirmedAt:next.t,riseCm:round(rise,2)}];
             }
         }
     }
@@ -361,14 +361,14 @@ export function evaluateDaily({ tank, inputValue, period, prev, series = [], cal
         usageDeviationLiters: round(pi - manual, 1), usageDeviationPercent: percentage === null ? null : round(percentage, 2),
         usageThresholdPercent: 17,
         manualStartVolumeLiters: round(manualStartVolume, 2), manualEndVolumeLiters: round(volume(manualCm), 2),
-        piStartCm: round(startCm, 3), piEndCm: round(endCm, 3),
+        piStartCm: round(startCm, 2), piEndCm: round(endCm, 2),
         piStartVolumeLiters: round(volume(startCm), 2), piEndVolumeLiters: round(volume(endCm), 2),
         addedLiters: 0,
-        refill: { detected: events.length > 0, count: events.length, riseCm: round(events.reduce((sum, e) => sum + e.riseCm, 0)), estLiters: round(refillLiters, 1) }
+        refill: { detected: events.length > 0, count: events.length, riseCm: round(events.reduce((sum, e) => sum + e.riseCm, 0), 2), estLiters: round(refillLiters, 1) }
     });
-    result.messages.push(`人工日使用量 ${result.manualUsagePer24h} L；PI 日使用量 ${result.piUsagePer24h} L；差距 ${percentage === null ? '人工為零，無法計算百分比' : result.usageDeviationPercent + '%'}（以人工用量為分母，超過 17% 才異常）`);
-    result.messages.push(`PI 期初／期末液位 ${result.piStartCm}／${result.piEndCm} cm，依桶槽形狀換算存量 ${result.piStartVolumeLiters}／${result.piEndVolumeLiters} L；以非補藥日存量差比較，不使用 APP 補藥紀錄。`);
-    if (conversion) result.messages.push(`採用${conversion.validationGrade === 'LIMITED' ? '有限驗證' : '歷史驗證'}的經驗換算：液位 cm＝${conversion.slope.toFixed(4)} × PI 原始值＋${conversion.intercept.toFixed(2)}；非儀表原廠量程。${conversion.validationMode === 'WITHIN_CYCLE' ? '同週期後段驗證（尚未跨週期）' : '獨立週期驗證'}液位誤差中位數 ${conversion.validationMedianErrorCm} cm、90 百分位 ${conversion.validationP90ErrorCm} cm。`);
+    result.messages.push(percentage === null ? `人工液位抄表與線上液位計(PI)換算差距過大：人工日用量 ${result.manualUsagePer24h} L、PI 日用量 ${result.piUsagePer24h} L。` : `人工液位抄表與線上液位計(PI)換算差距 ${result.usageDeviationPercent}%（超過 17% 門檻）：人工日用量 ${result.manualUsagePer24h} L、PI 日用量 ${result.piUsagePer24h} L。`);
+    result.messages.push(`PI 液位由 ${result.piStartCm} 降至 ${result.piEndCm} cm（存量 ${result.piStartVolumeLiters} → ${result.piEndVolumeLiters} L）；請核對現場抄表與加藥狀況，或檢查線上液位計是否飄移。`);
+    if (conversion) result.messages.push(`註：PI 已套用${conversion.validationGrade === 'LIMITED' ? '有限' : '歷史'}經驗換算校正，歷史誤差中位數約 ${isNum(conversion.validationMedianErrorCm) ? round(conversion.validationMedianErrorCm, 2) : '-'} cm。`);
     if (stable) result.messages.push('雷達 PI 採 15 分鐘時窗中位數抑制高頻波動，再計算當日下降量與補藥；短於時窗的事件可能無法辨識。');
     if (events.length) result.messages.push('PI 偵測到液位上升；日用量僅採已登錄補藥量，請核對補藥紀錄');
     return result;

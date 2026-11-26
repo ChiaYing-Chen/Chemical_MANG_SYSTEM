@@ -12,7 +12,8 @@ import {
     FluctuationAlert,
     DailyBWSParameterRecord,
     DailyCWSParameterRecord,
-    DailyParamsSyncResponse
+    DailyParamsSyncResponse,
+    BatchUsageSummaryItem
 } from '../types';
 
 export class StorageService {
@@ -170,14 +171,21 @@ export class StorageService {
         }
     }
 
-    static async saveReadingsBatch(readings: Reading[], alerts?: Partial<FluctuationAlert>[]): Promise<{ sent: boolean; error?: string } | undefined> {
+    static async saveReadingsBatch(readings: Reading[], alerts?: Partial<FluctuationAlert>[], usageSummaries?: BatchUsageSummaryItem[]): Promise<{ sent: boolean; error?: string } | undefined> {
         const BATCH_SIZE = 100;
         try {
             const apiReadings = readings.map(r => StorageService.convertReadingToAPI(r));
             // 人工批次只送一次，讓液位與異常共用交易。
             if (alerts !== undefined) {
                 const result = await API.createReadingsBatch(apiReadings, {
-                    alerts: alerts.map(a => StorageService.convertAlertToAPI(a))
+                    alerts: alerts.map(a => StorageService.convertAlertToAPI(a)),
+                    usageSummaries: (usageSummaries || []).map(item => ({
+                        tank_id: item.tankId,
+                        tank_name: item.tankName,
+                        actual_daily_usage_kg: item.actualDailyUsageKg,
+                        theoretical_daily_usage_kg: item.theoreticalDailyUsageKg,
+                        deviation_percent: item.deviationPercent
+                    }))
                 });
                 return result.notification || { sent: false, error: '液位已儲存，但未收到通知結果。請勿重複儲存。' };
             }

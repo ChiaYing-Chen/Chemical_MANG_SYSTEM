@@ -14,21 +14,27 @@ function setup({failure,notificationFailure}={}) {
         if(sql.includes('INSERT INTO fluctuation_alerts')){events.push('alert');if(failure==='alert')throw Error('alert failed');return {rows:[{tank_name:'測試槽',reason:'液位變動異常'}]};}
         throw Error('unexpected SQL');
     }};
-    const handler=new Function('pool','notifyBatchReadingResult','crypto','console','return '+route.arguments[1].getText(root))(
-        {connect:async()=>client},async(readings,alerts)=>{events.push({notification:true,count:readings.length,alerts:alerts.length});return notificationFailure?{sent:false,error:'通知失敗'}:{sent:true};},{randomUUID:()=> 'alert-id'},{error(){}}
+    const handler=new Function('pool','notifyBatchReadingResult','crypto','console','getTaipeiDateString','syncDailyParamsForDate','return '+route.arguments[1].getText(root))(
+        {connect:async()=>client},
+        async(readings,alerts,opts)=>{events.push({notification:true,count:readings.length,alerts:alerts.length,usageSummaries:opts?.usageSummaries?.length||0});return notificationFailure?{sent:false,error:'通知失敗'}:{sent:true};},
+        {randomUUID:()=> 'alert-id'},
+        {error(){}},
+        (d)=>new Date(d.getTime()+8*3600000).toISOString().slice(0,10),
+        async()=>{}
     );
     const res={code:200,status(code){this.code=code;return this;},json(value){this.body=value;}};
     return {events,handler,res};
 }
 const reading={id:'r',tank_id:'A',timestamp:Date.parse('2026-10-06T00:00:00+08:00'),level_cm:50};
 const alert={tank_id:'A',tank_name:'測試槽',date_str:'2026-10-06',reason:'液位變動異常'};
+const usageSummary={tank_id:'A',tank_name:'中和胺',actual_daily_usage_kg:8.5,theoretical_daily_usage_kg:8.0,deviation_percent:6.3};
 test('正常批次儲存後也通知，且必須先提交',async()=>{
-    const {handler,events,res}=setup();await handler({body:{readings:[reading],notification:{alerts:[]}}},res);
-    assert.deepEqual(events,['BEGIN','reading','COMMIT',{notification:true,count:1,alerts:0}]);assert.equal(res.body.notification.sent,true);
+    const {handler,events,res}=setup();await handler({body:{readings:[reading],notification:{alerts:[],usageSummaries:[usageSummary]}}},res);
+    assert.deepEqual(events,['BEGIN','reading','COMMIT',{notification:true,count:1,alerts:0,usageSummaries:1}]);assert.equal(res.body.notification.sent,true);
 });
 test('異常與液位在同筆交易儲存，僅通知一次',async()=>{
     const {handler,events,res}=setup();await handler({body:{readings:[reading],notification:{alerts:[alert]}}},res);
-    assert.deepEqual(events,['BEGIN','reading','alert','COMMIT',{notification:true,count:1,alerts:1}]);assert.equal(res.code,201);
+    assert.deepEqual(events,['BEGIN','reading','alert','COMMIT',{notification:true,count:1,alerts:1,usageSummaries:0}]);assert.equal(res.code,201);
 });
 for(const failure of ['reading','alert'])test(`${failure} 寫入失敗時回滾且不通知`,async()=>{
     const {handler,events,res}=setup({failure});await handler({body:{readings:[reading],notification:{alerts:[alert]}}},res);
@@ -52,6 +58,20 @@ for (const alerts of [[],[alert]]) test(`通知內容與燈號：${alerts.length
     assert.match(payload.message,/2026-10-06/);assert.match(payload.message,/已儲存 1 筆/);
     assert.equal(payload.status,alerts.length?'warning':'success');
     assert.match(payload.message,alerts.length?/測試槽：液位變動異常/:/本批次未發現/);
+});
+for (const alerts of [[],[alert]]) test(`通知附帶日用量摘要（實際 / 理論）：${alerts.length ? '異常' : '正常'}`,async()=>{
+    let payload;
+    const summaries=[
+        {tank_id:'t1',tank_name:'中和胺',actual_daily_usage_kg:8.5,theoretical_daily_usage_kg:8.2,deviation_percent:3.7},
+        {tank_id:'t2',tank_name:'氨水',actual_daily_usage_kg:120.0,theoretical_daily_usage_kg:null,deviation_percent:null}
+    ];
+    const result=await notifyBatchReadingResult([reading],alerts,{usageSummaries:summaries,env:{PIMCP_SUBSCRIPTION_ID:'3',PIMCP_API_URL:'http://pimcp/'},fetch:async(_url,options)=>{
+        payload=JSON.parse(options.body);return {ok:true,status:200,json:async()=>({success:true})};
+    }});
+    assert.equal(result.sent,true);
+    assert.match(payload.message,/各藥劑日用量摘要（實際 \/ 理論）：/);
+    assert.match(payload.message,/中和胺：實際 8\.5 kg \/ 理論 8\.2 kg（\+3\.7%）/);
+    assert.match(payload.message,/氨水：實際 120\.0 kg \/ 理論 -/);
 });
 for(const mode of ['http','business','network'])test(`通知 ${mode} 失敗不得回報成功`,async()=>{
     const result=await notifyBatchReadingResult([reading],[],{env:{PIMCP_SUBSCRIPTION_ID:'3'},fetch:async()=>{

@@ -176,3 +176,17 @@ test('相同下降高度在臥式槽不同液位有不同用量，依容積差�
     assert.notEqual(r.manualUsagePer24h,r.piUsagePer24h);
     assert.equal(r.status,'WARN');
 });
+
+test('evaluateDaily 公分數據（期初／期末與驗證誤差）皆四捨五入至小數點後兩位', () => {
+    const model = DAILY_PI_CONVERSIONS.tc1_1;
+    const mapped = { ...tank, id: 'tc1_1', piLevelUnit: model.unit || 'PERCENT', piLevelTag: model.tag };
+    const raw = series.map((p, i) => ({
+        ...p,
+        v: (100 - 0.12345 - i * 0.98765 - model.intercept) / model.slope
+    }));
+    const r = evaluateDaily({ ...fixture, tank: mapped, series: raw, prev: { levelCm: 100 }, inputValue: 76.296 });
+    assert.equal(r.piStartCm, Math.round(r.piStartCm * 100) / 100);
+    assert.equal(r.piEndCm, Math.round(r.piEndCm * 100) / 100);
+    const threePlusDecimalCm = r.messages.some(m => /\d+\.\d{3,}\s*cm\b/i.test(m));
+    assert.equal(threePlusDecimalCm, false);
+});

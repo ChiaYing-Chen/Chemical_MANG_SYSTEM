@@ -4,6 +4,7 @@ import { Tank, Reading, ChemicalSupply, SystemType, CWSParameterRecord, BWSParam
 import { StorageService } from '../services/storageService';
 import { calculateTankVolume } from '../utils/calculationUtils';
 import { Icons } from '../components/Icons';
+import { computePeriodActualUsage } from '../dailyParamsUtils.js';
 
 const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#82ca9d', '#a4de6c', '#d0ed57', '#ffc658'];
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -216,9 +217,20 @@ const AnnualDataView: React.FC<AnnualDataViewProps> = ({ tanks, readings, onNavi
 
             tData.months.forEach(m => {
                 const monthStartTime = m.monthStart.getTime();
-                const monthEndTime = m.monthEnd.getTime() - 1;
-                const monthReadings = tankReadings.filter(r => r.timestamp >= monthStartTime && r.timestamp <= monthEndTime);
-                m.actualUsage = calculateActualUsageKgFromLevel(tank, monthReadings, supplies.filter(s => s.tankId === tank.id));
+                const monthEndExclusiveTime = m.monthEnd.getTime();
+                m.actualUsage = computePeriodActualUsage({
+                    readings: tankReadings,
+                    tankId: tank.id,
+                    periodStartMs: monthStartTime,
+                    periodEndExclusiveMs: monthEndExclusiveTime,
+                    metric: 'KG',
+                    suppliesHistory: supplies.filter(s => s.tankId === tank.id),
+                    getVolume: (reading: Reading) => {
+                        const volume = calculateTankVolume(tank, reading.levelCm);
+                        if (Number.isFinite(volume) && volume >= 0) return volume;
+                        return reading.calculatedVolume || 0;
+                    }
+                });
             });
         });
 

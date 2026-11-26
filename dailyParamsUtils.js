@@ -1,6 +1,8 @@
 export const TAIPEI_OFFSET_MS = 8 * 60 * 60 * 1000;
 export const DAY_MS = 24 * 60 * 60 * 1000;
 export const ARCHIVE_BACKFILL_MS = 8 * 60 * 60 * 1000;
+export const ROLLING_WINDOW_START_HOUR = 22;
+export const ROLLING_WINDOW_START_MS = ROLLING_WINDOW_START_HOUR * 60 * 60 * 1000;
 
 /**
  * Format epoch milliseconds as an ISO-8601 timestamp in Taipei time (UTC+8).
@@ -69,6 +71,8 @@ export function computeDailyPiWindow(dateStr, nowMs = Date.now()) {
         return { valid: false, reason: 'FUTURE_DATE' };
     }
 
+    const rollingStartMs = dayStartMs + ROLLING_WINDOW_START_MS;
+
     let windowStartMs;
     let windowEndMs;
     let isFinal;
@@ -79,11 +83,17 @@ export function computeDailyPiWindow(dateStr, nowMs = Date.now()) {
         windowEndMs = dayEndMs;
         isFinal = true;
         windowMode = 'FULL_DAY';
-    } else {
+    } else if (nowMs >= rollingStartMs) {
         windowEndMs = nowMs;
         windowStartMs = nowMs - DAY_MS;
         isFinal = false;
         windowMode = 'ROLLING_24H';
+    } else {
+        return {
+            valid: false,
+            reason: 'DAY_NOT_READY',
+            allowedAfterIso: formatTaipeiIso(rollingStartMs)
+        };
     }
 
     const useRecorded = (nowMs - windowEndMs) < ARCHIVE_BACKFILL_MS;
@@ -343,4 +353,230 @@ export function aggregateWeeklyCondensateRecovery(
         steamProduction: Math.round(sumMs * 100) / 100,
         coveredDays: eligible.length
     };
+}
+
+/**
+ * Calculate condensate loss rate (%): 100 - condensateRecoveryRate.
+ * @param {number|string|null|undefined} condensateRecoveryRate
+ * @returns {number|null}
+ */
+export function calculateCondensateLossRate(condensateRecoveryRate) {
+    const rec = toFiniteNumber(condensateRecoveryRate);
+    if (rec === null) return null;
+    const loss = 100 - rec;
+    if (!Number.isFinite(loss)) return null;
+    return Math.round(loss * 100) / 100;
+}
+
+/**
+ * Calculate actual dosing concentration (ppm): (actualKg * 1000) / baseFlowTons.
+ * Returns null if actualKg < 0/non-finite or baseFlowTons < 1/non-finite.
+ * @param {number|string|null|undefined} actualKg
+ * @param {number|string|null|undefined} baseFlowTons
+ * @returns {number|null}
+ */
+export function calculateActualDosingPpm(actualKg, baseFlowTons) {
+    const kg = toFiniteNumber(actualKg);
+    const flow = toFiniteNumber(baseFlowTons);
+    if (kg === null || kg < 0 || flow === null || flow < 1) {
+        return null;
+    }
+    const ppm = (kg * 1000) / flow;
+    if (!Number.isFinite(ppm)) return null;
+    return Math.round(ppm * 1000) / 1000;
+}
+
+/**
+ * Convert a reading's stored Taipei date into its physical end-of-day boundary timestamp
+ * ((D + 1) 00:00:00+08:00), matching night-shift practice of logging day D after day D ends.
+ * @param {{ timestamp?: number|string }} reading
+ * @returns {number}
+ */
+export function getReadingPeriodEndMs(reading) {
+    const ts = Number(reading?.timestamp);
+    if (!Number.isFinite(ts)) return NaN;
+    const d = new Date(ts + TAIPEI_OFFSET_MS);
+    if (isNaN(d.getTime())) return NaN;
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - TAIPEI_OFFSET_MS + DAY_MS;
+}
+
+/**
+ * Collect ordered tank readings whose end-of-day boundaries cover [periodStartMs, periodEndExclusiveMs],
+ * including the boundary reading at periodEndExclusiveMs and surrounding readings if needed.
+ * @param {Array<any>} readings
+ * @param {string} tankId
+ * @param {number} periodStartMs
+ * @param {number} periodEndExclusiveMs
+ * @returns {Array<any>}
+ */
+export function computePeriodReadings(readings, tankId, periodStartMs, periodEndExclusiveMs) {
+    if (!Array.isArray(readings) || !tankId || !Number.isFinite(periodStartMs) || !Number.isFinite(periodEndExclusiveMs)) {
+        return [];
+    }
+
+    const sortedAll = readings
+        .filter((r) => r && r.tankId === tankId && Number.isFinite(getReadingPeriodEndMs(r)))
+        .sort((a, b) => getReadingPeriodEndMs(a) - getReadingPeriodEndMs(b) || Number(a.timestamp) - Number(b.timestamp));
+
+    const seenKeys = new Set();
+    const tankReadings = [];
+    for (const r of sortedAll) {
+        const key = r.id !== undefined && r.id !== null ? `id:${r.id}` : `ts:${r.timestamp}`;
+        if (!seenKeys.has(key)) {
+            seenKeys.add(key);
+            tankReadings.push(r);
+        }
+    }
+
+    if (tankReadings.length === 0) return [];
+
+    const core = tankReadings.filter((r) => {
+        const endTs = getReadingPeriodEndMs(r);
+        return endTs >= periodStartMs && endTs <= periodEndExclusiveMs;
+    });
+
+    const result = [...core];
+
+    if (core.length === 0 || getReadingPeriodEndMs(core[0]) > periodStartMs) {
+        const before = tankReadings.filter((r) => getReadingPeriodEndMs(r) < periodStartMs);
+        if (before.length > 0) {
+            result.unshift(before[before.length - 1]);
+        }
+    }
+
+    if (core.length === 0 || getReadingPeriodEndMs(core[core.length - 1]) < periodEndExclusiveMs) {
+        const after = tankReadings.find((r) => getReadingPeriodEndMs(r) > periodEndExclusiveMs);
+        if (after) {
+            result.push(after);
+        }
+    }
+
+    const deduped = [];
+    const outKeys = new Set();
+    for (const r of result.sort((a, b) => getReadingPeriodEndMs(a) - getReadingPeriodEndMs(b) || Number(a.timestamp) - Number(b.timestamp))) {
+        const key = r.id !== undefined && r.id !== null ? `id:${r.id}` : `ts:${r.timestamp}`;
+        if (!outKeys.has(key)) {
+            outKeys.add(key);
+            deduped.push(r);
+        }
+    }
+    return deduped;
+}
+
+/**
+ * Compute actual chemical usage over [periodStartMs, periodEndExclusiveMs) using volume intervals
+ * and day-by-day active contract specific gravity / price conversion.
+ * @param {Object} params
+ * @param {Array<any>} params.readings
+ * @param {string} params.tankId
+ * @param {number} params.periodStartMs
+ * @param {number} params.periodEndExclusiveMs
+ * @param {'KG'|'L'|'$'} [params.metric]
+ * @param {Array<any>} [params.suppliesHistory]
+ * @param {(reading: any) => number} params.getVolume
+ * @returns {number}
+ */
+export function computePeriodActualUsage({
+    readings,
+    tankId,
+    periodStartMs,
+    periodEndExclusiveMs,
+    metric = 'KG',
+    suppliesHistory = [],
+    getVolume
+}) {
+    const orderedReadings = computePeriodReadings(readings, tankId, periodStartMs, periodEndExclusiveMs);
+    if (orderedReadings.length < 2 || typeof getVolume !== 'function') {
+        return 0;
+    }
+
+    const sortedSupplies = Array.isArray(suppliesHistory)
+        ? [...suppliesHistory].sort((a, b) => Number(b?.startDate || 0) - Number(a?.startDate || 0))
+        : [];
+
+    const resolveSupplyAt = (ts) => sortedSupplies.find((s) => Number(s?.startDate || 0) <= ts);
+
+    const intervals = [];
+    for (let i = 1; i < orderedReadings.length; i++) {
+        const prev = orderedReadings[i - 1];
+        const curr = orderedReadings[i];
+        const prevTs = getReadingPeriodEndMs(prev);
+        const currTs = getReadingPeriodEndMs(curr);
+        if (!Number.isFinite(prevTs) || !Number.isFinite(currTs) || currTs <= prevTs) continue;
+
+        const prevVolume = Number(getVolume(prev));
+        const currVolume = Number(getVolume(curr));
+        const addedLiters = Number(curr.addedAmountLiters || 0);
+        const decreaseLiters = Math.max(0, prevVolume - currVolume);
+        const riseLiters = Math.max(0, currVolume - prevVolume);
+
+        intervals.push({
+            prev,
+            curr,
+            prevTs,
+            currTs,
+            prevVolume,
+            currVolume,
+            addedLiters,
+            decreaseLiters,
+            riseLiters
+        });
+    }
+
+    if (intervals.length === 0) return 0;
+
+    const firstTs = Number(orderedReadings[0].timestamp);
+    const lastTs = Number(orderedReadings[orderedReadings.length - 1].timestamp);
+    const elapsedDays = Math.max(1, (lastTs - firstTs) / DAY_MS);
+    const estimatedDailyUsageLiters = intervals.reduce((sum, iv) => sum + iv.decreaseLiters, 0) / elapsedDays;
+    const likelyRefillRiseThresholdLiters = estimatedDailyUsageLiters * 5;
+
+    const hasRefill = intervals.some((iv) => {
+        if (iv.addedLiters > 0) return true;
+        if (estimatedDailyUsageLiters <= 0) return false;
+        return iv.riseLiters >= likelyRefillRiseThresholdLiters;
+    });
+
+    let total = 0;
+
+    for (const iv of intervals) {
+        if (iv.currTs <= periodStartMs || iv.prevTs >= periodEndExclusiveMs) continue;
+
+        const isImplicitRefill = estimatedDailyUsageLiters > 0 && iv.riseLiters >= likelyRefillRiseThresholdLiters;
+        let fullIntervalLiters = 0;
+        if (iv.addedLiters > 0) {
+            fullIntervalLiters = Math.max(0, (iv.prevVolume + iv.addedLiters) - iv.currVolume);
+        } else if (isImplicitRefill) {
+            fullIntervalLiters = 0;
+        } else if (!hasRefill) {
+            fullIntervalLiters = iv.prevVolume - iv.currVolume;
+        } else {
+            fullIntervalLiters = iv.decreaseLiters;
+        }
+
+        const overlapStart = Math.max(iv.prevTs, periodStartMs);
+        const overlapEnd = Math.min(iv.currTs, periodEndExclusiveMs);
+        if (overlapEnd <= overlapStart) continue;
+
+        const duration = iv.currTs - iv.prevTs;
+        for (let segStart = overlapStart; segStart < overlapEnd; segStart += DAY_MS) {
+            const segEnd = Math.min(segStart + DAY_MS, overlapEnd);
+            const segLiters = fullIntervalLiters * ((segEnd - segStart) / duration);
+            if (metric === 'L') {
+                total += segLiters;
+            } else {
+                const sup = resolveSupplyAt(segEnd - 1);
+                const sg = toFiniteNumber(sup?.specificGravity) || toFiniteNumber(iv.curr.appliedSpecificGravity) || 1;
+                const segKg = segLiters * sg;
+                if (metric === '$') {
+                    const price = toFiniteNumber(sup?.price) || 0;
+                    total += segKg * price;
+                } else {
+                    total += segKg;
+                }
+            }
+        }
+    }
+
+    return Math.max(0, total);
 }

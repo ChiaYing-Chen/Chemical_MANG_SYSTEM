@@ -2,14 +2,14 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { StorageService } from './services/storageService';
 import * as API from './services/apiService';
 import { calculateTankVolume, calculateCWSUsage } from './utils/calculationUtils';
-import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType, FluctuationAlert, DailyBWSParameterRecord, DailyCWSParameterRecord, DailyParamsSyncResponse } from './types';
+import { Tank, Reading, SystemType, ChemicalSupply, CWSParameterRecord, BWSParameterRecord, ImportantNote, CalculationMethod, ShapeType, HeadType, FluctuationAlert, DailyBWSParameterRecord, DailyCWSParameterRecord, DailyParamsSyncResponse, BatchUsageSummaryItem } from './types';
 import { Icons } from './components/Icons';
 import { LoadingOverlay } from './components/LoadingOverlay';
 import { ImportAnomalyModal, ImportAnomaly } from './components/ImportAnomalyModal';
 import * as XLSX from 'xlsx';
 import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
-    BarChart, Bar, ComposedChart, Area, ReferenceLine
+    BarChart, Bar, ComposedChart, Area, ReferenceLine, Cell
 } from 'recharts';
 import AnnualDataView from './views/AnnualDataView';
 import { ExcelImportView } from './views/ExcelImportView';
@@ -18,7 +18,24 @@ import InstrumentManagementView from './views/InstrumentManagementView';
 import { FluctuationAlertsView } from './components/FluctuationAlertsView';
 import { LevelUsageCalculatorModal } from './components/LevelUsageCalculatorModal';
 import { formatAnomalyMessage } from './utils/textUtils';
-import { aggregateWeeklyCondensateRecovery } from './dailyParamsUtils.js';
+import {
+    aggregateWeeklyCondensateRecovery,
+    calculateCondensateLossRate,
+    calculateActualDosingPpm,
+    computePeriodReadings,
+    computePeriodActualUsage,
+    getReadingPeriodEndMs
+} from './dailyParamsUtils.js';
+import {
+    normalizeMetricLabel,
+    getWaterQualityContextForTank,
+    pickDefaultWaterQualityMetric,
+    buildDailyWaterQualityMap,
+    computeWeeklyWaterQualityAverage,
+    calculateCwsBlowdownM3,
+    buildDailyEventMap,
+    formatTooltipEvents
+} from './analysisDiagnosticUtils.js';
 
 // --- Helper Components ---
 
@@ -896,15 +913,17 @@ const DailyUsageTrendModal: React.FC<{
 
                 const dailyActualMap = new Map<string, number>();
 
-                // Calculate daily usage (identical logic to AnnualDataView)
+                // Calculate daily usage (Direction A: reading[D] represents end of day D)
                 for (let i = 1; i < sortedReadings.length; i++) {
                     const curr = sortedReadings[i];
                     const prev = sortedReadings[i - 1];
 
-                    const diffMs = curr.timestamp - prev.timestamp;
+                    const startMs = getReadingPeriodEndMs(prev);
+                    const endMs = getReadingPeriodEndMs(curr);
+                    const diffMs = endMs - startMs;
                     const diffDays = diffMs / (1000 * 60 * 60 * 24);
 
-                    if (diffDays <= 0) continue;
+                    if (!Number.isFinite(diffDays) || diffDays <= 0) continue;
 
                     const addedKg = curr.addedAmountLiters * curr.appliedSpecificGravity;
                     const totalUsageKg = (prev.calculatedWeightKg + addedKg) - curr.calculatedWeightKg;
@@ -912,10 +931,10 @@ const DailyUsageTrendModal: React.FC<{
                     // Do not clamp to 0 here to distinguish "flat" vs "rise"
                     const dailyUsage = totalUsageKg / diffDays;
 
-                    let iterDate = new Date(prev.timestamp);
-                    const endDate = new Date(curr.timestamp);
+                    let iterDate = new Date(startMs);
+                    const endDate = new Date(endMs);
 
-                    // Spread from prev to curr
+                    // Spread from startMs to endMs
                     while (iterDate < endDate) {
                         const Y = iterDate.getFullYear();
                         const M = String(iterDate.getMonth() + 1).padStart(2, '0');
@@ -1378,7 +1397,7 @@ const DataEntryView: React.FC<{
     tanks: Tank[],
     readings: Reading[],
     onSave: (r: Reading) => void,
-    onBatchSave: (rs: Reading[], alerts?: Partial<FluctuationAlert>[]) => Promise<void>,
+    onBatchSave: (rs: Reading[], alerts?: Partial<FluctuationAlert>[], usageSummaries?: BatchUsageSummaryItem[]) => Promise<void>,
     onUpdateTank: (tank?: Tank) => void;
     onLoading: (loading: boolean) => void;
     appSettings: any;
@@ -1400,6 +1419,7 @@ const DataEntryView: React.FC<{
     const [showAnomalyModal, setShowAnomalyModal] = useState(false);
     const [anomalySource, setAnomalySource] = useState<'IMPORT' | 'MANUAL'>('IMPORT');
     const [pendingReadings, setPendingReadings] = useState<Reading[]>([]);
+    const [pendingUsageSummaries, setPendingUsageSummaries] = useState<BatchUsageSummaryItem[]>([]);
     const [convertedCountInfo, setConvertedCountInfo] = useState<number>(0);
     const [batchSaving, setBatchSaving] = useState(false);
 
@@ -1640,6 +1660,53 @@ const DataEntryView: React.FC<{
         return null;
     };
 
+    const buildBatchUsageSummaries = (newReadings: Reading[]): BatchUsageSummaryItem[] => {
+        const readingByTank = new Map<string, Reading>();
+        newReadings.forEach(r => readingByTank.set(r.tankId, r));
+
+        const orderedReadings = tanks
+            .map(t => readingByTank.get(t.id))
+            .filter((r): r is Reading => Boolean(r));
+        newReadings.forEach(r => {
+            if (!tanks.some(t => t.id === r.tankId)) orderedReadings.push(r);
+        });
+
+        return orderedReadings.map(r => {
+            const tank = tanks.find(t => t.id === r.tankId);
+            const readingDateStr = getTaipeiDateString(r.timestamp);
+            const currDayTs = Date.parse(`${readingDateStr}T00:00:00+08:00`);
+
+            const prev = readings
+                .filter(item => item.tankId === r.tankId && getTaipeiDateString(item.timestamp) < readingDateStr)
+                .sort((a, b) => b.timestamp - a.timestamp)[0] || null;
+
+            let actualDailyUsageKg: number | null = null;
+            if (prev && Number.isFinite(currDayTs)) {
+                const prevDateStr = getTaipeiDateString(prev.timestamp);
+                const prevDayTs = Date.parse(`${prevDateStr}T00:00:00+08:00`);
+                const daysDiff = Number.isFinite(prevDayTs) ? Math.max(1, Math.round((currDayTs - prevDayTs) / 86400000)) : 1;
+                const addedAmount = r.addedAmountLiters || 0;
+                const levelChange = (prev.calculatedVolume + addedAmount) - r.calculatedVolume;
+                const sg = r.appliedSpecificGravity || 1.0;
+                actualDailyUsageKg = Number(((levelChange / daysDiff) * sg).toFixed(1));
+            }
+
+            const theoreticalInfo = tank ? getDailyTheoreticalUsageKg(tank, readingDateStr) : null;
+            const theoreticalDailyUsageKg = theoreticalInfo ? Number(theoreticalInfo.valueKg.toFixed(1)) : null;
+            const deviationPercent = (actualDailyUsageKg !== null && theoreticalDailyUsageKg !== null && theoreticalDailyUsageKg > 0)
+                ? Number((((actualDailyUsageKg - theoreticalDailyUsageKg) / theoreticalDailyUsageKg) * 100).toFixed(1))
+                : null;
+
+            return {
+                tankId: r.tankId,
+                tankName: tank?.name || r.tankId,
+                actualDailyUsageKg,
+                theoreticalDailyUsageKg,
+                deviationPercent
+            };
+        });
+    };
+
     const checkAnomalies = (newReadings: Reading[]): ImportAnomaly[] => {
         const anomalies: ImportAnomaly[] = [];
 
@@ -1742,7 +1809,8 @@ const DataEntryView: React.FC<{
 
             if (anomalySource === 'MANUAL') {
                 // 人工批次由後端一起儲存異常並通知。
-                await onBatchSave(pendingReadings, alertsToSave);
+                const summariesToSend = typeof pendingUsageSummaries !== 'undefined' ? pendingUsageSummaries : undefined;
+                await onBatchSave(pendingReadings, alertsToSave, summariesToSend);
                 setBatchLevels({}); // Clear manual inputs
                 alert(`已成功儲存 ${pendingReadings.length} 筆液位紀錄`);
             } else {
@@ -1757,6 +1825,7 @@ const DataEntryView: React.FC<{
             onLoading(false);
             setShowAnomalyModal(false);
             setPendingReadings([]);
+            if (typeof setPendingUsageSummaries === 'function') setPendingUsageSummaries([]);
             setImportAnomalies([]);
             onUpdateTank(); // Refresh data after successful import
         }
@@ -2126,12 +2195,28 @@ const DataEntryView: React.FC<{
     const handleSubmitReadings = async (e: React.FormEvent) => {
         e.preventDefault();
 
-        // 智慧判斷：若按下儲存的時間落於晚上 23:00 ~ 23:59:59，提示確認抄表日期
+        // 智慧判斷：以台北時間檢查是否誤選今日（22:00 前不可輸入今日）或未來日期，23:00~23:59 則提醒即將跨日
         const now = new Date(Date.now() + 8 * 3600000);
-        if (now.getUTCHours() === 23) {
+        const todayStr = now.toISOString().slice(0, 10);
+        const hour = now.getUTCHours();
+        const minuteStr = now.getUTCMinutes().toString().padStart(2, '0');
+        const hourStr = hour.toString().padStart(2, '0');
+
+        if (date > todayStr) {
+            alert(`⚠️ 日期錯誤：不可輸入未來日期（${date.replace(/-/g, '/')}）之液位紀錄。`);
+            return;
+        }
+
+        if (date === todayStr && hour < 22) {
+            const yesterdayStr = getTaipeiDateString(undefined, -1).replace(/-/g, '/');
+            alert(`⚠️ 日期錯誤：目前時間為 ${hourStr}:${minuteStr}，尚未達 22:00 結算時段，不可輸入今日（${date.replace(/-/g, '/')}）之液位紀錄。\n\n若要補登或修改昨日液位，請將「用量所屬日期」改為昨日（${yesterdayStr}）。`);
+            return;
+        }
+
+        if (hour === 23) {
             const [y, m, d] = date.split('-');
             const dateDisplay = `${y}/${m}/${d}`;
-            const confirmed = window.confirm(`⚠️ 注意：現在時間為深夜 ${now.getUTCHours().toString().padStart(2, '0')}:${now.getUTCMinutes().toString().padStart(2, '0')}，即將跨日。\n\n儲存的抄表日期為「${dateDisplay}」，是否正確？\n\n按「確定」繼續儲存，按「取消」返回修改日期。`);
+            const confirmed = window.confirm(`⚠️ 注意：現在時間為深夜 ${hourStr}:${minuteStr}，即將跨日。\n\n儲存的抄表日期為「${dateDisplay}」，是否正確？\n\n按「確定」繼續儲存，按「取消」返回修改日期。`);
             if (!confirmed) return;
         }
 
@@ -2210,18 +2295,20 @@ const DataEntryView: React.FC<{
             }
 
             if (newReadings.length > 0) {
+                const usageSummaries = buildBatchUsageSummaries(newReadings);
                 const anomalies = checkAnomalies(newReadings);
 
                 if (anomalies.length > 0) {
                     setImportAnomalies(anomalies);
                     setPendingReadings(newReadings);
+                    setPendingUsageSummaries(usageSummaries);
                     setAnomalySource('MANUAL');
                     setShowAnomalyModal(true);
                     onLoading(false); // Stop loading to show modal
                     return; // Wait for user confirmation
                 }
 
-                await onBatchSave(newReadings, []);
+                await onBatchSave(newReadings, [], usageSummaries);
                 setBatchLevels({}); // Clear inputs
                 alert(`已成功儲存 ${newReadings.length} 筆液位紀錄`);
             }
@@ -3190,6 +3277,10 @@ const DataEntryView: React.FC<{
                                             dailyParams.status === 'PI_ERROR' ? (
                                                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-amber-100 text-amber-800 border border-amber-200">
                                                     PI 同步失敗（不影響存檔）
+                                                </span>
+                                            ) : dailyParams.status === 'DAY_NOT_READY' ? (
+                                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-red-100 text-red-700 border border-red-200 font-medium">
+                                                    日期錯誤：本日 22:00 後才可輸入（請確認是否應選昨日）
                                                 </span>
                                             ) : dailyParams.status === 'FUTURE_DATE' ? (
                                                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-slate-100 text-slate-600 border border-slate-200">
@@ -4738,6 +4829,7 @@ const AnalysisView: React.FC<{
     };
 
     const [metric, setMetric] = useState<'KG' | 'L' | '$'>('KG');
+    const [chartViewMode, setChartViewMode] = useState<'total' | 'ppm' | 'deviation'>('total');
     const [bwsParamsHistory, setBwsParamsHistory] = useState<BWSParameterRecord[]>([]);
     const [cwsParamsHistory, setCwsParamsHistory] = useState<CWSParameterRecord[]>([]);
     const [dailyBwsParams, setDailyBwsParams] = useState<DailyBWSParameterRecord[]>([]);
@@ -4755,47 +4847,113 @@ const AnalysisView: React.FC<{
         selectedTank.calculationMethod === 'BWS_STEAM' &&
         BOILER_WATER_CHEMICAL_KEYWORDS.some(k => selectedTank.name.includes(k))
     );
+    const isCoolingTank = Boolean(
+        selectedTank &&
+        (selectedTank.system?.includes('冷卻') ||
+            selectedTank.name.toUpperCase().startsWith('CT-1') ||
+            selectedTank.name.toUpperCase().startsWith('CT-2'))
+    );
+    const isCwsBlowdownTank = Boolean(selectedTank && selectedTank.calculationMethod === 'CWS_BLOWDOWN');
+
+    const [cwsRightAxisMode, setCwsRightAxisMode] = useState<'blowdown' | 'cycles' | 'wq' | 'none'>('blowdown');
+    const [showEventMarkers, setShowEventMarkers] = useState<boolean>(true);
+    const [importantNotes, setImportantNotes] = useState<ImportantNote[]>([]);
+    const [fluctuationAlerts, setFluctuationAlerts] = useState<FluctuationAlert[]>([]);
+    const [wqReadingsByType, setWqReadingsByType] = useState<Record<'CW' | 'BW', any[]>>({ CW: [], BW: [] });
+    const [wqAliasMap, setWqAliasMap] = useState<Map<string, string>>(() => new Map());
+    const [selectedWqPointGroup, setSelectedWqPointGroup] = useState<string>('');
+    const [selectedWqMetric, setSelectedWqMetric] = useState<string>('');
+
+    type RightAxisConfig = {
+        mode: 'recovery' | 'loss' | 'wq';
+        recoveryMin: number | null;
+        recoveryMax: number | null;
+        recoveryReversed: boolean;
+        lossMin: number | null;
+        lossMax: number | null;
+    };
 
     const RECOVERY_SCALE_STORAGE_KEY = 'wtca_condensate_recovery_y_scale';
-    const [recoveryYScale, setRecoveryYScale] = useState<{ min: number | null; max: number | null }>(() => {
+    const RECOVERY_AXIS_CONFIG_KEY = 'wtca_condensate_right_axis_config';
+    const [rightAxisConfig, setRightAxisConfig] = useState<RightAxisConfig>(() => {
+        const defaultCfg: RightAxisConfig = {
+            mode: 'recovery',
+            recoveryMin: null,
+            recoveryMax: null,
+            recoveryReversed: false,
+            lossMin: null,
+            lossMax: null
+        };
+        const parseNullableNum = (v: any) => {
+            if (v === null || v === undefined || v === '') return null;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : null;
+        };
         try {
-            const raw = localStorage.getItem(RECOVERY_SCALE_STORAGE_KEY);
-            if (!raw) return { min: null, max: null };
-            const parsed = JSON.parse(raw);
-            const min = parsed?.min === null || parsed?.min === undefined ? null : Number(parsed.min);
-            const max = parsed?.max === null || parsed?.max === undefined ? null : Number(parsed.max);
-            if ((min !== null && !Number.isFinite(min)) || (max !== null && !Number.isFinite(max))) {
-                return { min: null, max: null };
+            const raw = localStorage.getItem(RECOVERY_AXIS_CONFIG_KEY);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                let recoveryMin = parseNullableNum(parsed?.recoveryMin);
+                let recoveryMax = parseNullableNum(parsed?.recoveryMax);
+                if (recoveryMin !== null && recoveryMax !== null && recoveryMin >= recoveryMax) {
+                    recoveryMin = null;
+                    recoveryMax = null;
+                }
+                let lossMin = parseNullableNum(parsed?.lossMin);
+                let lossMax = parseNullableNum(parsed?.lossMax);
+                if (lossMin !== null && lossMax !== null && lossMin >= lossMax) {
+                    lossMin = null;
+                    lossMax = null;
+                }
+                return {
+                    mode: parsed?.mode === 'loss' ? 'loss' : parsed?.mode === 'wq' ? 'wq' : 'recovery',
+                    recoveryMin,
+                    recoveryMax,
+                    recoveryReversed: Boolean(parsed?.recoveryReversed),
+                    lossMin,
+                    lossMax
+                };
             }
-            if (min !== null && max !== null && min >= max) {
-                return { min: null, max: null };
+            const legacyRaw = localStorage.getItem(RECOVERY_SCALE_STORAGE_KEY);
+            if (legacyRaw) {
+                const parsed = JSON.parse(legacyRaw);
+                const min = parseNullableNum(parsed?.min);
+                const max = parseNullableNum(parsed?.max);
+                if (!(min !== null && max !== null && min >= max)) {
+                    return { ...defaultCfg, recoveryMin: min, recoveryMax: max };
+                }
             }
-            return { min, max };
         } catch {
-            return { min: null, max: null };
+            // ignore storage errors
         }
+        return defaultCfg;
     });
     const [showRecoveryScaleModal, setShowRecoveryScaleModal] = useState(false);
     const [scaleMinDraft, setScaleMinDraft] = useState('');
     const [scaleMaxDraft, setScaleMaxDraft] = useState('');
+    const [scaleReversedDraft, setScaleReversedDraft] = useState(false);
     const [scaleDraftError, setScaleDraftError] = useState<string | null>(null);
+    const [selectedEventDayKey, setSelectedEventDayKey] = useState<string | null>(null);
 
-    const saveRecoveryYScale = (next: { min: number | null; max: number | null }) => {
-        setRecoveryYScale(next);
+    const saveRightAxisConfig = (next: RightAxisConfig) => {
+        setRightAxisConfig(next);
         try {
-            if (next.min === null && next.max === null) {
-                localStorage.removeItem(RECOVERY_SCALE_STORAGE_KEY);
-            } else {
-                localStorage.setItem(RECOVERY_SCALE_STORAGE_KEY, JSON.stringify(next));
-            }
+            localStorage.setItem(RECOVERY_AXIS_CONFIG_KEY, JSON.stringify(next));
         } catch {
             // ignore storage errors
         }
     };
 
     const openRecoveryScaleModal = () => {
-        setScaleMinDraft(recoveryYScale.min !== null ? String(recoveryYScale.min) : '');
-        setScaleMaxDraft(recoveryYScale.max !== null ? String(recoveryYScale.max) : '');
+        if (rightAxisConfig.mode === 'loss') {
+            setScaleMinDraft(rightAxisConfig.lossMin !== null ? String(rightAxisConfig.lossMin) : '');
+            setScaleMaxDraft(rightAxisConfig.lossMax !== null ? String(rightAxisConfig.lossMax) : '');
+            setScaleReversedDraft(false);
+        } else {
+            setScaleMinDraft(rightAxisConfig.recoveryMin !== null ? String(rightAxisConfig.recoveryMin) : '');
+            setScaleMaxDraft(rightAxisConfig.recoveryMax !== null ? String(rightAxisConfig.recoveryMax) : '');
+            setScaleReversedDraft(rightAxisConfig.recoveryReversed);
+        }
         setScaleDraftError(null);
         setShowRecoveryScaleModal(true);
     };
@@ -4814,21 +4972,168 @@ const AnalysisView: React.FC<{
             setScaleDraftError('低點必須小於高點');
             return;
         }
-        saveRecoveryYScale({ min: minVal, max: maxVal });
+        if (rightAxisConfig.mode === 'loss') {
+            saveRightAxisConfig({
+                ...rightAxisConfig,
+                lossMin: minVal,
+                lossMax: maxVal
+            });
+        } else {
+            saveRightAxisConfig({
+                ...rightAxisConfig,
+                recoveryMin: minVal,
+                recoveryMax: maxVal,
+                recoveryReversed: scaleReversedDraft
+            });
+        }
         setScaleDraftError(null);
         setShowRecoveryScaleModal(false);
     };
 
-    const hasCustomRecoveryScale = recoveryYScale.min !== null || recoveryYScale.max !== null;
-    const recoveryYAxisDomain: [number, number | ((dataMax: number) => number)] = [
-        recoveryYScale.min !== null ? recoveryYScale.min : 0,
-        recoveryYScale.max !== null
-            ? recoveryYScale.max
-            : (dataMax: number) => Math.max(100, Math.ceil((dataMax || 100) / 10) * 10)
-    ];
-    const recoveryScaleButtonLabel = hasCustomRecoveryScale
-        ? `回收率Y軸: ${recoveryYScale.min ?? '自動'}~${recoveryYScale.max ?? '自動'}%`
-        : '回收率Y軸: 自動';
+    const isLossMode = rightAxisConfig.mode === 'loss';
+    const activeRightMin = isLossMode ? rightAxisConfig.lossMin : rightAxisConfig.recoveryMin;
+    const activeRightMax = isLossMode ? rightAxisConfig.lossMax : rightAxisConfig.recoveryMax;
+    const hasCustomRecoveryScale = activeRightMin !== null || activeRightMax !== null;
+    const rightYAxisDomain: [number, number | ((dataMax: number) => number)] = isLossMode
+        ? [
+            activeRightMin !== null ? activeRightMin : 0,
+            activeRightMax !== null
+                ? activeRightMax
+                : (dataMax: number) => Math.max(25, Math.ceil((dataMax || 20) / 5) * 5)
+        ]
+        : [
+            activeRightMin !== null ? activeRightMin : 0,
+            activeRightMax !== null
+                ? activeRightMax
+                : (dataMax: number) => Math.max(100, Math.ceil((dataMax || 100) / 10) * 10)
+        ];
+    const rightYAxisReversed = !isLossMode && rightAxisConfig.recoveryReversed;
+    const recoveryScaleButtonLabel = isLossMode
+        ? (hasCustomRecoveryScale
+            ? `未回收Y軸: ${activeRightMin ?? '自動'}~${activeRightMax ?? '自動'}%`
+            : '未回收Y軸: 自動')
+        : `${hasCustomRecoveryScale
+            ? `回收率Y軸: ${activeRightMin ?? '自動'}~${activeRightMax ?? '自動'}%`
+            : '回收率Y軸: 自動'}${rightAxisConfig.recoveryReversed ? ' (反轉)' : ''}`;
+
+    const wqContext = useMemo(() => getWaterQualityContextForTank(selectedTank), [selectedTank]);
+    const effectiveCwsRightMode = isCoolingTank
+        ? (!isCwsBlowdownTank && (cwsRightAxisMode === 'blowdown' || cwsRightAxisMode === 'cycles') ? 'wq' : cwsRightAxisMode)
+        : 'none';
+    const isBoilerRecoveryOverlay = showCondensateRecovery && (rightAxisConfig.mode === 'recovery' || rightAxisConfig.mode === 'loss');
+    const isWqOverlayActive = (showCondensateRecovery && rightAxisConfig.mode === 'wq') || (isCoolingTank && effectiveCwsRightMode === 'wq');
+    const isCwsBlowdownOverlay = isCwsBlowdownTank && effectiveCwsRightMode === 'blowdown';
+    const isCwsCyclesOverlay = isCwsBlowdownTank && effectiveCwsRightMode === 'cycles';
+    const hasRightAxis = isBoilerRecoveryOverlay || isCwsBlowdownOverlay || isCwsCyclesOverlay || isWqOverlayActive;
+
+    // 載入重要紀事、波動警報與水質欄位別名 (供圖表事件標記與水質右軸使用)
+    useEffect(() => {
+        let cancelled = false;
+        Promise.all([
+            StorageService.getNotes().catch(() => []),
+            StorageService.getAlerts().catch(() => []),
+            API.fetchManualWaterQualityAliases().catch(() => [])
+        ]).then(([notesRes, alertsRes, aliasesRes]) => {
+            if (cancelled) return;
+            setImportantNotes(notesRes);
+            setFluctuationAlerts(alertsRes);
+            const map = new Map<string, string>();
+            if (Array.isArray(aliasesRes)) {
+                aliasesRes.forEach((a: any) => {
+                    if (a?.original_name && a?.display_name) {
+                        map.set(a.original_name, a.display_name);
+                    }
+                });
+            }
+            setWqAliasMap(map);
+        });
+        return () => { cancelled = true; };
+    }, []);
+
+    // 按水質類別快取人工水質資料 (CW / BW)
+    useEffect(() => {
+        const wt = wqContext.waterType as 'CW' | 'BW' | null;
+        if (!wt || wqReadingsByType[wt].length > 0) return;
+        let cancelled = false;
+        API.fetchManualWaterQualityReadings(wt)
+            .then(rows => {
+                if (cancelled) return;
+                setWqReadingsByType(prev => ({ ...prev, [wt]: Array.isArray(rows) ? rows : [] }));
+            })
+            .catch(err => console.warn('載入人工水質數據失敗:', err));
+        return () => { cancelled = true; };
+    }, [wqContext.waterType, wqReadingsByType]);
+
+    // 切換儲槽時自動設定冷卻水右軸預設模式與水質取樣點群組
+    useEffect(() => {
+        if (!selectedTank) return;
+        if (selectedTank.calculationMethod === 'CWS_BLOWDOWN') {
+            setCwsRightAxisMode('blowdown');
+        } else if (
+            selectedTank.system?.includes('冷卻') ||
+            selectedTank.name.toUpperCase().startsWith('CT-1') ||
+            selectedTank.name.toUpperCase().startsWith('CT-2')
+        ) {
+            setCwsRightAxisMode('wq');
+        }
+        const ctx = getWaterQualityContextForTank(selectedTank);
+        setSelectedWqPointGroup(ctx.defaultPointGroup || '');
+        setSelectedEventDayKey(null);
+    }, [selectedTankId]);
+
+    const activeWqPointConfig = useMemo(() => {
+        return wqContext.pointGroups.find((g: any) => g.id === selectedWqPointGroup) || wqContext.pointGroups[0] || null;
+    }, [wqContext, selectedWqPointGroup]);
+
+    const availableWqMetrics = useMemo(() => {
+        const wt = wqContext.waterType as 'CW' | 'BW' | null;
+        if (!wt || !activeWqPointConfig) return [] as Array<{ key: string; label: string }>;
+        const rows = wqReadingsByType[wt] || [];
+        const matchSet = new Set<string>(activeWqPointConfig.matchPoints || []);
+        const keys = new Set<string>();
+        for (const row of rows) {
+            if (!row || !matchSet.has(row.sample_point) || !row.data) continue;
+            Object.keys(row.data).forEach(k => keys.add(k));
+        }
+        return Array.from(keys).map(k => ({
+            key: k,
+            label: normalizeMetricLabel(k, wqAliasMap)
+        }));
+    }, [wqContext.waterType, activeWqPointConfig, wqReadingsByType, wqAliasMap]);
+
+    const wqDataCountForTank = wqContext.waterType ? (wqReadingsByType[wqContext.waterType as 'CW' | 'BW']?.length || 0) : 0;
+
+    useEffect(() => {
+        const keys = availableWqMetrics.map(m => m.key);
+        if (keys.length === 0) {
+            setSelectedWqMetric('');
+            return;
+        }
+        setSelectedWqMetric(pickDefaultWaterQualityMetric(selectedTank, keys));
+    }, [selectedTankId, selectedWqPointGroup, wqDataCountForTank]);
+
+    const selectedWqMetricLabel = useMemo(() => {
+        return availableWqMetrics.find(m => m.key === selectedWqMetric)?.label || normalizeMetricLabel(selectedWqMetric, wqAliasMap);
+    }, [availableWqMetrics, selectedWqMetric, wqAliasMap]);
+
+    const dailyWqMap = useMemo(() => {
+        const wt = wqContext.waterType as 'CW' | 'BW' | null;
+        if (!wt || !activeWqPointConfig || !selectedWqMetric) return new Map();
+        return buildDailyWaterQualityMap(wqReadingsByType[wt] || [], activeWqPointConfig.matchPoints, selectedWqMetric);
+    }, [wqContext.waterType, activeWqPointConfig, selectedWqMetric, wqReadingsByType]);
+
+    const dailyEventMap = useMemo(() => {
+        if (!selectedTank) return new Map();
+        return buildDailyEventMap({
+            tank: selectedTank,
+            readings,
+            notes: importantNotes,
+            alerts: fluctuationAlerts,
+            supplies: suppliesHistory,
+            startDate: appliedDateRange.start,
+            endDate: appliedDateRange.end
+        });
+    }, [selectedTank, readings, importantNotes, fluctuationAlerts, suppliesHistory, appliedDateRange.start, appliedDateRange.end]);
 
     // 載入該儲槽的參數歷史記錄和藥劑合約歷史
     useEffect(() => {
@@ -4857,7 +5162,8 @@ const AnalysisView: React.FC<{
         let startDate = appliedDateRange.start;
         let endDate = appliedDateRange.end;
 
-        if (showCondensateRecovery) {
+        const canCalc = selectedTank?.calculationMethod === 'BWS_STEAM' || selectedTank?.calculationMethod === 'CWS_BLOWDOWN';
+        if (canCalc) {
             const [sy, sm, sd] = appliedDateRange.start.split('-').map(Number);
             const [ey, em, ed] = appliedDateRange.end.split('-').map(Number);
             if (sy && sm && sd && ey && em && ed) {
@@ -4874,7 +5180,6 @@ const AnalysisView: React.FC<{
             }
         }
 
-        const canCalc = selectedTank?.calculationMethod === 'BWS_STEAM' || selectedTank?.calculationMethod === 'CWS_BLOWDOWN';
         const forceSync = forceRangeSyncRef.current;
         forceRangeSyncRef.current = false;
 
@@ -4917,7 +5222,7 @@ const AnalysisView: React.FC<{
                     ).map(p => p.dateStr)
                 );
                 for (let t = startMs, count = 0; t <= endMs && count < 62; t += DAY_MS, count++) {
-                    if (t > nowMs) break;
+                    if (t + 22 * 60 * 60 * 1000 > nowMs) break;
                     const dStr = new Date(t + 8 * 3600000).toISOString().slice(0, 10);
                     if (!finalSet.has(dStr)) {
                         needsSync = true;
@@ -4972,6 +5277,8 @@ const AnalysisView: React.FC<{
     const dailyData = useMemo(() => {
         if (!selectedTank || readings.length < 2) return [];
 
+        const DAY_MS = 24 * 60 * 60 * 1000;
+
         // Calculate Extended Range for Data Fetching
         const userStart = new Date(appliedDateRange.start);
         const userEnd = new Date(appliedDateRange.end);
@@ -4989,98 +5296,89 @@ const AnalysisView: React.FC<{
         extEnd.setDate(userEnd.getDate() + daysToSun);
 
         const startTs = getNormalizedTimestamp(extStart);
-        const endTs = getNormalizedTimestamp(extEnd) + (24 * 60 * 60 * 1000 - 1);
+        const endBaseTs = getNormalizedTimestamp(extEnd);
+        if (startTs === null || endBaseTs === null) return [];
+        const endExclusiveTs = endBaseTs + DAY_MS;
 
-        // Get readings within range
-        const readingsInRange = readings
-            .filter(r => r.tankId === selectedTankId && r.timestamp >= startTs && r.timestamp <= endTs);
+        const tankReadings = computePeriodReadings(readings, selectedTankId, startTs, endExclusiveTs);
+        if (tankReadings.length < 2) return [];
 
-        // Find ONE reading just before startTs
-        const prevReading = readings
-            .filter(r => r.tankId === selectedTankId && r.timestamp < startTs)
-            .sort((a, b) => b.timestamp - a.timestamp)[0]; // Latest one before startTs
+        const getReadingVolume = (reading: Reading): number => {
+            const volume = calculateTankVolume(selectedTank, reading.levelCm);
+            if (Number.isFinite(volume) && volume >= 0) return volume;
+            return reading.calculatedVolume || 0;
+        };
 
-        // Find ONE reading just after endTs to allow calculating the last interval crossing the end date
-        // This fixes the issue where usage for the end of the month is missing if the interval extends beyond endTs
-        const nextReading = readings
-            .filter(r => r.tankId === selectedTankId && r.timestamp > endTs)
-            .sort((a, b) => a.timestamp - b.timestamp)[0]; // Earliest one after endTs
+        const rawIntervals = tankReadings.slice(1).map((next, idx) => {
+            const curr = tankReadings[idx];
+            const startMs = getReadingPeriodEndMs(curr);
+            const endMs = getReadingPeriodEndMs(next);
+            const prevVol = getReadingVolume(curr);
+            const nextVol = getReadingVolume(next);
+            const diffDays = (endMs - startMs) / DAY_MS;
+            return {
+                curr,
+                next,
+                startMs,
+                endMs,
+                prevVol,
+                nextVol,
+                diffDays,
+                addedLiters: curr === next ? 0 : (next.addedAmountLiters || 0),
+                decreaseLiters: Math.max(0, prevVol - nextVol),
+                riseLiters: Math.max(0, nextVol - prevVol)
+            };
+        }).filter(iv => Number.isFinite(iv.diffDays) && iv.diffDays > 0);
 
-        const tankReadings = [prevReading, ...readingsInRange, nextReading]
-            .filter(Boolean)
-            // Deduplicate (in case range overlaps perfectly with prev/next finding logic, though filter >/< should prevent this)
-            .filter((v, i, a) => a.findIndex(t => t.id === v.id) === i)
-            .sort((a, b) => a.timestamp - b.timestamp);
+        if (rawIntervals.length === 0) return [];
 
-        if (tankReadings.length < 1) return [];
+        const totalElapsedDays = Math.max(1, (getReadingPeriodEndMs(tankReadings[tankReadings.length - 1]) - getReadingPeriodEndMs(tankReadings[0])) / DAY_MS);
+        const estDailyUsageLiters = rawIntervals.reduce((s, iv) => s + iv.decreaseLiters, 0) / totalElapsedDays;
+        const implicitRefillThresholdLiters = estDailyUsageLiters * LIKELY_REFILL_RISE_DAYS;
 
-        const dailyMap = new Map<string, { date: Date, usage: number, refill: number, level: number }>();
+        const dailyMap = new Map<string, { date: Date, usage: number, usageKg: number, refill: number, level: number }>();
 
-        for (let i = 0; i < tankReadings.length - 1; i++) {
-            const curr = tankReadings[i];
-            const next = tankReadings[i + 1];
+        for (const iv of rawIntervals) {
+            const isImplicitRefill = estDailyUsageLiters > 0 && iv.riseLiters >= implicitRefillThresholdLiters;
+            const intervalLiters = iv.addedLiters > 0
+                ? Math.max(0, (iv.prevVol + iv.addedLiters) - iv.nextVol)
+                : isImplicitRefill
+                    ? 0
+                    : Math.max(0, iv.prevVol - iv.nextVol);
 
-            const diffMs = next.timestamp - curr.timestamp;
-            const diffDays = diffMs / (1000 * 60 * 60 * 24);
+            const dailyLiters = intervalLiters / iv.diffDays;
 
-            if (diffDays <= 0) continue;
+            for (let iterTs = iv.startMs; iterTs < iv.endMs; iterTs += DAY_MS) {
+                if (iterTs >= startTs && iterTs < endExclusiveTs) {
+                    const dateKey = getLocalDateKey(iterTs);
+                    if (!dailyMap.has(dateKey)) {
+                        const activeSupply = getActiveSupplyAt(iterTs + DAY_MS - 1, suppliesHistory);
+                        const sg = Number(activeSupply?.specificGravity || iv.next.appliedSpecificGravity || 1);
+                        const price = Number(activeSupply?.price || 0);
+                        const usageKg = dailyLiters * sg;
+                        const finalValue = metric === 'L' ? dailyLiters : metric === '$' ? usageKg * price : usageKg;
 
-            let totalUsage = 0;
-            let startLevel = 0;
-            let endLevel = 0;
-
-            if (metric === 'L') {
-                startLevel = curr.calculatedVolume;
-                endLevel = next.calculatedVolume;
-                totalUsage = (startLevel + next.addedAmountLiters) - endLevel;
-            } else {
-                // Apply historic specific gravity for KG or Cost ($)
-                const addedKg = next.addedAmountLiters * next.appliedSpecificGravity;
-                startLevel = curr.calculatedWeightKg;
-                endLevel = next.calculatedWeightKg;
-                totalUsage = (startLevel + addedKg) - endLevel;
-            }
-
-            const dailyUsage = Math.max(0, totalUsage / diffDays);
-
-            let iterDate = new Date(curr.timestamp);
-            while (iterDate < new Date(next.timestamp)) {
-                // 使用 Local Time 建構日期 Key，與 AnnualDataView 一致，避免時區錯位
-                const Y = iterDate.getFullYear();
-                const M = String(iterDate.getMonth() + 1).padStart(2, '0');
-                const D = String(iterDate.getDate()).padStart(2, '0');
-                const dateKey = `${Y}-${M}-${D}`;
-                if (!dailyMap.has(dateKey)) {
-                    let finalValue = dailyUsage;
-
-                    // If Cost metric, multiply by price
-                    if (metric === '$') {
-                        // Find active supply for this specific day to get price
-                        const dayTime = iterDate.getTime();
-                        const activeSupply = suppliesHistory.find(s => s.startDate <= dayTime);
-                        const price = activeSupply?.price || 0;
-                        finalValue = dailyUsage * price;
+                        dailyMap.set(dateKey, {
+                            date: new Date(iterTs),
+                            usage: finalValue,
+                            usageKg,
+                            refill: 0,
+                            level: metric === 'L' ? iv.nextVol : iv.nextVol * sg
+                        });
                     }
-
-                    dailyMap.set(dateKey, {
-                        date: new Date(iterDate),
-                        usage: finalValue,
-                        refill: 0,
-                        level: metric === 'L' ? curr.calculatedVolume : curr.calculatedWeightKg
-                    });
                 }
-                iterDate.setDate(iterDate.getDate() + 1);
             }
         }
 
         return Array.from(dailyMap.values()).sort((a, b) => a.date.getTime() - b.date.getTime());
-    }, [readings, selectedTankId, metric, selectedTank, appliedDateRange]);
+    }, [readings, selectedTankId, metric, selectedTank, appliedDateRange, suppliesHistory]);
 
     // 2. Weekly Aggregation (Directly uses extended dailyData to form complete weeks)
     const weeklyData = useMemo(() => {
-        if (dailyData.length === 0) return [];
+        if (dailyData.length === 0 || !selectedTank) return [];
 
-        const weeklyMap = new Map<string, { date: Date, dateStr: string, usage: number, avgLevel: number, count: number }>();
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const weeklyMap = new Map<string, { date: Date, dateStr: string, usage: number, usageKg: number, avgLevel: number, count: number }>();
 
         dailyData.forEach(day => {
             const dayDate = new Date(day.date);
@@ -5090,13 +5388,14 @@ const AnalysisView: React.FC<{
             weekStart.setDate(dayDate.getDate() - daysSinceMonday);
             weekStart.setHours(0, 0, 0, 0);
 
-            const key = weekStart.toISOString().split('T')[0];
+            const key = getLocalDateKey(weekStart.getTime());
 
             if (!weeklyMap.has(key)) {
                 weeklyMap.set(key, {
                     date: weekStart,
                     dateStr: `${weekStart.getMonth() + 1}/${weekStart.getDate()}`,
                     usage: 0,
+                    usageKg: 0,
                     avgLevel: 0,
                     count: 0
                 });
@@ -5104,22 +5403,41 @@ const AnalysisView: React.FC<{
 
             const w = weeklyMap.get(key)!;
             w.usage += day.usage;
+            w.usageKg += day.usageKg;
             w.avgLevel += day.level;
             w.count += 1;
         });
 
+        const getReadingVolume = (reading: Reading): number => {
+            const volume = calculateTankVolume(selectedTank, reading.levelCm);
+            if (Number.isFinite(volume) && volume >= 0) return volume;
+            return reading.calculatedVolume || 0;
+        };
+
         return Array.from(weeklyMap.values()).map(w => {
             const weekStartTime = w.date.getTime();
-            const weekEndTime = weekStartTime + (7 * 24 * 60 * 60 * 1000) - 1;
-            const periodReadings = selectedTank
-                ? getReadingsForUsagePeriod(readings, selectedTank.id, weekStartTime, weekEndTime, true)
-                : [];
+            const weekEndExclusiveTime = weekStartTime + (7 * DAY_MS);
 
             return {
                 ...w,
-                usage: selectedTank
-                    ? calculateActualUsageFromLevel(selectedTank, periodReadings, metric, suppliesHistory)
-                    : 0,
+                usage: computePeriodActualUsage({
+                    readings,
+                    tankId: selectedTank.id,
+                    periodStartMs: weekStartTime,
+                    periodEndExclusiveMs: weekEndExclusiveTime,
+                    metric,
+                    suppliesHistory,
+                    getVolume: getReadingVolume
+                }),
+                usageKg: computePeriodActualUsage({
+                    readings,
+                    tankId: selectedTank.id,
+                    periodStartMs: weekStartTime,
+                    periodEndExclusiveMs: weekEndExclusiveTime,
+                    metric: 'KG',
+                    suppliesHistory,
+                    getVolume: getReadingVolume
+                }),
                 level: w.avgLevel / (w.count || 1)
             };
         }).sort((a, b) => a.date.getTime() - b.date.getTime());
@@ -5129,15 +5447,19 @@ const AnalysisView: React.FC<{
     const monthlyComparisonData = useMemo(() => {
         if (!selectedTank || dailyData.length === 0) return [];
 
-        // STRICT filtering by appliedDateRange for Monthly Charts
-        // We do NOT want the extended days (padding for weeks) to affect monthly stats.
+        const DAY_MS = 24 * 60 * 60 * 1000;
         const userStart = getNormalizedTimestamp(appliedDateRange.start);
-        const userEnd = getNormalizedTimestamp(appliedDateRange.end) + (24 * 60 * 60 * 1000 - 1);
+        const userEnd = getNormalizedTimestamp(appliedDateRange.end);
+        if (userStart === null || userEnd === null) return [];
+        const userEndInclusive = userEnd + (DAY_MS - 1);
 
         const filteredDaily = dailyData.filter(d => {
             const t = d.date.getTime();
-            return t >= userStart && t <= userEnd;
+            return t >= userStart && t <= userEndInclusive;
         });
+
+        const dailyBwsMap = new Map<string, DailyBWSParameterRecord>();
+        dailyBwsParams.forEach(p => dailyBwsMap.set(p.dateStr, p));
 
         const monthlyMap = new Map<string, {
             date: Date,
@@ -5148,10 +5470,6 @@ const AnalysisView: React.FC<{
             sgSet: Set<number>,
             priceSet: Set<number>
         }>();
-
-        // Initialize Monthly Map with ALL months in range (or at least cover the days found)
-        // Better: Iterate through the time range day by day to build a complete picture
-        // BUT, simplified: Iterate through filteredDaily to get months, THEN fill missing days for theoretical.
 
         filteredDaily.forEach(day => {
             const mKey = `${day.date.getFullYear()}-${String(day.date.getMonth() + 1).padStart(2, '0')}`;
@@ -5164,13 +5482,12 @@ const AnalysisView: React.FC<{
                     days: 0,
                     sgSet: new Set(),
                     priceSet: new Set()
-                }); // Will calculate theoretical for the WHOLE month later
+                });
             }
             const m = monthlyMap.get(mKey)!;
             m.actual += day.usage;
             m.days++;
 
-            // Track SG/Price used
             const dayTime = day.date.getTime();
             const activeSupply = suppliesHistory.find(s => s.startDate <= dayTime);
             const price = activeSupply?.price || 0;
@@ -5180,11 +5497,9 @@ const AnalysisView: React.FC<{
             if (price) m.priceSet.add(Math.round(price * 100) / 100);
         });
 
-        // Loop through each month to calculate FULL Monthly Theoretical Usage
-        // This ensures even if we only have data for 1/5-1/31, we calculate theoretical for 1/1-1/31
         monthlyMap.forEach(m => {
             const year = m.date.getFullYear();
-            const month = m.date.getMonth(); // 0-indexed
+            const month = m.date.getMonth();
             const daysInMonth = new Date(year, month + 1, 0).getDate();
             const today = new Date();
             today.setHours(23, 59, 59, 999);
@@ -5196,13 +5511,12 @@ const AnalysisView: React.FC<{
                 const dayDate = new Date(year, month, d);
                 const dayTime = dayDate.getTime();
 
-                // Skip future dates
                 if (dayTime > todayTime) continue;
 
-                // 1. Find effective Supply for this specific day
-                const activeSupply = suppliesHistory.find(s => s.startDate <= dayTime);
+                const activeSupply = suppliesHistory.find(s => s.startDate <= dayTime + DAY_MS - 1);
                 const targetPpm = activeSupply?.targetPpm || 0;
                 const price = activeSupply?.price || 0;
+                const sg = Number(activeSupply?.specificGravity || 1);
 
                 if (!targetPpm) continue;
 
@@ -5210,30 +5524,9 @@ const AnalysisView: React.FC<{
                 const calcMethod = selectedTank.calculationMethod || 'NONE';
 
                 if (calcMethod === 'CWS_BLOWDOWN') {
-                    // Find parameters that COVER this day
-                    const cwsParam = cwsParamsHistory.find(p => {
-                        const pDate = p.date || 0;
-                        const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
-                        return dayTime >= pDate && dayTime < pEnd;
-                    }) || selectedTank.cwsParams; // Fallback only if tank.cwsParams exists (legacy), but ideally restrict like AnnualDataView
-
-                    // Strict sync with AnnualDataView: AnnualDataView logic does NOT use fallback if logic was updated to match implementation plan
-                    // The implementation plan for AnnualDataView removed fallback.
-                    // Let's check if we should be strict here too.
-                    // The recent change to AnnualDataView REMOVED the fallback to tank.cwsParams if looking for weekly data fails to find one?
-                    // Actually, AnnualDataView implementation:
-                    // const cwsParam = tankCwsHistory.find(...) || tank.cwsParams;
-                    // It STILL has fallback in the code I inserted?
-                    // Wait, looking at Step 134 diff:
-                    // const cwsParam = tankCwsHistory.find(...) || tank.cwsParams; <-- REMOVED fallback? No, the diff showed:
-                    // - }) || tank.cwsParams;
-                    // + });
-                    // So YES, AnnualDataView REMOVED fallback. We should do the same here for consistency.
-
-                    // Re-finding strictly without fallback to match AnnualDataView's latest logic
                     const strictCwsParam = cwsParamsHistory.find(p => {
                         const pDate = normalizeTimestampToLocalDayStart(p.date);
-                        const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
+                        const pEnd = pDate + (7 * DAY_MS);
                         return dayTime >= pDate && dayTime < pEnd;
                     });
 
@@ -5251,31 +5544,28 @@ const AnalysisView: React.FC<{
                         const B = C > 1 ? E / (C - 1) : 0;
                         dailyTheoretical = (B * targetPpm) / 1000;
                     }
-
                 } else if (calcMethod === 'BWS_STEAM') {
-                    const bwsParam = bwsParamsHistory.find(p => {
-                        const pDate = p.date || 0;
-                        const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
-                        return dayTime >= pDate && dayTime < pEnd;
-                    }) || selectedTank.bwsParams; // AnnualDataView removed fallback here too? Yes.
-
-                    // Strict find
-                    const strictBwsParam = bwsParamsHistory.find(p => {
-                        const pDate = normalizeTimestampToLocalDayStart(p.date);
-                        const pEnd = pDate + (7 * 24 * 60 * 60 * 1000);
-                        return dayTime >= pDate && dayTime < pEnd;
-                    });
-
-                    if (strictBwsParam && strictBwsParam.steamProduction) {
-                        const weeklySteam = strictBwsParam.steamProduction;
-                        const dailySteam = weeklySteam / 7;
-                        dailyTheoretical = (dailySteam * targetPpm) / 1000;
+                    const dKey = getLocalDateKey(dayTime);
+                    const dailyBws = dailyBwsMap.get(dKey);
+                    if (dailyBws && dailyBws.steamProduction > 0) {
+                        dailyTheoretical = (dailyBws.steamProduction * targetPpm) / 1000;
+                    } else {
+                        const strictBwsParam = bwsParamsHistory.find(p => {
+                            const pDate = normalizeTimestampToLocalDayStart(p.date);
+                            const pEnd = pDate + (7 * DAY_MS);
+                            return dayTime >= pDate && dayTime < pEnd;
+                        });
+                        if (strictBwsParam && strictBwsParam.steamProduction) {
+                            const dailySteam = strictBwsParam.steamProduction / 7;
+                            dailyTheoretical = (dailySteam * targetPpm) / 1000;
+                        }
                     }
                 }
 
-                // Convert to Cost if needed
                 if (metric === '$') {
                     dailyTheoretical = dailyTheoretical * price;
+                } else if (metric === 'L') {
+                    dailyTheoretical = sg > 0 ? dailyTheoretical / sg : dailyTheoretical;
                 }
 
                 monthTheory += dailyTheoretical;
@@ -5284,14 +5574,27 @@ const AnalysisView: React.FC<{
             m.theoretical = monthTheory;
         });
 
+        const getReadingVolume = (reading: Reading): number => {
+            const volume = calculateTankVolume(selectedTank, reading.levelCm);
+            if (Number.isFinite(volume) && volume >= 0) return volume;
+            return reading.calculatedVolume || 0;
+        };
+
         return Array.from(monthlyMap.values()).map(m => {
-            // 取得該月最後一天有效的藥劑合約（而非逐日收集，避免舊合約干擾）
-            const monthEnd = new Date(m.date.getFullYear(), m.date.getMonth() + 1, 0); // 該月最後一天
-            monthEnd.setHours(23, 59, 59, 999);
-            const monthEndTime = monthEnd.getTime();
+            const monthStartMs = m.date.getTime();
+            const monthEndExclusiveMs = new Date(m.date.getFullYear(), m.date.getMonth() + 1, 1).getTime();
+            const monthEndTime = monthEndExclusiveMs - 1;
             const activeSupplyForMonth = suppliesHistory.find(s => s.startDate <= monthEndTime);
-            const periodReadings = getReadingsForUsagePeriod(readings, selectedTank.id, m.date.getTime(), monthEndTime);
-            const actual = calculateActualUsageFromLevel(selectedTank, periodReadings, metric, suppliesHistory);
+            const periodReadings = computePeriodReadings(readings, selectedTank.id, monthStartMs, monthEndExclusiveMs);
+            const actual = computePeriodActualUsage({
+                readings,
+                tankId: selectedTank.id,
+                periodStartMs: monthStartMs,
+                periodEndExclusiveMs: monthEndExclusiveMs,
+                metric,
+                suppliesHistory,
+                getVolume: getReadingVolume
+            });
             const levelRiseWarnings = getSuspiciousLevelRiseWarnings(selectedTank, periodReadings);
 
             const specificGravity = activeSupplyForMonth?.specificGravity;
@@ -5309,24 +5612,32 @@ const AnalysisView: React.FC<{
             };
         }).sort((a, b) => a.date.getTime() - b.date.getTime());
 
-    }, [dailyData, selectedTank, metric, suppliesHistory, cwsParamsHistory, bwsParamsHistory, appliedDateRange, readings]);
+    }, [dailyData, selectedTank, metric, suppliesHistory, cwsParamsHistory, bwsParamsHistory, dailyBwsParams, appliedDateRange, readings]);
 
     // 4. Weekly Comparison Data (Actual vs Theoretical)
     const weeklyComparisonData = useMemo(() => {
         if (!selectedTank || weeklyData.length === 0) return [];
 
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const todayEndTaipeiMs = Date.parse(`${getTaipeiDateString()}T00:00:00+08:00`) + DAY_MS;
+
         return weeklyData.map(week => {
             let theoreticalTotal = 0;
+            let theoreticalKg = 0;
+            let steamProduction: number | null = null;
+            let baseFlowTons: number | null = null;
+            let theorySource: 'PI日實測加總' | '當週數據' | '無數據' = '無數據';
+
             const weekStartTime = week.date.getTime();
-            const weekEndTime = weekStartTime + (7 * 24 * 60 * 60 * 1000);
+            const weekEndTime = weekStartTime + (7 * DAY_MS);
 
             // 逐日收集該週使用的比重與單價
             const sgSet = new Set<number>();
             const priceSet = new Set<number>();
 
             for (let i = 0; i < 7; i++) {
-                const dayTime = weekStartTime + i * 24 * 60 * 60 * 1000;
-                const activeSupplyForDay = suppliesHistory.find(s => s.startDate <= dayTime);
+                const dayTime = weekStartTime + i * DAY_MS;
+                const activeSupplyForDay = suppliesHistory.find(s => s.startDate <= dayTime + DAY_MS - 1);
                 if (activeSupplyForDay?.specificGravity !== undefined) {
                     sgSet.add(Math.round(activeSupplyForDay.specificGravity * 10000) / 10000);
                 }
@@ -5337,43 +5648,73 @@ const AnalysisView: React.FC<{
 
             // 取得該週末有效的藥劑合約（用於計算）
             const activeSupply = suppliesHistory
-                .filter(s => s.startDate <= weekEndTime)
+                .filter(s => s.startDate <= weekEndTime - 1)
                 .sort((a, b) => b.startDate - a.startDate)[0];
-            const targetPpm = activeSupply?.targetPpm || 0;
+            let targetPpm = activeSupply?.targetPpm || 0;
             const calcPrice = activeSupply?.price || 0;
+            const calcSg = activeSupply?.specificGravity || 1;
 
-            // Calculate theoretical usage based on tank calculation method
+            let cwsBlowdownM3: number | null = null;
+            let cwsConcentrationCycles: number | null = null;
+
+            const weekStartTaipeiMs = Date.parse(`${getLocalDateKey(week.date.getTime())}T00:00:00+08:00`);
+            const weekEndTaipeiMs = weekStartTaipeiMs + 7 * DAY_MS;
+            const effectiveEndMs = Math.min(weekEndTaipeiMs, todayEndTaipeiMs);
+            const expectedDays = effectiveEndMs > weekStartTaipeiMs ? Math.round((effectiveEndMs - weekStartTaipeiMs) / DAY_MS) : 0;
+
             if (selectedTank.calculationMethod === 'BWS_STEAM') {
-                // Find BWS data for this exact week (must have steamProduction for that week)
-                const weekData = bwsParamsHistory.find(p => {
-                    const pDate = p.date || 0;
-                    return pDate >= weekStartTime && pDate < weekEndTime;
-                });
+                const dailyRowsInWeek = dailyBwsParams.filter(
+                    p => p.date >= weekStartTaipeiMs && p.date < effectiveEndMs && Number(p.steamProduction) > 0
+                );
 
-                // Only calculate if we have steamProduction for this week
-                if (weekData && weekData.steamProduction) {
-                    const steamProduction = weekData.steamProduction;
-                    theoreticalTotal = (steamProduction * targetPpm) / 1000;
-
-                    if (metric === '$' && calcPrice) {
-                        theoreticalTotal = theoreticalTotal * calcPrice;
+                if (expectedDays > 0 && dailyRowsInWeek.length >= expectedDays) {
+                    let sumSteam = 0;
+                    let sumTheoKg = 0;
+                    let sumTheoMetric = 0;
+                    dailyRowsInWeek.forEach(p => {
+                        const daySup = getActiveSupplyAt(p.date + DAY_MS - 1, suppliesHistory);
+                        const dayPpm = Number(daySup?.targetPpm || 0);
+                        const daySg = Number(daySup?.specificGravity || 1);
+                        const dayPrice = Number(daySup?.price || 0);
+                        const dayKg = (p.steamProduction * dayPpm) / 1000;
+                        sumSteam += p.steamProduction;
+                        sumTheoKg += dayKg;
+                        sumTheoMetric += metric === '$' ? dayKg * dayPrice : metric === 'L' ? (daySg > 0 ? dayKg / daySg : dayKg) : dayKg;
+                    });
+                    steamProduction = Math.round(sumSteam * 10) / 10;
+                    baseFlowTons = sumSteam > 0 ? sumSteam : null;
+                    theoreticalKg = sumTheoKg;
+                    theoreticalTotal = sumTheoMetric;
+                    if (sumSteam > 0 && sumTheoKg > 0) {
+                        targetPpm = Math.round(((sumTheoKg * 1000) / sumSteam) * 1000) / 1000;
+                    }
+                    theorySource = 'PI日實測加總';
+                } else {
+                    const weekData = bwsParamsHistory.find(p => {
+                        const pDate = p.date || 0;
+                        return pDate >= weekStartTime && pDate < weekEndTime;
+                    });
+                    if (weekData && weekData.steamProduction) {
+                        steamProduction = weekData.steamProduction;
+                        baseFlowTons = weekData.steamProduction;
+                        theoreticalKg = (weekData.steamProduction * targetPpm) / 1000;
+                        theoreticalTotal = metric === '$'
+                            ? theoreticalKg * calcPrice
+                            : metric === 'L'
+                                ? (calcSg > 0 ? theoreticalKg / calcSg : theoreticalKg)
+                                : theoreticalKg;
+                        theorySource = '當週數據';
                     }
                 }
-                // If no weekData with steamProduction, theoreticalTotal stays 0
             } else if (selectedTank.calculationMethod === 'CWS_BLOWDOWN') {
-                // Find CWS data for this exact week (must have production data for that week)
                 const weekData = cwsParamsHistory.find(p => {
                     const pDate = p.date || 0;
                     return pDate >= weekStartTime && pDate < weekEndTime;
                 });
-
-                // Use weekData if available, otherwise fallback to tank defaults
                 const params = weekData || selectedTank.cwsParams;
 
-                // Only calculate if we have effective parameters
                 if (params && params.circulationRate && params.tempDiff) {
                     const { circulationRate, tempDiff, cwsHardness, makeupHardness, concentrationCycles } = params;
-
                     const days = 7;
                     const E = (circulationRate * tempDiff * 1.8 * 24 * days) / 1000;
 
@@ -5385,16 +5726,19 @@ const AnalysisView: React.FC<{
                     }
 
                     const BW = C > 1 ? E / (C - 1) : 0;
-                    theoreticalTotal = (BW * targetPpm) / 1000;
-
-                    if (metric === '$' && calcPrice) {
-                        theoreticalTotal = theoreticalTotal * calcPrice;
-                    }
+                    baseFlowTons = BW > 0 ? BW : null;
+                    cwsBlowdownM3 = BW > 0 ? Math.round(BW * 10) / 10 : null;
+                    cwsConcentrationCycles = C > 1 ? Math.round(C * 100) / 100 : null;
+                    theoreticalKg = (BW * targetPpm) / 1000;
+                    theoreticalTotal = metric === '$'
+                        ? theoreticalKg * calcPrice
+                        : metric === 'L'
+                            ? (calcSg > 0 ? theoreticalKg / calcSg : theoreticalKg)
+                            : theoreticalKg;
+                    theorySource = weekData ? '當週數據' : '無數據';
                 }
-                // If no weekData with production data, theoreticalTotal stays 0
             }
 
-            // 計算比重與單價結果
             const sgArray = Array.from(sgSet);
             const priceArray = Array.from(priceSet);
 
@@ -5407,8 +5751,6 @@ const AnalysisView: React.FC<{
             let recoveryCoveredDays = 0;
 
             if (showCondensateRecovery) {
-                const weekStartTaipeiMs = Date.parse(`${getLocalDateKey(week.date.getTime())}T00:00:00+08:00`);
-                const weekEndTaipeiMs = weekStartTaipeiMs + 7 * 24 * 60 * 60 * 1000;
                 const weeklyAgg = aggregateWeeklyCondensateRecovery(dailyBwsParams, weekStartTaipeiMs, weekEndTaipeiMs, true);
                 if (weeklyAgg && weeklyAgg.condensateRecoveryRate !== null) {
                     condensateRecoveryRate = weeklyAgg.condensateRecoveryRate;
@@ -5432,27 +5774,44 @@ const AnalysisView: React.FC<{
                 }
             }
 
+            const deviationRaw = theoreticalKg > 0 ? ((week.usageKg - theoreticalKg) / theoreticalKg) * 100 : null;
+            const wqWeekly = computeWeeklyWaterQualityAverage(dailyWqMap, getLocalDateKey(week.date.getTime()), 7);
+
             return {
                 dateStr: week.dateStr,
                 date: week.date,
                 actual: week.usage,
+                actualKg: week.usageKg,
                 theoretical: theoreticalTotal,
-                deviation: theoreticalTotal > 0 ? ((week.usage - theoreticalTotal) / theoreticalTotal) * 100 : 0,
+                theoreticalKg,
+                steamProduction,
+                targetPpm,
+                theorySource,
+                actualPpm: calculateActualDosingPpm(week.usageKg, baseFlowTons),
+                targetPpmForChart: theoreticalKg > 0 && targetPpm > 0 ? targetPpm : null,
+                deviationVal: deviationRaw !== null ? Math.round(deviationRaw * 10) / 10 : null,
+                deviation: deviationRaw !== null ? deviationRaw : 0,
                 specificGravity: sgArray.length === 1 ? sgArray[0] : undefined,
                 specificGravityMultiple: sgArray.length > 1 ? sgArray : undefined,
                 price: priceArray.length === 1 ? priceArray[0] : undefined,
                 priceMultiple: priceArray.length > 1 ? priceArray : undefined,
                 condensateRecoveryRate,
+                condensateLossRate: calculateCondensateLossRate(condensateRecoveryRate),
                 feedwaterFlow,
                 sprayWaterFlow,
                 makeupWaterFlow,
                 blowdownFlow,
-                recoveryCoveredDays
+                recoveryCoveredDays,
+                cwsBlowdownM3,
+                cwsConcentrationCycles,
+                waterQualityValue: wqWeekly.value,
+                waterQualityDays: wqWeekly.sampleDays
             };
         }).sort((a, b) => a.date.getTime() - b.date.getTime());
-    }, [weeklyData, selectedTank, bwsParamsHistory, cwsParamsHistory, suppliesHistory, metric, dailyBwsParams, showCondensateRecovery]);
+    }, [weeklyData, selectedTank, bwsParamsHistory, cwsParamsHistory, suppliesHistory, metric, dailyBwsParams, showCondensateRecovery, dailyWqMap]);
 
     const hasCalculation = selectedTank && selectedTank.calculationMethod && selectedTank.calculationMethod !== 'NONE';
+    const effectiveChartViewMode: 'total' | 'ppm' | 'deviation' = hasCalculation ? chartViewMode : 'total';
 
     // 5. Daily Comparison Data (Actual vs Theoretical using direct Daily PI params only)
     const dailyComparisonData = useMemo(() => {
@@ -5490,16 +5849,19 @@ const AnalysisView: React.FC<{
                 let circulationRate: number | null = null;
                 let tempDiff: number | null = null;
                 let concentrationCycles: number | null = null;
+                let baseFlowTons: number | null = null;
                 let condensateRecoveryRate: number | null = null;
                 let feedwaterFlow: number | null = null;
                 let sprayWaterFlow: number | null = null;
                 let makeupWaterFlow: number | null = null;
                 let blowdownFlow: number | null = null;
+                let cwsBlowdownM3: number | null = null;
 
                 if (selectedTank.calculationMethod === 'BWS_STEAM') {
                     const dailyBws = dailyBwsMap.get(dateKey);
                     if (dailyBws) {
                         steamProduction = dailyBws.steamProduction;
+                        baseFlowTons = steamProduction > 0 ? steamProduction : null;
                         if (targetPpm > 0) {
                             theoreticalKg = (steamProduction * targetPpm) / 1000;
                         }
@@ -5512,13 +5874,17 @@ const AnalysisView: React.FC<{
                             blowdownFlow = dailyBws.blowdownFlow ?? null;
                         }
                     }
-                } else if (selectedTank.calculationMethod === 'CWS_BLOWDOWN' && targetPpm > 0) {
+                } else if (selectedTank.calculationMethod === 'CWS_BLOWDOWN') {
                     const dailyCws = dailyCwsMap.get(dateKey);
                     if (dailyCws) {
                         circulationRate = dailyCws.circulationRate;
                         tempDiff = dailyCws.tempDiff;
                         concentrationCycles = dailyCws.concentrationCycles;
-                        theoreticalKg = calculateCWSUsage(circulationRate, tempDiff, concentrationCycles, targetPpm, 1);
+                        cwsBlowdownM3 = calculateCwsBlowdownM3(circulationRate, tempDiff, concentrationCycles, 1);
+                        baseFlowTons = cwsBlowdownM3;
+                        if (targetPpm > 0) {
+                            theoreticalKg = calculateCWSUsage(circulationRate, tempDiff, concentrationCycles, targetPpm, 1);
+                        }
                         sourceLabel = dailyCws.isFinal ? 'PI日實測' : 'PI滾動24h';
                     }
                 }
@@ -5533,22 +5899,35 @@ const AnalysisView: React.FC<{
                 }
 
                 const actual = day.usage;
-                const deviation = theoretical !== null && theoretical > 0 ? ((actual - theoretical) / theoretical) * 100 : 0;
+                const actualKg = day.usageKg;
+                const deviationRaw = theoreticalKg !== null && theoreticalKg > 0 ? ((actualKg - theoreticalKg) / theoreticalKg) * 100 : null;
+                const wqEntry = dailyWqMap.get(dateKey);
+                const dayEvents = dailyEventMap.get(dateKey) || [];
 
                 return {
                     date: day.date,
                     dateKey,
                     dateStr: `${day.date.getMonth() + 1}/${day.date.getDate()}`,
                     actual,
+                    actualKg,
                     theoretical,
-                    deviation,
+                    theoreticalKg,
+                    actualPpm: calculateActualDosingPpm(actualKg, baseFlowTons),
+                    targetPpmForChart: theoreticalKg !== null && targetPpm > 0 ? targetPpm : null,
+                    deviationVal: deviationRaw !== null ? Math.round(deviationRaw * 10) / 10 : null,
+                    deviation: deviationRaw !== null ? deviationRaw : 0,
                     targetPpm,
                     sourceLabel,
                     steamProduction,
                     circulationRate,
                     tempDiff,
                     concentrationCycles,
+                    cwsBlowdownM3,
+                    waterQualityValue: wqEntry?.value ?? null,
+                    waterQualitySamples: wqEntry?.sampleCount ?? 0,
+                    events: dayEvents,
                     condensateRecoveryRate,
+                    condensateLossRate: calculateCondensateLossRate(condensateRecoveryRate),
                     feedwaterFlow,
                     sprayWaterFlow,
                     makeupWaterFlow,
@@ -5556,7 +5935,12 @@ const AnalysisView: React.FC<{
                 };
             })
             .sort((a, b) => a.date.getTime() - b.date.getTime());
-    }, [dailyData, selectedTank, metric, suppliesHistory, dailyBwsParams, dailyCwsParams, appliedDateRange, showCondensateRecovery]);
+    }, [dailyData, selectedTank, metric, suppliesHistory, dailyBwsParams, dailyCwsParams, appliedDateRange, showCondensateRecovery, dailyWqMap, dailyEventMap]);
+
+    const selectedEventDay = useMemo(() => {
+        if (!selectedEventDayKey) return null;
+        return dailyComparisonData.find(d => d.dateKey === selectedEventDayKey) || null;
+    }, [selectedEventDayKey, dailyComparisonData]);
 
     // Theoretical Calculation Details Card
     const TheoreticalUsageCard: React.FC<{ tank: Tank, weeklyData: any[] }> = ({ tank, weeklyData }) => {
@@ -5821,7 +6205,7 @@ const AnalysisView: React.FC<{
                 </Card>
             );
         } else if (tank.calculationMethod === 'BWS_STEAM') {
-            if (weeklyData.length === 0) return null;
+            if (weeklyComparisonData.length === 0) return null;
 
             return (
                 <Card title="理論用量計算展示 (每週基礎)" className="mt-6 border-l-4 border-l-orange-500">
@@ -5832,9 +6216,13 @@ const AnalysisView: React.FC<{
                                     <th className="p-2 font-semibold text-slate-800">週次</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">蒸汽總產量 (ton)</th>
                                     {showCondensateRecovery && (
-                                        <th className="p-2 font-semibold text-slate-800 text-right">冷凝水回收率 (%)</th>
+                                        <>
+                                            <th className="p-2 font-semibold text-slate-800 text-right">冷凝水回收率 (%)</th>
+                                            <th className="p-2 font-semibold text-slate-800 text-right">未回收率 (%)</th>
+                                        </>
                                     )}
                                     <th className="p-2 font-semibold text-slate-800 text-right">目標濃度 (ppm)</th>
+                                    <th className="p-2 font-semibold text-slate-800 text-right">實際單耗 (ppm)</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">理論用量 ({metric})</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">實際用量 ({metric})</th>
                                     <th className="p-2 font-semibold text-slate-800 text-right">差異 %</th>
@@ -5842,57 +6230,45 @@ const AnalysisView: React.FC<{
                                 </tr>
                             </thead>
                             <tbody>
-                                {weeklyData.map((week, idx) => {
-                                    const params = getParamsForWeek(week.date) as BWSParameterRecord | undefined;
-                                    const steamProduction = params?.steamProduction || tank.bwsParams?.steamProduction || 0;
-
-                                    // Get Target PPM from Contract
-                                    const activeSupply = getActiveSupplyForDate(week.date);
-                                    const targetPpm = activeSupply?.targetPpm || 0;
-                                    const price = activeSupply?.price || 0;
-
-                                    let theoryUsage = (steamProduction * targetPpm) / 1000;
-                                    if (metric === '$') {
-                                        theoryUsage = theoryUsage * price;
-                                    }
-
-                                    const weekStartTime = week.date.getTime();
-                                    const weekEndTime = weekStartTime + (7 * 24 * 60 * 60 * 1000);
-                                    const hasWeekData = params && params.date && params.date >= weekStartTime && params.date < weekEndTime;
-
-                                    const actualUsage = week.usage;
-                                    const diffPercent = theoryUsage > 0 ? ((actualUsage - theoryUsage) / theoryUsage * 100) : 0;
-                                    const diffColor = Math.abs(diffPercent) > 20 ? 'text-red-600' :
-                                        Math.abs(diffPercent) > 10 ? 'text-yellow-600' : 'text-green-600';
-                                    const weekComp = showCondensateRecovery
-                                        ? weeklyComparisonData.find(w => w.dateStr === week.dateStr)
-                                        : undefined;
+                                {weeklyComparisonData.map((w, idx) => {
+                                    const diffColor = Math.abs(w.deviation) > 20 ? 'text-red-600' :
+                                        Math.abs(w.deviation) > 10 ? 'text-yellow-600' : 'text-green-600';
+                                    const badgeClass =
+                                        w.theorySource === 'PI日實測加總' ? 'bg-emerald-100 text-emerald-700' :
+                                            w.theorySource === '當週數據' ? 'bg-green-100 text-green-700' :
+                                                'bg-gray-100 text-gray-700';
 
                                     return (
-                                        <tr key={idx} className={idx % 2 === 0 ? 'bg-slate-50' : 'bg-white'}>
-                                            <td className="p-2 font-medium text-slate-700">{week.dateStr}</td>
-                                            <td className="p-2 text-right font-mono text-orange-700">{steamProduction.toFixed(1)}</td>
+                                        <tr key={w.dateStr} className={idx % 2 === 0 ? 'bg-slate-50' : 'bg-white'}>
+                                            <td className="p-2 font-medium text-slate-700">{w.dateStr}</td>
+                                            <td className="p-2 text-right font-mono text-orange-700">
+                                                {w.steamProduction !== null ? w.steamProduction.toFixed(1) : '-'}
+                                            </td>
                                             {showCondensateRecovery && (
-                                                <td className="p-2 text-right font-mono font-semibold text-emerald-700">
-                                                    {weekComp?.condensateRecoveryRate !== null && weekComp?.condensateRecoveryRate !== undefined
-                                                        ? `${weekComp.condensateRecoveryRate.toFixed(1)}%`
-                                                        : '-'}
-                                                </td>
+                                                <>
+                                                    <td className="p-2 text-right font-mono font-semibold text-emerald-700">
+                                                        {w.condensateRecoveryRate !== null && w.condensateRecoveryRate !== undefined
+                                                            ? `${w.condensateRecoveryRate.toFixed(1)}%`
+                                                            : '-'}
+                                                    </td>
+                                                    <td className="p-2 text-right font-mono font-semibold text-amber-700">
+                                                        {w.condensateLossRate !== null && w.condensateLossRate !== undefined
+                                                            ? `${w.condensateLossRate.toFixed(1)}%`
+                                                            : '-'}
+                                                    </td>
+                                                </>
                                             )}
-                                            <td className="p-2 text-right font-mono">{targetPpm.toFixed(1)}</td>
-                                            <td className="p-2 text-right font-bold text-red-600">{theoryUsage.toFixed(1)}</td>
-                                            <td className="p-2 text-right font-bold text-blue-600">{actualUsage.toFixed(1)}</td>
+                                            <td className="p-2 text-right font-mono">{w.targetPpm.toFixed(2)}</td>
+                                            <td className="p-2 text-right font-mono text-indigo-700 font-semibold">
+                                                {w.actualPpm !== null && w.actualPpm !== undefined ? w.actualPpm.toFixed(3) : '-'}
+                                            </td>
+                                            <td className="p-2 text-right font-bold text-red-600">{w.theoretical.toFixed(1)}</td>
+                                            <td className="p-2 text-right font-bold text-blue-600">{w.actual.toFixed(1)}</td>
                                             <td className={`p-2 text-right font-bold ${diffColor}`}>
-                                                {diffPercent > 0 ? '+' : ''}{diffPercent.toFixed(1)}%
+                                                {w.theoretical > 0 ? `${w.deviation > 0 ? '+' : ''}${w.deviation.toFixed(1)}%` : '-'}
                                             </td>
                                             <td className="p-2 text-center">
-                                                {hasWeekData ? (
-                                                    <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">當週數據</span>
-                                                ) : params ? (
-                                                    <span className="text-xs bg-yellow-100 text-yellow-700 px-2 py-1 rounded">歷史數據</span>
-                                                ) : (
-                                                    <span className="text-xs bg-gray-100 text-gray-700 px-2 py-1 rounded">預設值</span>
-                                                )}
+                                                <span className={`text-xs px-2 py-1 rounded ${badgeClass}`}>{w.theorySource}</span>
                                             </td>
                                         </tr>
                                     );
@@ -5946,6 +6322,238 @@ const AnalysisView: React.FC<{
         });
         return groups;
     }, [sortedTanks]);
+
+    const renderRightAxisControls = () => (
+        <>
+            {showCondensateRecovery && (
+                <>
+                    <div className="inline-flex rounded border border-slate-300 bg-slate-100 p-0.5">
+                        <button
+                            type="button"
+                            onClick={() => saveRightAxisConfig({ ...rightAxisConfig, mode: 'recovery' })}
+                            className={`px-2 py-0.5 rounded transition-colors ${rightAxisConfig.mode === 'recovery' ? 'bg-emerald-600 text-white font-medium' : 'text-slate-600 hover:bg-slate-200'}`}
+                        >
+                            回收率 %
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => saveRightAxisConfig({ ...rightAxisConfig, mode: 'loss' })}
+                            title="未回收損失率 = 100% - 回收率；折線上升代表流失增加，與超標呈同向正相關"
+                            className={`px-2 py-0.5 rounded transition-colors ${rightAxisConfig.mode === 'loss' ? 'bg-amber-600 text-white font-medium' : 'text-slate-600 hover:bg-slate-200'}`}
+                        >
+                            未回收率 %
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => saveRightAxisConfig({ ...rightAxisConfig, mode: 'wq' })}
+                            title="於右軸疊加人工水質化驗指標（可切換取樣點與化驗項目）"
+                            className={`px-2 py-0.5 rounded transition-colors ${rightAxisConfig.mode === 'wq' ? 'bg-purple-600 text-white font-medium' : 'text-slate-600 hover:bg-slate-200'}`}
+                        >
+                            水質指標
+                        </button>
+                    </div>
+                    {isBoilerRecoveryOverlay && (
+                        <button
+                            type="button"
+                            onClick={openRecoveryScaleModal}
+                            className={`px-2.5 py-1 rounded border transition-colors ${isLossMode
+                                ? 'border-amber-500/50 bg-amber-950/40 text-amber-300 hover:bg-amber-900/50'
+                                : 'border-emerald-500/50 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50'}`}
+                            title="調整右側 Y 軸顯示範圍與方向（日／週圖表同步套用）"
+                        >
+                            {recoveryScaleButtonLabel}
+                        </button>
+                    )}
+                </>
+            )}
+            {isCoolingTank && (
+                <div className="inline-flex rounded border border-slate-300 bg-slate-100 p-0.5">
+                    {isCwsBlowdownTank && (
+                        <>
+                            <button
+                                type="button"
+                                onClick={() => setCwsRightAxisMode('blowdown')}
+                                className={`px-2 py-0.5 rounded transition-colors ${effectiveCwsRightMode === 'blowdown' ? 'bg-amber-600 text-white font-medium' : 'text-slate-600 hover:bg-slate-200'}`}
+                            >
+                                排污量 m³
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setCwsRightAxisMode('cycles')}
+                                className={`px-2 py-0.5 rounded transition-colors ${effectiveCwsRightMode === 'cycles' ? 'bg-emerald-600 text-white font-medium' : 'text-slate-600 hover:bg-slate-200'}`}
+                            >
+                                濃縮倍數 N
+                            </button>
+                        </>
+                    )}
+                    <button
+                        type="button"
+                        onClick={() => setCwsRightAxisMode('wq')}
+                        className={`px-2 py-0.5 rounded transition-colors ${effectiveCwsRightMode === 'wq' ? 'bg-purple-600 text-white font-medium' : 'text-slate-600 hover:bg-slate-200'}`}
+                    >
+                        水質指標
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setCwsRightAxisMode('none')}
+                        className={`px-2 py-0.5 rounded transition-colors ${effectiveCwsRightMode === 'none' ? 'bg-slate-600 text-white font-medium' : 'text-slate-600 hover:bg-slate-200'}`}
+                    >
+                        關閉
+                    </button>
+                </div>
+            )}
+            {isWqOverlayActive && wqContext.pointGroups.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                    <select
+                        value={selectedWqPointGroup}
+                        onChange={e => setSelectedWqPointGroup(e.target.value)}
+                        className="px-2 py-1 rounded border border-purple-500/40 bg-slate-900 text-purple-200 text-xs focus:outline-none focus:border-purple-400"
+                        title="選擇水質取樣點"
+                    >
+                        {wqContext.pointGroups.map((g: any) => (
+                            <option key={g.id} value={g.id}>{g.label}</option>
+                        ))}
+                    </select>
+                    <select
+                        value={selectedWqMetric}
+                        onChange={e => setSelectedWqMetric(e.target.value)}
+                        className="px-2 py-1 rounded border border-purple-500/40 bg-slate-900 text-purple-200 text-xs max-w-48 focus:outline-none focus:border-purple-400"
+                        title="選擇水質指標"
+                    >
+                        {availableWqMetrics.length === 0 ? (
+                            <option value="">無水質指標</option>
+                        ) : (
+                            availableWqMetrics.map(m => (
+                                <option key={m.key} value={m.key}>{m.label}</option>
+                            ))
+                        )}
+                    </select>
+                </div>
+            )}
+        </>
+    );
+
+    const renderRightYAxis = () => {
+        if (!hasRightAxis) return null;
+        if (isBoilerRecoveryOverlay) {
+            return (
+                <YAxis
+                    yAxisId="right"
+                    orientation="right"
+                    unit="%"
+                    domain={rightYAxisDomain}
+                    reversed={rightYAxisReversed}
+                    allowDataOverflow={hasCustomRecoveryScale}
+                    tick={{ fill: isLossMode ? '#f59e0b' : '#10b981', fontSize: 11 }}
+                />
+            );
+        }
+        if (isCwsBlowdownOverlay) {
+            return (
+                <YAxis
+                    yAxisId="right"
+                    orientation="right"
+                    unit=" m³"
+                    domain={[0, 'auto']}
+                    tick={{ fill: '#f59e0b', fontSize: 11 }}
+                />
+            );
+        }
+        if (isCwsCyclesOverlay) {
+            return (
+                <YAxis
+                    yAxisId="right"
+                    orientation="right"
+                    domain={['auto', 'auto']}
+                    tick={{ fill: '#10b981', fontSize: 11 }}
+                />
+            );
+        }
+        if (isWqOverlayActive) {
+            return (
+                <YAxis
+                    yAxisId="right"
+                    orientation="right"
+                    domain={['auto', 'auto']}
+                    tick={{ fill: '#c084fc', fontSize: 11 }}
+                />
+            );
+        }
+        return null;
+    };
+
+    const renderRightLine = (cyclesDataKey: 'concentrationCycles' | 'cwsConcentrationCycles') => {
+        if (!hasRightAxis) return null;
+        if (isBoilerRecoveryOverlay) {
+            return (
+                <Line
+                    yAxisId="right"
+                    type="monotone"
+                    dataKey={isLossMode ? 'condensateLossRate' : 'condensateRecoveryRate'}
+                    stroke={isLossMode ? '#f59e0b' : '#10b981'}
+                    strokeWidth={2}
+                    dot={{ r: 3, fill: isLossMode ? '#f59e0b' : '#10b981' }}
+                    activeDot={{ r: 5 }}
+                    connectNulls={false}
+                    isAnimationActive={false}
+                    name={isLossMode
+                        ? '未回收損失率 (%)'
+                        : rightYAxisReversed
+                            ? '冷凝水回收率 (%, 反轉)'
+                            : '冷凝水回收率 (%)'}
+                />
+            );
+        }
+        if (isCwsBlowdownOverlay) {
+            return (
+                <Line
+                    yAxisId="right"
+                    type="monotone"
+                    dataKey="cwsBlowdownM3"
+                    stroke="#f59e0b"
+                    strokeWidth={2}
+                    dot={{ r: 3, fill: '#f59e0b' }}
+                    activeDot={{ r: 5 }}
+                    connectNulls={false}
+                    isAnimationActive={false}
+                    name="排污量 (m³)"
+                />
+            );
+        }
+        if (isCwsCyclesOverlay) {
+            return (
+                <Line
+                    yAxisId="right"
+                    type="monotone"
+                    dataKey={cyclesDataKey}
+                    stroke="#10b981"
+                    strokeWidth={2}
+                    dot={{ r: 3, fill: '#10b981' }}
+                    activeDot={{ r: 5 }}
+                    connectNulls={false}
+                    isAnimationActive={false}
+                    name="濃縮倍數 (N)"
+                />
+            );
+        }
+        if (isWqOverlayActive && selectedWqMetric) {
+            return (
+                <Line
+                    yAxisId="right"
+                    type="monotone"
+                    dataKey="waterQualityValue"
+                    stroke="#a855f7"
+                    strokeWidth={2}
+                    dot={{ r: 3.5, fill: '#a855f7' }}
+                    activeDot={{ r: 5 }}
+                    connectNulls={true}
+                    isAnimationActive={false}
+                    name={selectedWqMetricLabel || '水質指標'}
+                />
+            );
+        }
+        return null;
+    };
 
     return (
         <div className="space-y-6">
@@ -6022,48 +6630,99 @@ const AnalysisView: React.FC<{
                         </Button>
                     </div>
 
-                    <div className="ml-auto flex gap-1">
-                        <div className="bg-slate-100 border rounded-lg p-0.5 flex">
-                            <button onClick={() => setMetric('KG')} className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${metric === 'KG' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'}`}>KG</button>
-                            <button onClick={() => setMetric('L')} className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${metric === 'L' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'}`}>L</button>
-                            <button onClick={() => setMetric('$')} className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${metric === '$' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'}`}>$</button>
+                    <div className="ml-auto flex flex-wrap items-center gap-2">
+                        {hasCalculation && (
+                            <div className="bg-slate-100 border rounded-lg p-0.5 flex" title="切換日／週圖表左軸分析指標">
+                                <button
+                                    type="button"
+                                    onClick={() => setChartViewMode('total')}
+                                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${chartViewMode === 'total' ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-200'}`}
+                                >
+                                    總用量
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setChartViewMode('ppm')}
+                                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${chartViewMode === 'ppm' ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-200'}`}
+                                >
+                                    單耗 ppm
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setChartViewMode('deviation')}
+                                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${chartViewMode === 'deviation' ? 'bg-indigo-600 text-white' : 'text-slate-600 hover:bg-slate-200'}`}
+                                >
+                                    超標率 %
+                                </button>
+                            </div>
+                        )}
+                        <div className="bg-slate-100 border rounded-lg p-0.5 flex" title={effectiveChartViewMode !== 'total' ? '單耗與超標率固定以重量基準計算' : undefined}>
+                            <button
+                                type="button"
+                                disabled={effectiveChartViewMode !== 'total'}
+                                onClick={() => setMetric('KG')}
+                                className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${metric === 'KG' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'} ${effectiveChartViewMode !== 'total' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                                KG
+                            </button>
+                            <button
+                                type="button"
+                                disabled={effectiveChartViewMode !== 'total'}
+                                onClick={() => setMetric('L')}
+                                className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${metric === 'L' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'} ${effectiveChartViewMode !== 'total' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                                L
+                            </button>
+                            <button
+                                type="button"
+                                disabled={effectiveChartViewMode !== 'total'}
+                                onClick={() => setMetric('$')}
+                                className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${metric === '$' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-200'} ${effectiveChartViewMode !== 'total' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                                $
+                            </button>
                         </div>
                     </div>
                 </div>
             </div>
 
             {/* Daily Comparison Chart - Full Width */}
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                <div className="px-6 py-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-2 bg-slate-50/50">
+            <div className="bg-white chart-card rounded-xl shadow-sm border border-slate-200">
+                <div className="px-6 py-4 border-b border-slate-100 rounded-t-xl flex flex-wrap justify-between items-center gap-2 bg-slate-50/50">
                     <h3 className="font-semibold text-slate-800 flex items-center gap-2">
-                        {hasCalculation ? `日用量 vs 理論值 (${metric})` : `日用量趨勢 (${metric})`}
+                        {effectiveChartViewMode === 'ppm'
+                            ? '日實際單耗 vs 目標濃度 (ppm)'
+                            : effectiveChartViewMode === 'deviation'
+                                ? '日超標差異率 (%)'
+                                : hasCalculation
+                                    ? `日用量 vs 理論值 (${metric})`
+                                    : `日用量趨勢 (${metric})`}
                         <button onClick={() => setHelpTopic('daily')} className="text-slate-400 hover:text-brand-500 transition-colors">
                             <Icons.Help className="w-4 h-4" />
                         </button>
                     </h3>
-                    {hasCalculation && (
-                        <div className="flex items-center gap-2 text-xs">
-                            {dailyRangeSyncing && (
-                                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-sky-100 text-sky-700 border border-sky-200">
-                                    <Icons.Activity className="w-3.5 h-3.5 animate-spin" />
-                                    正在向 PI 同步區間每日數據...
-                                </span>
-                            )}
-                            {!dailyRangeSyncing && dailyRangeSyncError && (
-                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
-                                    {dailyRangeSyncError}
-                                </span>
-                            )}
-                            {showCondensateRecovery && (
-                                <button
-                                    type="button"
-                                    onClick={openRecoveryScaleModal}
-                                    className="px-2.5 py-1 rounded border border-emerald-500/50 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50 transition-colors"
-                                    title="調整冷凝水回收率右側 Y 軸顯示範圍（日／週圖表同步套用）"
-                                >
-                                    {recoveryScaleButtonLabel}
-                                </button>
-                            )}
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                        {hasCalculation && dailyRangeSyncing && (
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-sky-100 text-sky-700 border border-sky-200">
+                                <Icons.Activity className="w-3.5 h-3.5 animate-spin" />
+                                正在向 PI 同步區間每日數據...
+                            </span>
+                        )}
+                        {hasCalculation && !dailyRangeSyncing && dailyRangeSyncError && (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
+                                {dailyRangeSyncError}
+                            </span>
+                        )}
+                        {renderRightAxisControls()}
+                        <button
+                            type="button"
+                            onClick={() => setShowEventMarkers(v => !v)}
+                            className={`px-2.5 py-1 rounded border transition-colors ${showEventMarkers ? 'border-purple-500/50 bg-purple-950/40 text-purple-200' : 'border-slate-300 bg-white text-slate-600 hover:bg-slate-100'}`}
+                            title="於圖表 X 軸與提示中標註補藥、異常備註、重要紀事與比重／合約調整"
+                        >
+                            {showEventMarkers ? '事件標記: 開' : '事件標記: 關'}
+                        </button>
+                        {hasCalculation && (
                             <button
                                 type="button"
                                 disabled={dailyRangeSyncing}
@@ -6075,31 +6734,87 @@ const AnalysisView: React.FC<{
                             >
                                 同步每日PI數據
                             </button>
-                        </div>
-                    )}
+                        )}
+                    </div>
                 </div>
-                <div className="px-6 pt-4 pb-2" style={{ height: '320px' }}>
+                <div className="px-6 pt-4 pb-2" style={{ height: '330px' }}>
                     {dailyComparisonData.length > 0 ? (
-                        <ResponsiveContainer width="100%" height="100%" minHeight={260}>
+                        <ResponsiveContainer width="100%" height="100%" minHeight={270}>
                             <ComposedChart
-                                key={`daily-${selectedTankId}-${appliedDateRange.start}-${appliedDateRange.end}-${metric}-${dailyBwsParams.length}-${dailyCwsParams.length}-${recoveryYScale.min ?? 'auto'}-${recoveryYScale.max ?? 'auto'}`}
+                                key={`daily-${selectedTankId}-${appliedDateRange.start}-${appliedDateRange.end}-${metric}-${effectiveChartViewMode}-${rightAxisConfig.mode}-${effectiveCwsRightMode}-${selectedWqPointGroup}-${selectedWqMetric}-${showEventMarkers}-${activeRightMin ?? 'auto'}-${activeRightMax ?? 'auto'}-${rightYAxisReversed}-${dailyBwsParams.length}-${dailyCwsParams.length}`}
                                 data={dailyComparisonData}
-                                margin={{ top: 20, right: 30, left: 20, bottom: 20 }}
+                                margin={{ top: 20, right: 30, left: 20, bottom: showEventMarkers ? 24 : 16 }}
+                                className="cursor-pointer"
+                                onClick={(state: any) => {
+                                    const rawIdx = state?.activeTooltipIndex ?? state?.activeIndex;
+                                    const idx = rawIdx !== null && rawIdx !== undefined && rawIdx !== '' ? Number(rawIdx) : NaN;
+                                    if (Number.isInteger(idx) && idx >= 0 && idx < dailyComparisonData.length) {
+                                        setSelectedEventDayKey(dailyComparisonData[idx].dateKey);
+                                        return;
+                                    }
+                                    if (state?.activeLabel !== undefined && state?.activeLabel !== null) {
+                                        const matched = dailyComparisonData.find(item => item.dateStr === String(state.activeLabel));
+                                        if (matched?.dateKey) {
+                                            setSelectedEventDayKey(matched.dateKey);
+                                            return;
+                                        }
+                                    }
+                                    const fallbackKey = state?.activePayload?.[0]?.payload?.dateKey;
+                                    if (fallbackKey) {
+                                        setSelectedEventDayKey(fallbackKey);
+                                    }
+                                }}
                             >
                                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#2d3b55" />
-                                <XAxis dataKey="dateStr" tick={{ fill: '#cbd5e1', fontSize: 11 }} />
-                                <YAxis yAxisId="left" tick={{ fill: '#cbd5e1', fontSize: 11 }} />
-                                {showCondensateRecovery && (
-                                    <YAxis
-                                        yAxisId="right"
-                                        orientation="right"
-                                        unit="%"
-                                        domain={recoveryYAxisDomain}
-                                        allowDataOverflow={hasCustomRecoveryScale}
-                                        tick={{ fill: '#10b981', fontSize: 11 }}
+                                <XAxis
+                                    dataKey="dateStr"
+                                    height={showEventMarkers ? 42 : 28}
+                                    tick={(props: any) => {
+                                        const { x, y, payload } = props;
+                                        const row = dailyComparisonData.find(item => item.dateStr === payload.value);
+                                        const icons = showEventMarkers && row?.events?.length
+                                            ? Array.from(new Set(row.events.map((ev: any) => ev.icon))).slice(0, 3).join('')
+                                            : '';
+                                        return (
+                                            <g
+                                                transform={`translate(${x},${y})`}
+                                                style={{ cursor: row?.dateKey ? 'pointer' : 'default' }}
+                                                onClick={() => {
+                                                    if (row?.dateKey) setSelectedEventDayKey(row.dateKey);
+                                                }}
+                                            >
+                                                <text x={0} y={0} dy={12} textAnchor="middle" fill="#cbd5e1" fontSize={11}>
+                                                    {payload.value}
+                                                </text>
+                                                {icons && (
+                                                    <text x={0} y={16} dy={12} textAnchor="middle" fontSize={11}>
+                                                        {icons}
+                                                    </text>
+                                                )}
+                                            </g>
+                                        );
+                                    }}
+                                />
+                                <YAxis
+                                    yAxisId="left"
+                                    unit={effectiveChartViewMode === 'deviation' ? '%' : undefined}
+                                    tickFormatter={effectiveChartViewMode === 'ppm' ? (v: number) => Number(v).toFixed(2) : undefined}
+                                    tick={{ fill: '#cbd5e1', fontSize: 11 }}
+                                />
+                                {renderRightYAxis()}
+                                {showEventMarkers && dailyComparisonData.filter(d => d.events && d.events.length > 0).map(d => (
+                                    <ReferenceLine
+                                        key={`ev-ref-${d.dateKey}`}
+                                        yAxisId="left"
+                                        x={d.dateStr}
+                                        stroke="#a855f7"
+                                        strokeDasharray="3 3"
+                                        strokeOpacity={0.4}
                                     />
-                                )}
+                                ))}
                                 <Tooltip
+                                    allowEscapeViewBox={{ x: false, y: true }}
+                                    wrapperStyle={{ zIndex: 60, pointerEvents: 'none' }}
                                     content={({ active, payload }: any) => {
                                         if (!active || !payload?.length) return null;
                                         const d = payload[0]?.payload;
@@ -6107,49 +6822,112 @@ const AnalysisView: React.FC<{
                                         const totalFw = d.feedwaterFlow !== null && d.feedwaterFlow !== undefined
                                             ? Number(d.feedwaterFlow) + Number(d.sprayWaterFlow || 0)
                                             : null;
+                                        const tooltipEv = showEventMarkers && d.events?.length
+                                            ? formatTooltipEvents(d.events, 2, 42)
+                                            : null;
                                         return (
-                                            <div className="bg-slate-900 border border-slate-700 rounded-lg p-3 text-xs text-slate-100 shadow-lg space-y-1 min-w-48">
-                                                <div className="font-bold text-slate-200 border-b border-slate-700 pb-1 flex justify-between gap-3">
+                                            <div className="chart-tooltip-card rounded-lg p-2.5 text-xs space-y-1 min-w-52 max-w-80">
+                                                <div className="font-bold chart-tooltip-title border-b chart-tooltip-divider pb-1 flex justify-between gap-3">
                                                     <span>{d.dateKey}</span>
-                                                    <span className="text-slate-400 font-normal">{d.sourceLabel}</span>
+                                                    <span className="chart-tooltip-muted font-normal">{d.sourceLabel}</span>
                                                 </div>
                                                 <div className="flex justify-between gap-4">
                                                     <span className="text-blue-400">實際用量</span>
-                                                    <span className="font-mono font-bold">{Number(d.actual).toFixed(1)} {metric}</span>
+                                                    <span className="font-mono font-bold chart-tooltip-title">{Number(d.actual).toFixed(1)} {metric}</span>
                                                 </div>
                                                 {hasCalculation && (
                                                     <>
                                                         <div className="flex justify-between gap-4">
                                                             <span className="text-sky-400">理論預估</span>
-                                                            <span className="font-mono font-bold">
+                                                            <span className="font-mono font-bold chart-tooltip-title">
                                                                 {d.theoretical !== null ? `${Number(d.theoretical).toFixed(1)} ${metric}` : '-'}
                                                             </span>
                                                         </div>
                                                         {d.theoretical !== null && d.theoretical > 0 && (
                                                             <div className="flex justify-between gap-4">
-                                                                <span className="text-slate-400">差異 %</span>
+                                                                <span className="chart-tooltip-muted">差異 %</span>
                                                                 <span className={`font-mono font-bold ${devColor}`}>
                                                                     {d.deviation > 0 ? '+' : ''}{Number(d.deviation).toFixed(1)}%
                                                                 </span>
                                                             </div>
                                                         )}
+                                                        <div className="flex justify-between gap-4">
+                                                            <span className="text-indigo-300">實際單耗</span>
+                                                            <span className="font-mono font-bold text-indigo-200">
+                                                                {d.actualPpm !== null && d.actualPpm !== undefined
+                                                                    ? `${Number(d.actualPpm).toFixed(3)} ppm`
+                                                                    : '-'}
+                                                                {d.targetPpm > 0 ? ` (目標 ${Number(d.targetPpm).toFixed(2)})` : ''}
+                                                            </span>
+                                                        </div>
                                                     </>
                                                 )}
                                                 {showCondensateRecovery && (
-                                                    <div className="pt-1 mt-1 border-t border-slate-700/80 space-y-0.5">
-                                                        <div className="flex justify-between gap-4">
-                                                            <span className="text-emerald-400">冷凝水回收率</span>
-                                                            <span className="font-mono font-bold text-emerald-300">
-                                                                {d.condensateRecoveryRate !== null && d.condensateRecoveryRate !== undefined
-                                                                    ? `${Number(d.condensateRecoveryRate).toFixed(1)}%`
-                                                                    : '-'}
+                                                    <div className="pt-1 mt-1 border-t chart-tooltip-divider space-y-0.5">
+                                                        <div className="flex justify-between gap-3">
+                                                            <span className="text-emerald-400">回收率 / 未回收損失</span>
+                                                            <span className="font-mono font-bold">
+                                                                <span className="text-emerald-300">
+                                                                    {d.condensateRecoveryRate !== null && d.condensateRecoveryRate !== undefined
+                                                                        ? `${Number(d.condensateRecoveryRate).toFixed(1)}%`
+                                                                        : '-'}
+                                                                </span>
+                                                                <span className="chart-tooltip-muted mx-1">/</span>
+                                                                <span className="text-amber-300">
+                                                                    {d.condensateLossRate !== null && d.condensateLossRate !== undefined
+                                                                        ? `${Number(d.condensateLossRate).toFixed(1)}%`
+                                                                        : '-'}
+                                                                </span>
                                                             </span>
                                                         </div>
                                                         {totalFw !== null && d.steamProduction !== null && (
-                                                            <div className="text-[11px] text-slate-400 font-mono">
+                                                            <div className="text-[11px] chart-tooltip-muted font-mono">
                                                                 給水 {totalFw.toFixed(0)} / 補給 {Number(d.makeupWaterFlow || 0).toFixed(0)} / 排污 {Number(d.blowdownFlow || 0).toFixed(0)} / 產汽 {Number(d.steamProduction).toFixed(0)} t
                                                             </div>
                                                         )}
+                                                    </div>
+                                                )}
+                                                {isCwsBlowdownTank && d.cwsBlowdownM3 !== null && (
+                                                    <div className="pt-1 mt-1 border-t chart-tooltip-divider space-y-0.5">
+                                                        <div className="flex justify-between gap-4">
+                                                            <span className="text-amber-400">日排污量</span>
+                                                            <span className="font-mono font-bold text-amber-300">{Number(d.cwsBlowdownM3).toFixed(1)} m³</span>
+                                                        </div>
+                                                        <div className="flex justify-between gap-4">
+                                                            <span className="text-emerald-400">濃縮倍數</span>
+                                                            <span className="font-mono font-bold text-emerald-300">
+                                                                {d.concentrationCycles !== null ? Number(d.concentrationCycles).toFixed(1) : '-'}
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                {(isWqOverlayActive || d.waterQualityValue !== null) && selectedWqMetric && (
+                                                    <div className="pt-1 mt-1 border-t chart-tooltip-divider flex justify-between gap-4">
+                                                        <span className="text-purple-300 truncate">{selectedWqMetricLabel}</span>
+                                                        <span className="font-mono font-bold text-purple-200 shrink-0">
+                                                            {d.waterQualityValue !== null && d.waterQualityValue !== undefined
+                                                                ? `${d.waterQualityValue}${d.waterQualitySamples > 1 ? ` (${d.waterQualitySamples}點)` : ''}`
+                                                                : '-'}
+                                                        </span>
+                                                    </div>
+                                                )}
+                                                {tooltipEv && tooltipEv.items.length > 0 && (
+                                                    <div className="pt-1 mt-1 border-t chart-tooltip-divider space-y-1">
+                                                        <div className="text-[11px] font-semibold text-purple-300">當日事件／備註</div>
+                                                        {tooltipEv.items.map((ev: any, eIdx: number) => (
+                                                            <div key={eIdx} className="text-[11px] chart-tooltip-body leading-snug">
+                                                                <span className="mr-1">{ev.icon}</span>
+                                                                <span className="font-semibold chart-tooltip-title">{ev.label}：</span>
+                                                                <span className="chart-tooltip-body break-words">{ev.shortDetail}</span>
+                                                            </div>
+                                                        ))}
+                                                        <div className="text-[11px] text-sky-400 pt-0.5">
+                                                            {tooltipEv.hiddenCount > 0
+                                                                ? `＋還有 ${tooltipEv.hiddenCount} 筆事件，點擊長條看全文`
+                                                                : tooltipEv.hasMoreDetail
+                                                                    ? '字數較多已精簡，點擊長條看全文'
+                                                                    : '點擊長條可查看當日完整明細'}
+                                                        </div>
                                                     </div>
                                                 )}
                                             </div>
@@ -6157,24 +6935,76 @@ const AnalysisView: React.FC<{
                                     }}
                                 />
                                 <Legend verticalAlign="top" />
-                                {hasCalculation && metric === 'KG' && (
-                                    <Area yAxisId="left" type="monotone" dataKey="theoretical" connectNulls={false} strokeWidth={2} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
+                                {effectiveChartViewMode === 'total' && (
+                                    <>
+                                        {hasCalculation && (
+                                            <Area yAxisId="left" type="monotone" dataKey="theoretical" connectNulls={false} strokeWidth={2} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
+                                        )}
+                                        <Bar
+                                            yAxisId="left"
+                                            dataKey="actual"
+                                            barSize={14}
+                                            fill="#3b82f6"
+                                            name="實際用量"
+                                            radius={[4, 4, 0, 0]}
+                                            className="cursor-pointer"
+                                            onClick={(barData: any, idx: number) => {
+                                                const dk = barData?.payload?.dateKey || barData?.dateKey || dailyComparisonData[idx]?.dateKey;
+                                                if (dk) setSelectedEventDayKey(dk);
+                                            }}
+                                        />
+                                    </>
                                 )}
-                                <Bar yAxisId="left" dataKey="actual" barSize={14} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
-                                {showCondensateRecovery && (
-                                    <Line
-                                        yAxisId="right"
-                                        type="monotone"
-                                        dataKey="condensateRecoveryRate"
-                                        stroke="#10b981"
-                                        strokeWidth={2}
-                                        dot={{ r: 3, fill: '#10b981' }}
-                                        activeDot={{ r: 5 }}
-                                        connectNulls={false}
-                                        isAnimationActive={false}
-                                        name="冷凝水回收率 (%)"
-                                    />
+                                {effectiveChartViewMode === 'ppm' && (
+                                    <>
+                                        <Area yAxisId="left" type="monotone" dataKey="targetPpmForChart" connectNulls={false} strokeWidth={2} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="目標濃度 (ppm)" />
+                                        <Bar
+                                            yAxisId="left"
+                                            dataKey="actualPpm"
+                                            barSize={14}
+                                            fill="#3b82f6"
+                                            name="實際單耗 (ppm)"
+                                            radius={[4, 4, 0, 0]}
+                                            className="cursor-pointer"
+                                            onClick={(barData: any, idx: number) => {
+                                                const dk = barData?.payload?.dateKey || barData?.dateKey || dailyComparisonData[idx]?.dateKey;
+                                                if (dk) setSelectedEventDayKey(dk);
+                                            }}
+                                        />
+                                    </>
                                 )}
+                                {effectiveChartViewMode === 'deviation' && (
+                                    <>
+                                        <ReferenceLine yAxisId="left" y={0} stroke="#94a3b8" strokeDasharray="4 4" />
+                                        <Bar
+                                            yAxisId="left"
+                                            dataKey="deviationVal"
+                                            barSize={14}
+                                            name="超標差異 (%)"
+                                            radius={[4, 4, 0, 0]}
+                                            className="cursor-pointer"
+                                            onClick={(barData: any, idx: number) => {
+                                                const dk = barData?.payload?.dateKey || barData?.dateKey || dailyComparisonData[idx]?.dateKey;
+                                                if (dk) setSelectedEventDayKey(dk);
+                                            }}
+                                        >
+                                            {dailyComparisonData.map((entry, idx) => {
+                                                const v = entry.deviationVal;
+                                                const fill = v === null
+                                                    ? 'transparent'
+                                                    : v > 20
+                                                        ? '#ef4444'
+                                                        : v > 5
+                                                            ? '#f59e0b'
+                                                            : v < 0
+                                                                ? '#10b981'
+                                                                : '#3b82f6';
+                                                return <Cell key={`daily-dev-${idx}`} fill={fill} />;
+                                            })}
+                                        </Bar>
+                                    </>
+                                )}
+                                {renderRightLine('concentrationCycles')}
                             </ComposedChart>
                         </ResponsiveContainer>
                     ) : (
@@ -6185,32 +7015,33 @@ const AnalysisView: React.FC<{
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {/* Weekly Comparison Chart - Left */}
-                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                    <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center gap-2 bg-slate-50/50">
+                <div className="bg-white chart-card rounded-xl shadow-sm border border-slate-200">
+                    <div className="px-6 py-4 border-b border-slate-100 rounded-t-xl flex flex-wrap justify-between items-center gap-2 bg-slate-50/50">
                         <h3 className="font-semibold text-slate-800 flex items-center gap-2">
-                            {hasCalculation ? `週用量 vs 理論值 (${metric})` : `週用量趨勢 (${metric})`}
+                            {effectiveChartViewMode === 'ppm'
+                                ? '週實際單耗 vs 目標濃度 (ppm)'
+                                : effectiveChartViewMode === 'deviation'
+                                    ? '週超標差異率 (%)'
+                                    : hasCalculation
+                                        ? `週用量 vs 理論值 (${metric})`
+                                        : `週用量趨勢 (${metric})`}
                             {hasCalculation && (
                                 <button onClick={() => setHelpTopic('weekly')} className="text-slate-400 hover:text-brand-500 transition-colors">
                                     <Icons.Help className="w-4 h-4" />
                                 </button>
                             )}
                         </h3>
-                        {showCondensateRecovery && (
-                            <button
-                                type="button"
-                                onClick={openRecoveryScaleModal}
-                                className="px-2.5 py-1 rounded border border-emerald-500/50 bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50 text-xs transition-colors"
-                                title="調整冷凝水回收率右側 Y 軸顯示範圍（日／週圖表同步套用）"
-                            >
-                                {recoveryScaleButtonLabel}
-                            </button>
+                        {(showCondensateRecovery || isCoolingTank) && (
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                                {renderRightAxisControls()}
+                            </div>
                         )}
                     </div>
                     <div className="px-6 pt-4" style={{ height: '340px' }}>
                         {weeklyComparisonData.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%" minHeight={280}>
                                 <ComposedChart
-                                    key={`weekly-${selectedTankId}-${appliedDateRange.start}-${appliedDateRange.end}-${metric}-${weeklyComparisonData.length}-${recoveryYScale.min ?? 'auto'}-${recoveryYScale.max ?? 'auto'}`}
+                                    key={`weekly-${selectedTankId}-${appliedDateRange.start}-${appliedDateRange.end}-${metric}-${effectiveChartViewMode}-${rightAxisConfig.mode}-${effectiveCwsRightMode}-${selectedWqPointGroup}-${selectedWqMetric}-${weeklyComparisonData.length}-${activeRightMin ?? 'auto'}-${activeRightMax ?? 'auto'}-${rightYAxisReversed}`}
                                     data={weeklyComparisonData}
                                     margin={{ top: 20, right: 30, left: 20, bottom: 50 }}
                                 >
@@ -6234,56 +7065,106 @@ const AnalysisView: React.FC<{
                                             );
                                         }}
                                     />
-                                    <YAxis yAxisId="left" tick={{ fill: '#cbd5e1', fontSize: 11 }} />
-                                    {showCondensateRecovery && (
-                                        <YAxis
-                                            yAxisId="right"
-                                            orientation="right"
-                                            unit="%"
-                                            domain={recoveryYAxisDomain}
-                                            allowDataOverflow={hasCustomRecoveryScale}
-                                            tick={{ fill: '#10b981', fontSize: 11 }}
-                                        />
-                                    )}
+                                    <YAxis
+                                        yAxisId="left"
+                                        unit={effectiveChartViewMode === 'deviation' ? '%' : undefined}
+                                        tickFormatter={effectiveChartViewMode === 'ppm' ? (v: number) => Number(v).toFixed(2) : undefined}
+                                        tick={{ fill: '#cbd5e1', fontSize: 11 }}
+                                    />
+                                    {renderRightYAxis()}
                                     <Tooltip
+                                        allowEscapeViewBox={{ x: false, y: true }}
+                                        wrapperStyle={{ zIndex: 60, pointerEvents: 'none' }}
                                         content={({ active, payload }: any) => {
                                             if (!active || !payload?.length) return null;
                                             const d = payload[0]?.payload;
                                             const devColor = Math.abs(d.deviation) > 20 ? 'text-red-400' : Math.abs(d.deviation) > 10 ? 'text-amber-400' : 'text-emerald-400';
+                                            const totalFw = d.feedwaterFlow !== null && d.feedwaterFlow !== undefined
+                                                ? Number(d.feedwaterFlow) + Number(d.sprayWaterFlow || 0)
+                                                : null;
                                             return (
-                                                <div className="bg-slate-900 border border-slate-700 rounded-lg p-3 text-xs text-slate-100 shadow-lg space-y-1 min-w-44">
-                                                    <div className="font-bold text-slate-200 border-b border-slate-700 pb-1 flex justify-between gap-3">
+                                                <div className="chart-tooltip-card rounded-lg p-2.5 text-xs space-y-1 min-w-52 max-w-80">
+                                                    <div className="font-bold chart-tooltip-title border-b chart-tooltip-divider pb-1 flex justify-between gap-3">
                                                         <span>週起始 {d.dateStr}</span>
+                                                        {d.theorySource && <span className="chart-tooltip-muted font-normal">{d.theorySource}</span>}
                                                     </div>
                                                     <div className="flex justify-between gap-4">
                                                         <span className="text-blue-400">實際用量</span>
-                                                        <span className="font-mono font-bold">{Number(d.actual).toFixed(1)} {metric}</span>
+                                                        <span className="font-mono font-bold chart-tooltip-title">{Number(d.actual).toFixed(1)} {metric}</span>
                                                     </div>
                                                     {hasCalculation && (
                                                         <>
                                                             <div className="flex justify-between gap-4">
                                                                 <span className="text-sky-400">理論預估</span>
-                                                                <span className="font-mono font-bold">{Number(d.theoretical).toFixed(1)} {metric}</span>
+                                                                <span className="font-mono font-bold chart-tooltip-title">{Number(d.theoretical).toFixed(1)} {metric}</span>
                                                             </div>
                                                             {d.theoretical > 0 && (
                                                                 <div className="flex justify-between gap-4">
-                                                                    <span className="text-slate-400">差異 %</span>
+                                                                    <span className="chart-tooltip-muted">差異 %</span>
                                                                     <span className={`font-mono font-bold ${devColor}`}>
                                                                         {d.deviation > 0 ? '+' : ''}{Number(d.deviation).toFixed(1)}%
                                                                     </span>
                                                                 </div>
                                                             )}
+                                                            <div className="flex justify-between gap-4">
+                                                                <span className="text-indigo-300">實際單耗</span>
+                                                                <span className="font-mono font-bold text-indigo-200">
+                                                                    {d.actualPpm !== null && d.actualPpm !== undefined
+                                                                        ? `${Number(d.actualPpm).toFixed(3)} ppm`
+                                                                        : '-'}
+                                                                    {d.targetPpm > 0 ? ` (目標 ${Number(d.targetPpm).toFixed(2)})` : ''}
+                                                                </span>
+                                                            </div>
                                                         </>
                                                     )}
                                                     {showCondensateRecovery && (
-                                                        <div className="pt-1 mt-1 border-t border-slate-700/80 flex justify-between gap-4">
-                                                            <span className="text-emerald-400">
-                                                                冷凝水回收率{d.recoveryCoveredDays ? ` (${d.recoveryCoveredDays}天)` : ''}
+                                                        <div className="pt-1 mt-1 border-t chart-tooltip-divider space-y-0.5">
+                                                            <div className="flex justify-between gap-3">
+                                                                <span className="text-emerald-400">
+                                                                    回收率 / 損失{d.recoveryCoveredDays ? ` (${d.recoveryCoveredDays}天)` : ''}
+                                                                </span>
+                                                                <span className="font-mono font-bold">
+                                                                    <span className="text-emerald-300">
+                                                                        {d.condensateRecoveryRate !== null && d.condensateRecoveryRate !== undefined
+                                                                            ? `${Number(d.condensateRecoveryRate).toFixed(1)}%`
+                                                                            : '-'}
+                                                                    </span>
+                                                                    <span className="chart-tooltip-muted mx-1">/</span>
+                                                                    <span className="text-amber-300">
+                                                                        {d.condensateLossRate !== null && d.condensateLossRate !== undefined
+                                                                            ? `${Number(d.condensateLossRate).toFixed(1)}%`
+                                                                            : '-'}
+                                                                    </span>
+                                                                </span>
+                                                            </div>
+                                                            {totalFw !== null && d.steamProduction !== null && (
+                                                                <div className="text-[11px] chart-tooltip-muted font-mono">
+                                                                    給水 {totalFw.toFixed(0)} / 補給 {Number(d.makeupWaterFlow || 0).toFixed(0)} / 排污 {Number(d.blowdownFlow || 0).toFixed(0)} / 產汽 {Number(d.steamProduction).toFixed(0)} t
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    )}
+                                                    {isCwsBlowdownTank && d.cwsBlowdownM3 !== null && (
+                                                        <div className="pt-1 mt-1 border-t chart-tooltip-divider space-y-0.5">
+                                                            <div className="flex justify-between gap-4">
+                                                                <span className="text-amber-400">週排污量</span>
+                                                                <span className="font-mono font-bold text-amber-300">{Number(d.cwsBlowdownM3).toFixed(1)} m³</span>
+                                                            </div>
+                                                            <div className="flex justify-between gap-4">
+                                                                <span className="text-emerald-400">濃縮倍數</span>
+                                                                <span className="font-mono font-bold text-emerald-300">
+                                                                    {d.cwsConcentrationCycles !== null ? Number(d.cwsConcentrationCycles).toFixed(1) : '-'}
+                                                                </span>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                    {(isWqOverlayActive || d.waterQualityValue !== null) && selectedWqMetric && (
+                                                        <div className="pt-1 mt-1 border-t chart-tooltip-divider flex justify-between gap-4">
+                                                            <span className="text-purple-300 truncate">
+                                                                {selectedWqMetricLabel}{d.waterQualityDays ? ` (${d.waterQualityDays}天)` : ''}
                                                             </span>
-                                                            <span className="font-mono font-bold text-emerald-300">
-                                                                {d.condensateRecoveryRate !== null && d.condensateRecoveryRate !== undefined
-                                                                    ? `${Number(d.condensateRecoveryRate).toFixed(1)}%`
-                                                                    : '-'}
+                                                            <span className="font-mono font-bold text-purple-200 shrink-0">
+                                                                {d.waterQualityValue !== null && d.waterQualityValue !== undefined ? d.waterQualityValue : '-'}
                                                             </span>
                                                         </div>
                                                     )}
@@ -6293,24 +7174,41 @@ const AnalysisView: React.FC<{
                                     />
                                     <Legend verticalAlign="top" />
 
-                                    {hasCalculation && metric === 'KG' && (
-                                        <Area yAxisId="left" type="monotone" dataKey="theoretical" strokeWidth={2} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
+                                    {effectiveChartViewMode === 'total' && (
+                                        <>
+                                            {hasCalculation && (
+                                                <Area yAxisId="left" type="monotone" dataKey="theoretical" strokeWidth={2} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
+                                            )}
+                                            <Bar yAxisId="left" dataKey="actual" barSize={20} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
+                                        </>
                                     )}
-                                    <Bar yAxisId="left" dataKey="actual" barSize={20} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
-                                    {showCondensateRecovery && (
-                                        <Line
-                                            yAxisId="right"
-                                            type="monotone"
-                                            dataKey="condensateRecoveryRate"
-                                            stroke="#10b981"
-                                            strokeWidth={2}
-                                            dot={{ r: 3, fill: '#10b981' }}
-                                            activeDot={{ r: 5 }}
-                                            connectNulls={false}
-                                            isAnimationActive={false}
-                                            name="冷凝水回收率 (%)"
-                                        />
+                                    {effectiveChartViewMode === 'ppm' && (
+                                        <>
+                                            <Area yAxisId="left" type="monotone" dataKey="targetPpmForChart" connectNulls={false} strokeWidth={2} fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="目標濃度 (ppm)" />
+                                            <Bar yAxisId="left" dataKey="actualPpm" barSize={20} fill="#3b82f6" name="實際單耗 (ppm)" radius={[4, 4, 0, 0]} />
+                                        </>
                                     )}
+                                    {effectiveChartViewMode === 'deviation' && (
+                                        <>
+                                            <ReferenceLine yAxisId="left" y={0} stroke="#94a3b8" strokeDasharray="4 4" />
+                                            <Bar yAxisId="left" dataKey="deviationVal" barSize={20} name="超標差異 (%)" radius={[4, 4, 0, 0]}>
+                                                {weeklyComparisonData.map((entry, idx) => {
+                                                    const v = entry.deviationVal;
+                                                    const fill = v === null
+                                                        ? 'transparent'
+                                                        : v > 20
+                                                            ? '#ef4444'
+                                                            : v > 10
+                                                                ? '#f59e0b'
+                                                                : v < 0
+                                                                    ? '#10b981'
+                                                                    : '#3b82f6';
+                                                    return <Cell key={`weekly-dev-${idx}`} fill={fill} />;
+                                                })}
+                                            </Bar>
+                                        </>
+                                    )}
+                                    {renderRightLine('cwsConcentrationCycles')}
                                 </ComposedChart>
                             </ResponsiveContainer>
                         ) : (
@@ -6348,8 +7246,8 @@ const AnalysisView: React.FC<{
 
 
                 {/* Monthly Comparison Chart - Right */}
-                <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                    <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                <div className="bg-white chart-card rounded-xl shadow-sm border border-slate-200">
+                    <div className="px-6 py-4 border-b border-slate-100 rounded-t-xl flex justify-between items-center bg-slate-50/50">
                         <h3 className="font-semibold text-slate-800 flex items-center gap-2">
                             {hasCalculation ? `月用量 vs 理論值 (${metric})` : `月用量趨勢 (${metric})`}
                             <button onClick={() => setHelpTopic('monthly')} className="text-slate-400 hover:text-brand-500 transition-colors">
@@ -6389,29 +7287,33 @@ const AnalysisView: React.FC<{
                                     />
                                     <YAxis tick={{ fill: '#cbd5e1', fontSize: 11 }} />
                                     <Tooltip
+                                        allowEscapeViewBox={{ x: false, y: true }}
+                                        wrapperStyle={{ zIndex: 60, pointerEvents: 'none' }}
                                         content={({ active, payload, label }: any) => {
                                             if (!active || !payload?.length) return null;
                                             const data = payload[0]?.payload;
                                             const warnings: LevelRiseWarning[] = data?.levelRiseWarnings || [];
+                                            const visibleWarnings = warnings.slice(0, 3);
+                                            const hiddenWarningsCount = Math.max(0, warnings.length - visibleWarnings.length);
 
                                             return (
-                                                <div className="bg-white border border-slate-200 shadow-lg rounded-md p-3 text-sm text-slate-700 min-w-48">
-                                                    <div className="font-semibold text-slate-900 mb-2">{label}</div>
+                                                <div className="chart-tooltip-card rounded-lg p-2.5 text-xs min-w-52 max-w-80 space-y-1">
+                                                    <div className="font-bold chart-tooltip-title border-b chart-tooltip-divider pb-1 mb-1">{label}</div>
                                                     {payload.map((entry: any) => (
                                                         <div key={entry.dataKey} className="flex justify-between gap-4">
                                                             <span style={{ color: entry.color }}>{entry.name}</span>
-                                                            <span className="font-medium">{Number(entry.value).toFixed(1)}</span>
+                                                            <span className="font-mono font-bold chart-tooltip-title">{Number(entry.value).toFixed(1)}</span>
                                                         </div>
                                                     ))}
                                                     {warnings.length > 0 && (
-                                                        <div className="mt-3 pt-2 border-t border-amber-100 space-y-1 text-xs">
-                                                            <div className="font-semibold text-amber-700 flex items-center gap-1">
+                                                        <div className="mt-2 pt-1.5 border-t chart-tooltip-divider space-y-1 text-[11px]">
+                                                            <div className="font-semibold text-amber-400 flex items-center gap-1">
                                                                 <Icons.Alert className="w-3.5 h-3.5" />
                                                                 液位上升警示
                                                             </div>
-                                                            {warnings.map((warning, index) => (
-                                                                <div key={`${warning.dateStr}-${index}`} className="text-slate-600">
-                                                                    <span className="font-medium">{warning.dateStr}</span>
+                                                            {visibleWarnings.map((warning, index) => (
+                                                                <div key={`${warning.dateStr}-${index}`} className="chart-tooltip-body leading-snug">
+                                                                    <span className="font-medium chart-tooltip-title">{warning.dateStr}</span>
                                                                     ：{warning.previousLevelCm} → {warning.currentLevelCm} cm，
                                                                     約 {warning.dailyEquivalent.toFixed(1)} 天用量
                                                                     {warning.kind === 'SUSPICIOUS_RISE'
@@ -6419,6 +7321,11 @@ const AnalysisView: React.FC<{
                                                                         : '，本月大幅上升出現兩次以上，請確認補藥紀錄'}
                                                                 </div>
                                                             ))}
+                                                            {hiddenWarningsCount > 0 && (
+                                                                <div className="text-sky-400">
+                                                                    ＋還有 {hiddenWarningsCount} 筆液位上升警示
+                                                                </div>
+                                                            )}
                                                         </div>
                                                     )}
                                                 </div>
@@ -6427,7 +7334,7 @@ const AnalysisView: React.FC<{
                                     />
                                     <Legend verticalAlign="top" />
 
-                                    {hasCalculation && metric === 'KG' && (
+                                    {hasCalculation && (
                                         <Area type="monotone" dataKey="theoretical" fill="rgba(14, 165, 233, 0.15)" stroke="#0ea5e9" name="理論預估" />
                                     )}
                                     <Bar dataKey="actual" barSize={20} fill="#3b82f6" name="實際用量" radius={[4, 4, 0, 0]} />
@@ -6501,7 +7408,10 @@ const AnalysisView: React.FC<{
                                             <>
                                                 <th className="p-2 font-semibold text-slate-800 text-right">日蒸汽量 (ton)</th>
                                                 {showCondensateRecovery && (
-                                                    <th className="p-2 font-semibold text-slate-800 text-right">冷凝水回收率 (%)</th>
+                                                    <>
+                                                        <th className="p-2 font-semibold text-slate-800 text-right">冷凝水回收率 (%)</th>
+                                                        <th className="p-2 font-semibold text-slate-800 text-right">未回收率 (%)</th>
+                                                    </>
                                                 )}
                                             </>
                                         ) : (
@@ -6509,12 +7419,20 @@ const AnalysisView: React.FC<{
                                                 <th className="p-2 font-semibold text-slate-800 text-right">循環水量 R (m³/h)</th>
                                                 <th className="p-2 font-semibold text-slate-800 text-right">溫差 ΔT (°C)</th>
                                                 <th className="p-2 font-semibold text-slate-800 text-right">濃縮倍數 N</th>
+                                                <th className="p-2 font-semibold text-slate-800 text-right">日排污量 (m³)</th>
                                             </>
                                         )}
                                         <th className="p-2 font-semibold text-slate-800 text-right">目標濃度 (ppm)</th>
+                                        <th className="p-2 font-semibold text-slate-800 text-right">實際單耗 (ppm)</th>
                                         <th className="p-2 font-semibold text-slate-800 text-right">理論用量 ({metric})</th>
                                         <th className="p-2 font-semibold text-slate-800 text-right">實際用量 ({metric})</th>
                                         <th className="p-2 font-semibold text-slate-800 text-right">差異 %</th>
+                                        {isWqOverlayActive && selectedWqMetric && (
+                                            <th className="p-2 font-semibold text-purple-800 text-right max-w-36 truncate" title={selectedWqMetricLabel}>
+                                                {selectedWqMetricLabel}
+                                            </th>
+                                        )}
+                                        <th className="p-2 font-semibold text-slate-800 text-center">事件</th>
                                         <th className="p-2 font-semibold text-slate-800 text-center">數據來源</th>
                                     </tr>
                                 </thead>
@@ -6526,6 +7444,7 @@ const AnalysisView: React.FC<{
                                             d.sourceLabel === 'PI日實測' ? 'bg-emerald-100 text-emerald-700' :
                                                 d.sourceLabel === 'PI滾動24h' ? 'bg-sky-100 text-sky-700' :
                                                     'bg-gray-100 text-gray-500';
+                                        const eventTooltip = (d.events || []).map((ev: any) => `${ev.icon} ${ev.label}: ${ev.detail}`).join('\n');
 
                                         return (
                                             <tr key={d.dateKey} className={idx % 2 === 0 ? 'bg-slate-50' : 'bg-white'}>
@@ -6536,11 +7455,18 @@ const AnalysisView: React.FC<{
                                                             {d.steamProduction !== null ? d.steamProduction.toFixed(1) : '-'}
                                                         </td>
                                                         {showCondensateRecovery && (
-                                                            <td className="p-2 text-right font-mono font-semibold text-emerald-700">
-                                                                {d.condensateRecoveryRate !== null && d.condensateRecoveryRate !== undefined
-                                                                    ? `${d.condensateRecoveryRate.toFixed(1)}%`
-                                                                    : '-'}
-                                                            </td>
+                                                            <>
+                                                                <td className="p-2 text-right font-mono font-semibold text-emerald-700">
+                                                                    {d.condensateRecoveryRate !== null && d.condensateRecoveryRate !== undefined
+                                                                        ? `${d.condensateRecoveryRate.toFixed(1)}%`
+                                                                        : '-'}
+                                                                </td>
+                                                                <td className="p-2 text-right font-mono font-semibold text-amber-700">
+                                                                    {d.condensateLossRate !== null && d.condensateLossRate !== undefined
+                                                                        ? `${d.condensateLossRate.toFixed(1)}%`
+                                                                        : '-'}
+                                                                </td>
+                                                            </>
                                                         )}
                                                     </>
                                                 ) : (
@@ -6554,15 +7480,43 @@ const AnalysisView: React.FC<{
                                                         <td className="p-2 text-right font-mono text-slate-600">
                                                             {d.concentrationCycles !== null ? d.concentrationCycles.toFixed(1) : '-'}
                                                         </td>
+                                                        <td className="p-2 text-right font-mono font-semibold text-amber-700">
+                                                            {d.cwsBlowdownM3 !== null && d.cwsBlowdownM3 !== undefined ? d.cwsBlowdownM3.toFixed(1) : '-'}
+                                                        </td>
                                                     </>
                                                 )}
                                                 <td className="p-2 text-right font-mono">{d.targetPpm.toFixed(1)}</td>
+                                                <td className="p-2 text-right font-mono font-semibold text-indigo-700">
+                                                    {d.actualPpm !== null && d.actualPpm !== undefined ? d.actualPpm.toFixed(3) : '-'}
+                                                </td>
                                                 <td className="p-2 text-right font-bold text-red-600">
                                                     {d.theoretical !== null ? d.theoretical.toFixed(1) : '-'}
                                                 </td>
                                                 <td className="p-2 text-right font-bold text-blue-600">{d.actual.toFixed(1)}</td>
                                                 <td className={`p-2 text-right font-bold ${diffColor}`}>
                                                     {d.theoretical !== null && d.theoretical > 0 ? `${d.deviation > 0 ? '+' : ''}${d.deviation.toFixed(1)}%` : '-'}
+                                                </td>
+                                                {isWqOverlayActive && selectedWqMetric && (
+                                                    <td className="p-2 text-right font-mono text-purple-700">
+                                                        {d.waterQualityValue !== null && d.waterQualityValue !== undefined ? d.waterQualityValue : '-'}
+                                                    </td>
+                                                )}
+                                                <td className="p-2 text-center whitespace-nowrap" title={eventTooltip ? '點擊查看當日完整事件與明細' : undefined}>
+                                                    {d.events && d.events.length > 0 ? (
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setSelectedEventDayKey(d.dateKey)}
+                                                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-purple-950/50 cursor-pointer text-sm transition-colors"
+                                                            title="點擊查看當日完整事件與明細"
+                                                        >
+                                                            <span>{Array.from(new Set(d.events.map((ev: any) => ev.icon))).join(' ')}</span>
+                                                            {d.events.length > 1 && (
+                                                                <span className="text-[11px] font-mono text-purple-300">({d.events.length})</span>
+                                                            )}
+                                                        </button>
+                                                    ) : (
+                                                        <span className="text-slate-300">-</span>
+                                                    )}
                                                 </td>
                                                 <td className="p-2 text-center">
                                                     <span className={`text-xs px-2 py-1 rounded ${badgeClass}`}>{d.sourceLabel}</span>
@@ -6579,108 +7533,370 @@ const AnalysisView: React.FC<{
                 <TheoreticalUsageCard tank={selectedTank} weeklyData={weeklyData} />
             )}
 
+            {/* Full Daily Event & Detail Modal */}
+            {selectedEventDay && (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4" onClick={() => setSelectedEventDayKey(null)}>
+                    <div
+                        className="bg-white hover:!transform-none rounded-xl shadow-xl border border-slate-200 w-full max-w-xl max-h-[85vh] flex flex-col animate-in fade-in zoom-in duration-200"
+                        onClick={e => e.stopPropagation()}
+                    >
+                        <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-xl shrink-0">
+                            <div className="flex items-center gap-2.5">
+                                <h3 className="text-lg font-bold text-slate-800 font-mono">
+                                    {selectedEventDay.dateKey} 當日明細與事件
+                                </h3>
+                                <span className={`text-xs px-2 py-0.5 rounded ${
+                                    selectedEventDay.sourceLabel === 'PI日實測'
+                                        ? 'bg-emerald-100 text-emerald-700'
+                                        : selectedEventDay.sourceLabel === 'PI滾動24h'
+                                            ? 'bg-sky-100 text-sky-700'
+                                            : 'bg-slate-100 text-slate-600'
+                                }`}>
+                                    {selectedEventDay.sourceLabel}
+                                </span>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setSelectedEventDayKey(null)}
+                                className="text-slate-400 hover:text-slate-600 p-1 rounded"
+                                aria-label="關閉視窗"
+                            >
+                                <Icons.X className="w-5 h-5" />
+                            </button>
+                        </div>
+
+                        <div className="p-5 space-y-4 overflow-y-auto text-sm text-slate-700">
+                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+                                <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                                    <div className="text-xs text-slate-500">實際用量</div>
+                                    <div className="font-mono font-bold text-blue-400 mt-0.5">
+                                        {Number(selectedEventDay.actual).toFixed(1)} {metric}
+                                    </div>
+                                </div>
+                                {hasCalculation && (
+                                    <>
+                                        <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                                            <div className="text-xs text-slate-500">理論預估</div>
+                                            <div className="font-mono font-bold text-sky-400 mt-0.5">
+                                                {selectedEventDay.theoretical !== null
+                                                    ? `${Number(selectedEventDay.theoretical).toFixed(1)} ${metric}`
+                                                    : '-'}
+                                            </div>
+                                        </div>
+                                        <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                                            <div className="text-xs text-slate-500">差異 %</div>
+                                            <div className={`font-mono font-bold mt-0.5 ${
+                                                selectedEventDay.theoretical === null || selectedEventDay.theoretical <= 0
+                                                    ? 'text-slate-400'
+                                                    : Math.abs(selectedEventDay.deviation) > 20
+                                                        ? 'text-red-400'
+                                                        : Math.abs(selectedEventDay.deviation) > 5
+                                                            ? 'text-amber-400'
+                                                            : 'text-emerald-400'
+                                            }`}>
+                                                {selectedEventDay.theoretical !== null && selectedEventDay.theoretical > 0
+                                                    ? `${selectedEventDay.deviation > 0 ? '+' : ''}${Number(selectedEventDay.deviation).toFixed(1)}%`
+                                                    : '-'}
+                                            </div>
+                                        </div>
+                                        <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                                            <div className="text-xs text-slate-500">實際單耗 (目標)</div>
+                                            <div className="font-mono font-bold text-indigo-300 mt-0.5">
+                                                {selectedEventDay.actualPpm !== null && selectedEventDay.actualPpm !== undefined
+                                                    ? `${Number(selectedEventDay.actualPpm).toFixed(3)} ppm`
+                                                    : '-'}
+                                                {selectedEventDay.targetPpm > 0 ? ` (${Number(selectedEventDay.targetPpm).toFixed(2)})` : ''}
+                                            </div>
+                                        </div>
+                                    </>
+                                )}
+                                {showCondensateRecovery && (
+                                    <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                                        <div className="text-xs text-slate-500">回收率 / 未回收率</div>
+                                        <div className="font-mono font-bold mt-0.5">
+                                            <span className="text-emerald-400">
+                                                {selectedEventDay.condensateRecoveryRate !== null && selectedEventDay.condensateRecoveryRate !== undefined
+                                                    ? `${Number(selectedEventDay.condensateRecoveryRate).toFixed(1)}%`
+                                                    : '-'}
+                                            </span>
+                                            <span className="text-slate-500 mx-1">/</span>
+                                            <span className="text-amber-400">
+                                                {selectedEventDay.condensateLossRate !== null && selectedEventDay.condensateLossRate !== undefined
+                                                    ? `${Number(selectedEventDay.condensateLossRate).toFixed(1)}%`
+                                                    : '-'}
+                                            </span>
+                                        </div>
+                                    </div>
+                                )}
+                                {isCwsBlowdownTank && selectedEventDay.cwsBlowdownM3 !== null && (
+                                    <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                                        <div className="text-xs text-slate-500">日排污量 / 濃縮倍數</div>
+                                        <div className="font-mono font-bold mt-0.5">
+                                            <span className="text-amber-400">{Number(selectedEventDay.cwsBlowdownM3).toFixed(1)} m³</span>
+                                            <span className="text-slate-500 mx-1">/</span>
+                                            <span className="text-emerald-400">
+                                                {selectedEventDay.concentrationCycles !== null ? Number(selectedEventDay.concentrationCycles).toFixed(1) : '-'}
+                                            </span>
+                                        </div>
+                                    </div>
+                                )}
+                                {selectedEventDay.waterQualityValue !== null && selectedEventDay.waterQualityValue !== undefined && selectedWqMetric && (
+                                    <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                                        <div className="text-xs text-slate-500 truncate" title={selectedWqMetricLabel}>{selectedWqMetricLabel}</div>
+                                        <div className="font-mono font-bold text-purple-300 mt-0.5">
+                                            {selectedEventDay.waterQualityValue}
+                                            {selectedEventDay.waterQualitySamples > 1 ? ` (${selectedEventDay.waterQualitySamples}點)` : ''}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="pt-2 border-t border-slate-200 space-y-2.5">
+                                <div className="font-semibold text-purple-300 flex items-center justify-between">
+                                    <span>當日事件／備註（共 {selectedEventDay.events?.length || 0} 筆）</span>
+                                </div>
+                                {selectedEventDay.events && selectedEventDay.events.length > 0 ? (
+                                    <div className="space-y-2.5">
+                                        {selectedEventDay.events.map((ev: any, eIdx: number) => (
+                                            <div key={eIdx} className="p-3 rounded-lg bg-slate-50 border border-slate-200 space-y-1.5">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-semibold bg-slate-100 text-slate-800 border border-slate-300">
+                                                        <span>{ev.icon}</span>
+                                                        <span>{ev.label}</span>
+                                                    </span>
+                                                </div>
+                                                <p className="text-xs text-slate-700 whitespace-pre-wrap break-words leading-relaxed">
+                                                    {ev.detail}
+                                                </p>
+                                            </div>
+                                        ))}
+                                    </div>
+                                ) : (
+                                    <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 text-center text-xs text-slate-500">
+                                        當日無補藥、警報、紀事或比重／合約調整紀錄。
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="px-6 py-3 border-t border-slate-100 bg-slate-50 rounded-b-xl flex justify-end shrink-0">
+                            <button
+                                type="button"
+                                onClick={() => setSelectedEventDayKey(null)}
+                                className="px-4 py-1.5 rounded-lg bg-brand-500 hover:bg-brand-600 text-white text-xs font-medium transition-colors"
+                            >
+                                關閉
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Help Modal */}
             {
                 helpTopic && (
                     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4" onClick={() => setHelpTopic(null)}>
-                        <div className="bg-white rounded-lg shadow-xl w-full max-w-lg animate-in fade-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
-                            <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-lg">
+                        <div className="bg-white rounded-lg shadow-xl w-full max-w-xl max-h-[85vh] flex flex-col animate-in fade-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
+                            <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-lg shrink-0">
                                 <h3 className="text-lg font-bold text-slate-800 flex items-center">
                                     <Icons.Help className="w-5 h-5 mr-2 text-brand-500" />
-                                    {helpTopic === 'daily' ? '日理論用量計算說明' : helpTopic === 'weekly' ? '週理論用量計算說明' : '月理論用量計算說明'}
+                                    {helpTopic === 'daily' ? '日理論用量與趨勢判讀說明' : helpTopic === 'weekly' ? '週理論用量與趨勢判讀說明' : '月理論用量計算說明'}
                                 </h3>
                                 <button onClick={() => setHelpTopic(null)} className="text-slate-400 hover:text-slate-600">
                                     <Icons.X className="w-5 h-5" />
                                 </button>
                             </div>
-                            <div className="p-6 space-y-4 text-slate-700 text-sm">
+                            <div className="p-6 space-y-4 text-slate-700 text-sm overflow-y-auto">
                                 {helpTopic === 'daily' ? (
                                     <div className="space-y-4">
-                                        <h4 className="font-bold text-brand-700">每日 PI 計算說明</h4>
-                                        <ul className="list-disc pl-5 space-y-2">
-                                            <li>
-                                                <span className="font-semibold text-emerald-700">PI日實測</span>：每日各自抓取 00:00~24:00 完整區間之 PI 蒸汽總量／平均流量與溫差計算，不使用週均推算。
-                                            </li>
-                                            <li>
-                                                <span className="font-semibold text-sky-700">PI滾動24h</span>：當日尚未結束時，由同步時間往前推滿 24 小時之暫估值。
-                                            </li>
-                                            <li>
-                                                <span className="font-semibold text-slate-700">待同步</span>：該日尚未取得 PI 日參數（可按右上角「同步每日PI數據」重新同步）。
-                                            </li>
-                                        </ul>
-                                        <p className="text-xs text-slate-500">實際用量取自現場液位紀錄差值（跨日未抄表時依區間天數平均分攤）。</p>
+                                        <div>
+                                            <h4 className="font-bold text-brand-700 mb-2">每日 PI 數據狀態</h4>
+                                            <ul className="list-disc pl-5 space-y-1.5 text-xs">
+                                                <li>
+                                                    <span className="font-semibold text-emerald-700">PI日實測</span>：抓取當日 00:00~24:00 完整 PI 數據，不使用週均推算。
+                                                </li>
+                                                <li>
+                                                    <span className="font-semibold text-sky-400">PI滾動24h</span>：僅於當日 22:00~24:00 尚未跨日時，取同步前 24 小時暫估值。
+                                                </li>
+                                                <li>
+                                                    <span className="font-semibold text-slate-700">待同步</span>：該日尚無資料，可按「同步每日PI數據」補抓。
+                                                </li>
+                                            </ul>
+                                        </div>
+
+                                        <div className="pt-3 border-t border-slate-200 space-y-2">
+                                            <h4 className="font-bold text-slate-800">日實際用量與理論公式</h4>
+                                            <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200 space-y-1">
+                                                <div>日實際用量 (kg) = 日消耗體積 (L) × 當日合約比重</div>
+                                                <div>鍋爐理論 (kg) = 日蒸汽產量 (t) × 目標濃度 (ppm) ÷ 1000</div>
+                                                <div>冷卻理論 (kg) = 日排放水量 BW (m³) × 目標濃度 (ppm) ÷ 1000</div>
+                                            </div>
+                                            <p className="text-xs text-slate-600">
+                                                系統先算液位體積差，再乘當日合約比重，可避免換約日重量跳動失真。
+                                            </p>
+                                            <p className="text-xs text-slate-500">
+                                                跨日未抄表時，總消耗體積依區間天數平均分攤。
+                                            </p>
+                                        </div>
+
+                                        <div className="pt-3 border-t border-slate-200 space-y-2">
+                                            <h4 className="font-bold text-indigo-300">左軸三種分析視角</h4>
+                                            <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200 space-y-1">
+                                                <div>實際單耗 (ppm) = 實際用量 (kg) × 1000 ÷ 產汽量或排放水量</div>
+                                                <div>超標差異 (%) = ((實際用量 - 理論用量) ÷ 理論用量) × 100%</div>
+                                            </div>
+                                            <ul className="list-disc pl-5 space-y-1.5 text-xs">
+                                                <li>
+                                                    <span className="font-semibold">總用量</span>：比較每日總量，但數值會隨產汽負載高低起伏。
+                                                </li>
+                                                <li>
+                                                    <span className="font-semibold text-indigo-300">單耗 ppm</span>：換算每噸基準用量，可排除鍋爐升降載干擾。
+                                                </li>
+                                                <li>
+                                                    <span className="font-semibold text-amber-700">超標率 %</span>：正值代表超出理論，方便對比操作偏差幅度。
+                                                </li>
+                                            </ul>
+                                        </div>
+
                                         {showCondensateRecovery && (
                                             <div className="pt-3 border-t border-slate-200 space-y-2">
-                                                <h4 className="font-bold text-emerald-700">冷凝水回收率 (%)</h4>
-                                                <div className="bg-emerald-50 p-3 rounded font-mono text-xs border border-emerald-200 text-emerald-900">
-                                                    回收率 (%) = ((鍋爐飼水 + S/H減溫噴水 - DW補水 - CBD排污) / MS產汽) × 100%
+                                                <h4 className="font-bold text-emerald-700">冷凝水回收率與未回收率（僅鍋爐水藥劑）</h4>
+                                                <div className="bg-emerald-50 p-3 rounded font-mono text-xs border border-emerald-200 text-emerald-200 space-y-1">
+                                                    <div>回收率 (%) = ((飼水 + S/H噴水 - DW補水 - CBD排污) ÷ MS產汽) × 100%</div>
+                                                    <div>未回收損失率 (%) = 100% - 冷凝水回收率 (%)</div>
                                                 </div>
                                                 <p className="text-xs text-slate-600">
-                                                    僅於鍋爐水藥劑（中和胺、脫氧劑、清罐劑）顯示，採四部爐與一/二階 DW 之 PI 每日總量計算。
+                                                    現行理論公式未納入回收率，鍋爐降載時產汽與回收率常會一起下降。
+                                                </p>
+                                                <p className="text-xs text-slate-600">
+                                                    建議右軸切為「未回收率 %」，或於設定勾選反轉 Y 軸刻度。
+                                                </p>
+                                                <p className="text-xs text-slate-600">
+                                                    再搭配左軸「單耗 ppm」或「超標率 %」，兩線同升即表示受回收率下降影響。
+                                                </p>
+                                            </div>
+                                        )}
+
+                                        {isCwsBlowdownTank && (
+                                            <div className="pt-3 border-t border-slate-200 space-y-2">
+                                                <h4 className="font-bold text-amber-700">冷卻水右軸（排污量／濃縮倍數）</h4>
+                                                <p className="text-xs text-slate-600">
+                                                    右軸可切換「排污量 m³」或「濃縮倍數 N」。若濃縮倍數下滑且排污量暴增，超標通常來自排污閥異常或補水硬度上升。
+                                                </p>
+                                            </div>
+                                        )}
+
+                                        {(showCondensateRecovery || isCoolingTank) && (
+                                            <div className="pt-3 border-t border-slate-200 space-y-2">
+                                                <h4 className="font-bold text-purple-700">右軸水質指標疊加 &amp; 事件標記</h4>
+                                                <p className="text-xs text-slate-600">
+                                                    右軸切為「水質指標」可對照人工化驗（如 pH、聯胺、磷酸鹽、餘氯）。用量超標且水質同步偏高代表加藥過量；水質正常或偏低則多為水質惡化或排污增加。
+                                                </p>
+                                                <p className="text-xs text-slate-600">
+                                                    X 軸下方標示現場事件：🚚 補藥、⚠️ 波動警報／備註、📝 重要紀事、⚖️ 比重調整／🔄 合約切換。
                                                 </p>
                                             </div>
                                         )}
                                     </div>
                                 ) : helpTopic === 'weekly' ? (
                                     <div className="space-y-4">
-                                        <h4 className="font-bold text-brand-700">冷卻水系統 (CWS)</h4>
-                                        <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
-                                            (循環水量 × 溫差 × 1.8 × 24hr × 7天) / 1000 / (濃縮倍數 - 1) × 目標濃度(ppm) / 1000
+                                        <div>
+                                            <h4 className="font-bold text-slate-800 mb-2">週實際用量（完整 7 天）</h4>
+                                            <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                                週實際用量 (kg) = ∑(每日消耗體積 L × 當日合約比重)
+                                            </div>
+                                            <p className="text-xs text-slate-600 mt-1.5">
+                                                每週取週一 00:00 至下週一 00:00 共 7 天區間，完整涵蓋週日用量。
+                                            </p>
                                         </div>
-                                        <p>依據當週的平均操作參數計算。</p>
 
-                                        <h4 className="font-bold text-orange-700 mt-4">鍋爐系統 (BWS)</h4>
-                                        <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
-                                            (當週蒸氣總產量 × 目標濃度(ppm)) / 1000
+                                        <div className="pt-3 border-t border-slate-200 space-y-2">
+                                            <h4 className="font-bold text-orange-700">鍋爐系統 (BWS) 週理論用量</h4>
+                                            <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                                週理論用量 (kg) = ∑(日蒸汽產量 × 當日目標 ppm ÷ 1000)
+                                            </div>
+                                            <p className="text-xs text-slate-600">
+                                                優先加總該週完整「PI日實測」；日資料未齊時改採「當週數據」。
+                                            </p>
                                         </div>
-                                        <p>直接依據流量計回傳的蒸氣總量計算。</p>
+
+                                        <div className="pt-3 border-t border-slate-200 space-y-2">
+                                            <h4 className="font-bold text-brand-700">冷卻水系統 (CWS) 週理論用量</h4>
+                                            <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
+                                                (循環水量 × 溫差 × 1.8 × 24 × 7 ÷ 1000) ÷ (濃縮倍數 - 1) × 目標 ppm ÷ 1000
+                                            </div>
+                                            <p className="text-xs text-slate-600">依據當週的平均操作參數計算。</p>
+                                        </div>
+
+                                        <div className="pt-3 border-t border-slate-200 space-y-2">
+                                            <h4 className="font-bold text-indigo-300">週單耗 ppm 與超標率 %</h4>
+                                            <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200 space-y-1">
+                                                <div>週實際單耗 (ppm) = 週實際用量 (kg) × 1000 ÷ 週蒸汽總產量 (或排放水量)</div>
+                                                <div>週超標差異 (%) = ((週實際用量 - 週理論用量) ÷ 週理論用量) × 100%</div>
+                                            </div>
+                                        </div>
 
                                         {showCondensateRecovery && (
-                                            <>
-                                                <h4 className="font-bold text-emerald-700 mt-4">週冷凝水回收率 (%)</h4>
-                                                <div className="bg-emerald-50 p-3 rounded font-mono text-xs border border-emerald-200 text-emerald-900">
-                                                    週回收率 (%) = ((∑給水 - ∑補給 - ∑排污) / ∑產汽) × 100%
+                                            <div className="pt-3 border-t border-slate-200 space-y-2">
+                                                <h4 className="font-bold text-emerald-700">週回收率與未回收率（僅鍋爐水藥劑）</h4>
+                                                <div className="bg-emerald-50 p-3 rounded font-mono text-xs border border-emerald-200 text-emerald-200 space-y-1">
+                                                    <div>週回收率 (%) = ((∑給水 - ∑補給 - ∑排污) ÷ ∑產汽) × 100%</div>
+                                                    <div>週未回收損失率 (%) = 100% - 週回收率 (%)</div>
                                                 </div>
                                                 <p className="text-xs text-slate-600">
-                                                    以該週內所有具備完整日 PI 流量之天數進行總流量加權計算。
+                                                    回收率以該週完整日 PI 流量總和加權計算，不受單日負載高低偏誤影響。
                                                 </p>
-                                            </>
+                                                <p className="text-xs text-slate-600">
+                                                    切換「未回收率 %」並搭配「單耗 ppm／超標率 %」，可直接看出流失與超標的正相關。
+                                                </p>
+                                            </div>
                                         )}
 
-                                        <h4 className="font-bold text-amber-700 mt-4">比重與單價說明</h4>
-                                        <ul className="list-disc pl-5 space-y-2">
-                                            <li>
-                                                <span className="font-semibold">顯示方式</span>：若該週內只有單一比重/單價，則直接顯示該值；若有多個不同的值（例如週中換約），則顯示 <span className="text-amber-600 font-bold">「多值*」</span>，將游標移至該文字可檢視所有數值。
-                                            </li>
-                                            <li>
-                                                計算金額時，系統會依據每日各自適用的合約單價逐日計算後加總。
-                                            </li>
-                                        </ul>
+                                        {(isCwsBlowdownTank || isCoolingTank) && (
+                                            <div className="pt-3 border-t border-slate-200 space-y-2">
+                                                <h4 className="font-bold text-amber-700">冷卻水與水質指標右軸</h4>
+                                                <p className="text-xs text-slate-600">
+                                                    右軸可疊加週排污量 (m³)、濃縮倍數 (N) 或當週水質化驗平均值，輔助判讀週用量超標主因。
+                                                </p>
+                                            </div>
+                                        )}
+
+                                        <div className="pt-3 border-t border-slate-200">
+                                            <h4 className="font-bold text-amber-700 mb-1.5">比重與單價說明</h4>
+                                            <ul className="list-disc pl-5 space-y-1 text-xs">
+                                                <li>
+                                                    若週中換約，表格顯示<span className="text-amber-600 font-bold">「多值*」</span>，移至文字上方可看明細。
+                                                </li>
+                                                <li>
+                                                    系統依每日各自生效的合約比重與單價計算後再加總。
+                                                </li>
+                                            </ul>
+                                        </div>
                                     </div>
                                 ) : (
                                     <div className="space-y-4">
                                         {hasCalculation && (
                                             <>
-                                                <h4 className="font-bold text-slate-800">理論值計算原理</h4>
-                                                <p>月度理論值採用<span className="font-bold text-brand-600">「逐日加總」</span>方式計算：</p>
-                                                <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200">
-                                                    月總量 = ∑ (每日理論用量)
+                                                <h4 className="font-bold text-slate-800">月理論與實際計算原理</h4>
+                                                <div className="bg-slate-50 p-3 rounded font-mono text-xs border border-slate-200 space-y-1">
+                                                    <div>月理論總量 = ∑(當月每日理論用量)</div>
+                                                    <div>月實際用量 = ∑(當月每日消耗體積 L × 當日比重/單價)</div>
                                                 </div>
-                                                <ul className="list-disc pl-5 space-y-2 mt-2">
+                                                <ul className="list-disc pl-5 space-y-1.5 text-xs mt-2">
                                                     <li>
-                                                        <span className="font-semibold">每日理論用量</span> = 對應週次的週理論用量 ÷ 7
+                                                        實際用量取當月 1 日 00:00 至次月 1 日 00:00 完整區間，含月底最後一天。
                                                     </li>
                                                     <li>
-                                                        系統會自動找出每一天所屬的週次參數進行計算。
+                                                        鍋爐水優先採每日 PI 實測產汽量計算，缺漏日再以週參數除以 7 推算。
                                                     </li>
                                                     <li>
-                                                        此方式能精確處理由於月份天數不同 (28/30/31天) 以及週次跨月所導致的計算誤差，確保月度總和與實際天數完全吻合。
+                                                        此方式可精準對齊大小月天數與跨月週次，並與年度總覽數值一致。
                                                     </li>
                                                 </ul>
                                             </>
                                         )}
                                         <h4 className="font-bold text-amber-700 mt-4">比重與單價說明</h4>
-                                        <ul className="list-disc pl-5 space-y-2">
+                                        <ul className="list-disc pl-5 space-y-1.5 text-xs">
                                             <li>
                                                 <span className="font-semibold">週次</span>：顯示該週最後生效的藥劑合約之比重與單價。
                                             </li>
@@ -6688,13 +7904,13 @@ const AnalysisView: React.FC<{
                                                 <span className="font-semibold">月份</span>：顯示該月最後一天生效的藥劑合約之比重與單價。
                                             </li>
                                             <li>
-                                                計算金額時，系統會依據每日各自適用的合約單價逐日計算後加總。
+                                                實際金額與重量皆依每日各自適用的合約逐日計算後加總。
                                             </li>
                                         </ul>
                                     </div>
                                 )}
                             </div>
-                            <div className="px-6 py-4 bg-slate-50 rounded-b-lg flex justify-end">
+                            <div className="px-6 py-4 bg-slate-50 rounded-b-lg flex justify-end shrink-0">
                                 <Button onClick={() => setHelpTopic(null)}>關閉</Button>
                             </div>
                         </div>
@@ -6702,14 +7918,16 @@ const AnalysisView: React.FC<{
                 )
             }
 
-            {/* Condensate Recovery Y-Axis Scale Modal */}
+            {/* Condensate Recovery / Loss Y-Axis Scale Modal */}
             {
                 showRecoveryScaleModal && (
                     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4" onClick={() => setShowRecoveryScaleModal(false)}>
                         <div className="bg-white rounded-lg shadow-xl w-full max-w-md animate-in fade-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
                             <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 rounded-t-lg">
                                 <div>
-                                    <h3 className="text-base font-bold text-slate-800">設定冷凝水回收率 Y 軸範圍</h3>
+                                    <h3 className="text-base font-bold text-slate-800">
+                                        {isLossMode ? '設定未回收損失率 Y 軸範圍' : '設定冷凝水回收率 Y 軸範圍'}
+                                    </h3>
                                     <p className="text-xs text-slate-500 mt-0.5">同步套用於日用量與週用量圖表右側 Y 軸 (%)</p>
                                 </div>
                                 <button onClick={() => setShowRecoveryScaleModal(false)} className="text-slate-400 hover:text-slate-600">
@@ -6720,12 +7938,20 @@ const AnalysisView: React.FC<{
                                 <div>
                                     <div className="text-xs text-slate-500 mb-2">快速預設範圍</div>
                                     <div className="flex flex-wrap gap-2">
-                                        {[
-                                            { label: '自動 (0~100%)', min: '', max: '' },
-                                            { label: '60~100%', min: '60', max: '100' },
-                                            { label: '75~100%', min: '75', max: '100' },
-                                            { label: '80~95%', min: '80', max: '95' }
-                                        ].map(preset => (
+                                        {(isLossMode
+                                            ? [
+                                                { label: '自動 (0~25%)', min: '', max: '' },
+                                                { label: '0~30%', min: '0', max: '30' },
+                                                { label: '5~20%', min: '5', max: '20' },
+                                                { label: '8~20%', min: '8', max: '20' }
+                                            ]
+                                            : [
+                                                { label: '自動 (0~100%)', min: '', max: '' },
+                                                { label: '60~100%', min: '60', max: '100' },
+                                                { label: '75~100%', min: '75', max: '100' },
+                                                { label: '80~95%', min: '80', max: '95' }
+                                            ]
+                                        ).map(preset => (
                                             <button
                                                 key={preset.label}
                                                 type="button"
@@ -6734,7 +7960,9 @@ const AnalysisView: React.FC<{
                                                     setScaleMaxDraft(preset.max);
                                                     setScaleDraftError(null);
                                                 }}
-                                                className="px-2.5 py-1 rounded border border-slate-300 text-xs text-slate-700 hover:border-emerald-500 hover:text-emerald-400 transition-colors"
+                                                className={`px-2.5 py-1 rounded border border-slate-300 text-xs text-slate-700 transition-colors ${isLossMode
+                                                    ? 'hover:border-amber-500 hover:text-amber-600'
+                                                    : 'hover:border-emerald-500 hover:text-emerald-600'}`}
                                             >
                                                 {preset.label}
                                             </button>
@@ -6773,6 +8001,20 @@ const AnalysisView: React.FC<{
                                     </div>
                                 </div>
 
+                                {!isLossMode && (
+                                    <label className="flex items-start gap-2.5 pt-1 cursor-pointer select-none">
+                                        <input
+                                            type="checkbox"
+                                            checked={scaleReversedDraft}
+                                            onChange={e => setScaleReversedDraft(e.target.checked)}
+                                            className="mt-0.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                        />
+                                        <span className="text-xs text-slate-700 leading-relaxed">
+                                            反轉 Y 軸刻度（上低、下高；回收率下降時折線往上）
+                                        </span>
+                                    </label>
+                                )}
+
                                 {scaleDraftError && (
                                     <div className="text-xs text-red-400 font-medium">{scaleDraftError}</div>
                                 )}
@@ -6781,7 +8023,20 @@ const AnalysisView: React.FC<{
                                 <Button
                                     variant="secondary"
                                     onClick={() => {
-                                        saveRecoveryYScale({ min: null, max: null });
+                                        if (isLossMode) {
+                                            saveRightAxisConfig({
+                                                ...rightAxisConfig,
+                                                lossMin: null,
+                                                lossMax: null
+                                            });
+                                        } else {
+                                            saveRightAxisConfig({
+                                                ...rightAxisConfig,
+                                                recoveryMin: null,
+                                                recoveryMax: null,
+                                                recoveryReversed: false
+                                            });
+                                        }
                                         setShowRecoveryScaleModal(false);
                                     }}
                                 >
@@ -8296,8 +9551,8 @@ const App: React.FC = () => {
         await refreshData();
     };
 
-    const handleBatchSaveReadings = async (newReadings: Reading[], alerts?: Partial<FluctuationAlert>[]) => {
-        const notification = await StorageService.saveReadingsBatch(newReadings, alerts);
+    const handleBatchSaveReadings = async (newReadings: Reading[], alerts?: Partial<FluctuationAlert>[], usageSummaries?: BatchUsageSummaryItem[]) => {
+        const notification = await StorageService.saveReadingsBatch(newReadings, alerts, usageSummaries);
         if (notification && !notification.sent) alert(notification.error);
         await refreshData();
     }
